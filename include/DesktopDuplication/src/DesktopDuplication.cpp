@@ -1,3 +1,5 @@
+#define UNICODE
+
 #include "./DesktopDuplication.hpp"
 
 #include <iostream> 
