@@ -1,7 +1,9 @@
 #include "NDSession.hpp"
+#include "DesktopDuplication.hpp"
 #include <iostream>
 #include <thread>
 #include <chrono>
+#include <wincodec.h>
 
 constexpr char TEST_PORT[] = "54321";
 
@@ -13,14 +15,75 @@ constexpr char TEST_PORT[] = "54321";
 #undef max
 #undef min
 
-constexpr size_t WIDTH = 1920;
-constexpr size_t HEIGHT = 1080;
+constexpr size_t WIDTH = 2560;
+constexpr size_t HEIGHT = 1440;
 constexpr size_t FPS = 360;
 
-constexpr size_t LENGTH_PER_FRAME = 1 + (WIDTH * HEIGHT * 3 / 8); // Drop alpha
-// Approx. 770 KB per frame, consider batching. Send/Recv latency is around < 1 ms though.
+constexpr size_t LENGTH_PER_FRAME = 1 + (WIDTH * HEIGHT * 4);
+// Approx. 8.3MB per frame, consider batching. Send/Recv latency is around < 1 ms though.
 
 static size_t maxSge = -1;
+
+bool SaveFrameFromBuffer(const std::filesystem::path& path, const uint8_t* buffer, size_t length, unsigned int width, unsigned int height) {
+    IWICImagingFactory* factory = nullptr;
+    IWICBitmapEncoder* encoder = nullptr;
+    IWICBitmapFrameEncode* frame = nullptr;
+    IWICStream* stream = nullptr;
+
+    HRESULT hr = CoInitialize(nullptr);
+    if (FAILED(hr)) return false;
+
+    hr = CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&factory));
+    if (FAILED(hr)) return false;
+
+    hr = factory->CreateStream(&stream);
+    if (FAILED(hr)) return false;
+
+    std::time_t now = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
+    std::tm localTime;
+    localtime_s(&localTime, &now);
+
+    std::string time = std::format("{:04d}-{:02d}-{:02d}_{:02d}-{:02d}-{:02d}", localTime.tm_year + 1900, localTime.tm_mon + 1, localTime.tm_mday, localTime.tm_hour, localTime.tm_min, localTime.tm_sec);
+
+    std::filesystem::path savePath = path / std::format("DeskDupl_{}.png", time);
+
+    hr = stream->InitializeFromFilename(savePath.c_str(), GENERIC_WRITE);
+    if (FAILED(hr)) return false;
+
+    hr = factory->CreateEncoder(GUID_ContainerFormatPng, nullptr, &encoder);
+    if (FAILED(hr)) return false;
+
+    hr = encoder->Initialize(stream, WICBitmapEncoderNoCache);
+    if (FAILED(hr)) return false;
+
+    hr = encoder->CreateNewFrame(&frame, nullptr);
+    if (FAILED(hr)) return false;
+
+    hr = frame->Initialize(nullptr);
+    if (FAILED(hr)) return false;
+
+    hr = frame->SetSize(width, height);
+    if (FAILED(hr)) return false;
+
+    WICPixelFormatGUID format = GUID_WICPixelFormat32bppBGRA;
+    hr = frame->SetPixelFormat(&format);
+    if (FAILED(hr)) return false;
+
+    hr = frame->WritePixels(height, width * 4, length, const_cast<unsigned char*>(buffer));
+    if (FAILED(hr)) return false;
+
+    frame->Commit();
+    encoder->Commit();
+
+    stream->Release();
+    frame->Release();
+    encoder->Release();
+    factory->Release();
+
+    CoUninitialize();
+
+    return true;
+}
 
 std::string FormatBytes(uint64_t bytes) {
     if (bytes >= 1024ULL * 1024 * 1024) {
@@ -158,7 +221,7 @@ public:
 
         memset(m_Buf, 0, LENGTH_PER_FRAME);
 
-        // Flag test (0 = Nothing, 1 = Client notifies server to post receive, 2 = Server notifies client to send, 3 = Server notifies client to post receive, 4 = Client notifies server to send)
+        // Flag test (0 = Nothing, 1 = Client has written, 2 = Server has read)
         // Reset to 0 after send completion
         // First bit of the memory is used as a flag
         unsigned char flag = 0;
@@ -184,7 +247,34 @@ public:
             return;
         }
 
-        std::cout << "Test is complete." << std::endl;
+        std::cout << "Waiting for the frame..." << std::endl;
+
+        while (true) {
+            flag = *static_cast<unsigned char*>(m_Buf);
+            if (flag == 1) {
+                break;
+            }
+        }
+
+        std::cout << "Received frame from client." << std::endl;
+
+        if (!SaveFrameFromBuffer("./", reinterpret_cast<uint8_t*>(m_Buf) + 1, LENGTH_PER_FRAME - 1, WIDTH, HEIGHT)) {
+            std::cerr << "Failed to save frame." << std::endl;
+        } else {
+            std::cout << "Frame saved successfully." << std::endl;
+        }
+
+        memset(m_Buf, 0, LENGTH_PER_FRAME);
+        memset(m_Buf, 2, 1);
+
+        if (FAILED(Write(&sge, 1, remoteInfo.remoteAddr, remoteInfo.remoteToken, 0, WRITE_CTXT))) {
+            std::cerr << "Write to reset flag failed." << std::endl;
+            return;
+        }
+        if (!WaitForCompletionAndCheckContext(WRITE_CTXT)) {
+            std::cerr << "WaitForCompletion for reset flag write failed." << std::endl;
+            return;
+        }
 
         Shutdown();
     }
@@ -306,7 +396,96 @@ public:
 
         memset(m_Buf, 0, LENGTH_PER_FRAME);
 
-        std::cout << "Test is complete." << std::endl;
+        std::cout << "Resetting the flag." << std::endl;
+        if (FAILED(Write(&sge, 1, remoteInfo.remoteAddr, remoteInfo.remoteToken, 0, WRITE_CTXT))) {
+            std::cerr << "Write to reset flag failed." << std::endl;
+            return;
+        }
+        if (!WaitForCompletionAndCheckContext(WRITE_CTXT)) {
+            std::cerr << "WaitForCompletion for reset flag write failed." << std::endl;
+            return;
+        }
+
+        std::cout << "Sending a frame to the server." << std::endl;
+        DesktopDuplication::Duplication& dupl = DesktopDuplication::Singleton<DesktopDuplication::Duplication>::Instance();
+        ID3D11Texture2D* frame;
+
+        bool success = dupl.GetStagedTexture(frame);
+        if (!success) {
+            std::cerr << "Failed to get frame from Desktop Duplication." << std::endl;
+            return;
+        }
+
+        D3D11_TEXTURE2D_DESC desc;
+        frame->GetDesc(&desc);
+        uint8_t* frameData = reinterpret_cast<uint8_t*>(m_Buf);
+
+        frameData[0] = 0;
+
+        D3D11_MAPPED_SUBRESOURCE mappedResource;
+        dupl.GetContext()->Map(frame, 0, D3D11_MAP_READ, 0 , &mappedResource);
+
+        for (unsigned int i = 0; i < desc.Height; i++) {
+            memcpy(frameData + 1 + i * desc.Width * 4, 
+                (uint8_t*)mappedResource.pData + i * mappedResource.RowPitch, 
+                desc.Width * 4);
+        }
+
+        dupl.GetContext()->Unmap(frame, 0);
+        frame->Release();
+        frame = nullptr;
+
+        // Send the frame data
+        sge.Buffer = m_Buf;
+        sge.BufferLength = LENGTH_PER_FRAME;
+        sge.MemoryRegionToken = m_pMr->GetLocalToken();
+
+        if (FAILED(Write(&sge, 1, remoteInfo.remoteAddr, remoteInfo.remoteToken, 0, WRITE_CTXT))) {
+            std::cerr << "Write of frame data failed." << std::endl;
+            return;
+        }
+        if (!WaitForCompletionAndCheckContext(WRITE_CTXT)) {
+            std::cerr << "WaitForCompletion for frame data write failed." << std::endl;
+            return;
+        }
+
+        // Now set the flag
+        reinterpret_cast<unsigned char*>(m_Buf)[0] = 1;
+        sge.BufferLength = 1;
+        if (FAILED(Write(&sge, 1, remoteInfo.remoteAddr, remoteInfo.remoteToken, 0, WRITE_CTXT))) {
+            std::cerr << "Write to set flag failed." << std::endl;
+            return;
+        }
+        if (!WaitForCompletionAndCheckContext(WRITE_CTXT)) {
+            std::cerr << "WaitForCompletion for flag set failed." << std::endl;
+            return;
+        }
+
+        // Wait for server to acknowledge the frame
+        std::cout << "Waiting for server to acknowledge the frame..." << std::endl;
+
+        memset(m_Buf, 0, LENGTH_PER_FRAME);
+        sge.Buffer = m_Buf;
+        sge.BufferLength = 1;
+        sge.MemoryRegionToken = m_pMr->GetLocalToken();
+
+        while (true) {
+            if (FAILED(Read(&sge, 1, remoteInfo.remoteAddr, remoteInfo.remoteToken, 0, READ_CTXT))) {
+                std::cerr << "Read failed." << std::endl;
+                return;
+            }
+            if (!WaitForCompletionAndCheckContext(READ_CTXT)) {
+                std::cerr << "WaitForCompletion for read failed." << std::endl;
+                return;
+            }
+
+            if (reinterpret_cast<unsigned char*>(m_Buf)[0] == 2) {
+                std::cout << "Server acknowledged the frame." << std::endl;
+                break;
+            }
+
+            _mm_pause();
+        }
 
         Shutdown();
     }
@@ -318,6 +497,7 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
+
     bool isServer = false;
     if (strcmp(argv[1], "-s") == 0) {
         if (argc != 3) { ShowUsage(); return 1; }
@@ -328,6 +508,13 @@ int main(int argc, char* argv[]) {
     } else {
         ShowUsage();
         return 1;
+    }
+
+    if (!isServer) {
+        DesktopDuplication::ChooseOutput();
+
+        DesktopDuplication::Duplication& dupl = DesktopDuplication::Singleton<DesktopDuplication::Duplication>::Instance();
+        dupl.InitDuplication();
     }
 
     WSADATA wsaData;

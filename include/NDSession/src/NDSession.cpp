@@ -291,10 +291,7 @@ bool NDSessionBase::WaitForCompletionAndCheckContext(void *expectedContext, ULON
         return false;
     }
     if (expectedContext != ndRes.RequestContext) {
-        std::cerr << "Unexpected completion" << std::endl;
-        #ifdef _DEBUG
-        abort();
-        #endif
+        std::cerr << "Unexpected completion. Check for missing WaitForCompletion() call." << std::endl;
         return false;
     }
 
