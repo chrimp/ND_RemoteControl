@@ -307,6 +307,7 @@ bool Duplication::GetStagedTexture(_Out_ ID3D11Texture2D*& dst) {
     desc.Usage = D3D11_USAGE_STAGING;
     desc.BindFlags = 0;
     desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
     desc.MiscFlags = 0;
 
     m_Device->CreateTexture2D(&desc, nullptr, &dst);

@@ -20,9 +20,9 @@ constexpr char TEST_PORT[] = "54321";
 
 constexpr size_t WIDTH = 2560;
 constexpr size_t HEIGHT = 1440;
-constexpr size_t FPS = 60;
+constexpr size_t FPS = 120;
 
-constexpr size_t LENGTH_PER_FRAME = 1 + (WIDTH * HEIGHT * 4);
+constexpr size_t LENGTH_PER_FRAME = 1 + (WIDTH * HEIGHT * 3);
 // Approx. 8.3MB per frame (FHD), consider batching. Send/Recv latency is around < 1 ms though.
 
 static size_t maxSge = -1;
