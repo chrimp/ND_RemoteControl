@@ -21,5 +21,4 @@ target_include_directories(D2DPresentation
 # Set compile definitions if needed
 target_compile_definitions(D2DPresentation PRIVATE
     WIN32_LEAN_AND_MEAN
-    NOMINMAX
 )

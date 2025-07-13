@@ -7,6 +7,13 @@
 #include <thread>
 #include <chrono>
 #include <wincodec.h>
+#include <DirectXTex.h>
+
+#ifdef _DEBUG
+#pragma comment(lib, "Debug/DirectXTex.lib")
+#else
+#pragma comment(lib, "Release/DirectXTex.lib")
+#endif
 
 constexpr char TEST_PORT[] = "54321";
 
@@ -20,10 +27,14 @@ constexpr char TEST_PORT[] = "54321";
 
 constexpr size_t WIDTH = 2560;
 constexpr size_t HEIGHT = 1440;
-constexpr size_t FPS = 60;
+constexpr size_t FPS = 120;
 
-constexpr size_t LENGTH_PER_FRAME = 1 + (WIDTH * HEIGHT * 4);
-// Approx. 8.3MB per frame (FHD), consider batching. Send/Recv latency is around < 1 ms though.
+constexpr size_t BC7_BLOCK_SIZE = 16;
+constexpr size_t BC7_BLOCKS_WIDE = (WIDTH + 3) / 4;
+constexpr size_t BC7_BLOCKS_HIGH = (HEIGHT + 3) / 4;
+constexpr size_t BC7_COMPRESSED_SIZE = BC7_BLOCKS_WIDE * BC7_BLOCKS_HIGH * BC7_BLOCK_SIZE;
+
+constexpr size_t LENGTH_PER_FRAME = 1 + BC7_COMPRESSED_SIZE;
 
 static size_t maxSge = -1;
 
@@ -283,50 +294,85 @@ public:
 
         auto now = std::chrono::steady_clock::now();
         ID3D11Texture2D* frameTex = nullptr;
+        
+        std::vector<uint8_t> previousTex(LENGTH_PER_FRAME - 1, 0);
+
+        auto lastDraw = std::chrono::steady_clock::time_point::max();
 
         while (true) {
-            while (true) {
+            for (;;) {
                 flag = *static_cast<unsigned char*>(m_Buf);
                 if (flag == 1) {
-                    break;
+                    std::atomic_thread_fence(std::memory_order_acquire);
+                    goto newFrame;
                 }
+                if (std::chrono::steady_clock::now() - lastDraw > std::chrono::milliseconds(1000 / FPS)) goto noFrame;
                 _mm_pause();
             }
 
-            D3D11_TEXTURE2D_DESC desc;
-            desc.Width = WIDTH;
-            desc.Height = HEIGHT;
-            desc.MipLevels = 1;
-            desc.ArraySize = 1;
-            desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
-            desc.SampleDesc.Count = 1;
-            desc.SampleDesc.Quality = 0;
-            desc.Usage = D3D11_USAGE_DEFAULT;
-            desc.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
-            desc.CPUAccessFlags = 0;
-            desc.MiscFlags = 0;
+            newFrame:
+            {
+                D3D11_TEXTURE2D_DESC desc;
+                desc.Width = WIDTH;
+                desc.Height = HEIGHT;
+                desc.MipLevels = 1;
+                desc.ArraySize = 1;
+                desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+                desc.SampleDesc.Count = 1;
+                desc.SampleDesc.Quality = 0;
+                desc.Usage = D3D11_USAGE_DEFAULT;
+                desc.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+                desc.CPUAccessFlags = 0;
+                desc.MiscFlags = 0;
 
-            D3D11_SUBRESOURCE_DATA initData = {};
-            initData.pSysMem = reinterpret_cast<uint8_t*>(m_Buf) + 1; // Skip the first byte which is the flag
-            initData.SysMemPitch = desc.Width * 4;
-            initData.SysMemSlicePitch = 0;
+                D3D11_SUBRESOURCE_DATA initData = {};
+                initData.pSysMem = reinterpret_cast<uint8_t*>(m_Buf) + 1; // Skip the first byte which is the flag
+                initData.SysMemPitch = desc.Width * 4;
+                initData.SysMemSlicePitch = 0;
 
-            HRESULT hr = d3dDevice->CreateTexture2D(&desc, &initData, &frameTex);
-            if (FAILED(hr)) {
-                std::cerr << "CreateTexture2D failed: " << std::hex << hr << std::endl;
-                throw new std::exception();
+                std::copy(reinterpret_cast<uint8_t*>(m_Buf) + 1, 
+                        reinterpret_cast<uint8_t*>(m_Buf) + LENGTH_PER_FRAME, 
+                        previousTex.data());
+
+                HRESULT hr = d3dDevice->CreateTexture2D(&desc, &initData, &frameTex);
+                if (FAILED(hr)) {
+                    std::cerr << "CreateTexture2D failed: " << std::hex << hr << std::endl;
+                    throw new std::exception();
+                }
             }
 
+            noFrame:
+            {
+                D3D11_TEXTURE2D_DESC desc;
+                desc.Width = WIDTH;
+                desc.Height = HEIGHT;
+                desc.MipLevels = 1;
+                desc.ArraySize = 1;
+                desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+                desc.SampleDesc.Count = 1;
+                desc.SampleDesc.Quality = 0;
+                desc.Usage = D3D11_USAGE_DEFAULT;
+                desc.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+                desc.CPUAccessFlags = 0;
+                desc.MiscFlags = 0;
+
+                D3D11_SUBRESOURCE_DATA initData = {};
+                initData.pSysMem = previousTex.data();
+                initData.SysMemPitch = desc.Width * 4;
+                initData.SysMemSlicePitch = 0;
+
+                HRESULT hr = d3dDevice->CreateTexture2D(&desc, &initData, &frameTex);
+                if (FAILED(hr)) {
+                    std::cerr << "CreateTexture2D failed: " << std::hex << hr << std::endl;
+                    throw new std::exception();
+                }
+            }
+
+            lastDraw = std::chrono::steady_clock::now();
             renderer.SetSourceSurface(frameTex);
             renderer.Render();
 
             frameTex->Release();
-
-            /*
-            if (!SaveFrameFromBuffer("./", reinterpret_cast<uint8_t*>(m_Buf) + 1, LENGTH_PER_FRAME - 1, WIDTH, HEIGHT)) {
-                std::cerr << "Failed to save frame." << std::endl;
-            }
-            */
 
             memset(m_Buf, 0, LENGTH_PER_FRAME);
             memset(m_Buf, 2, 1);
@@ -367,6 +413,85 @@ public:
         CoUninitialize();
     }
 };
+
+// MARK: ClientUtils
+
+bool TextureToImage(ID3D11Device* device, ID3D11DeviceContext* context, ID3D11Texture2D* texture, DirectX::ScratchImage& image) {
+    D3D11_TEXTURE2D_DESC desc;
+    texture->GetDesc(&desc);
+
+    // Create staging texture for reading
+    D3D11_TEXTURE2D_DESC stagingDesc = desc;
+    stagingDesc.Usage = D3D11_USAGE_STAGING;
+    stagingDesc.BindFlags = 0;
+    stagingDesc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    stagingDesc.MiscFlags = 0;
+
+    ComPtr<ID3D11Texture2D> stagingTexture;
+    HRESULT hr = device->CreateTexture2D(&stagingDesc, nullptr, stagingTexture.GetAddressOf());
+    if (FAILED(hr)) return false;
+
+    // Copy to staging texture
+    context->CopyResource(stagingTexture.Get(), texture);
+
+    // Map and read data
+    D3D11_MAPPED_SUBRESOURCE mapped;
+    hr = context->Map(stagingTexture.Get(), 0, D3D11_MAP_READ, 0, &mapped);
+    if (FAILED(hr)) return false;
+
+    // Create DirectXTex image
+    hr = image.Initialize2D(desc.Format, desc.Width, desc.Height, 1, 1);
+    if (FAILED(hr)) {
+        context->Unmap(stagingTexture.Get(), 0);
+        return false;
+    }
+
+    // Copy data to DirectXTex image
+    const DirectX::Image* img = image.GetImage(0, 0, 0);
+    const uint8_t* src = static_cast<const uint8_t*>(mapped.pData);
+    uint8_t* dst = img->pixels;
+
+    for (size_t y = 0; y < desc.Height; ++y) {
+        memcpy(dst + y * img->rowPitch, 
+               src + y * mapped.RowPitch, 
+               desc.Width * 4); // 4 bytes per pixel for BGRA
+    }
+
+    context->Unmap(stagingTexture.Get(), 0);
+    return true;
+}
+
+// Simplified compress function that writes directly to m_Buf
+bool CompressImageToBuf(const DirectX::ScratchImage& srcImage, void* destBuf, size_t& compressedSize) {
+    DirectX::ScratchImage compressedImage;
+    
+    HRESULT hr = DirectX::Compress(
+        srcImage.GetImages(), 
+        srcImage.GetImageCount(), 
+        srcImage.GetMetadata(),
+        DXGI_FORMAT_BC7_UNORM,
+        DirectX::TEX_COMPRESS_DEFAULT,
+        DirectX::TEX_THRESHOLD_DEFAULT,
+        compressedImage
+    );
+
+    if (FAILED(hr)) {
+        std::cerr << "Compression failed: " << std::hex << hr << std::endl;
+        return false;
+    }
+
+    // Get compressed data and copy directly to buffer
+    const DirectX::Image* compImg = compressedImage.GetImage(0, 0, 0);
+    compressedSize = compImg->slicePitch;
+    
+    // Layout: [flag:1] [size:4] [compressed_data:variable]
+    uint8_t* buf = static_cast<uint8_t*>(destBuf);
+    buf[0] = 0; // Flag
+    *reinterpret_cast<uint32_t*>(buf + 1) = static_cast<uint32_t>(compressedSize);
+    memcpy(buf + 1 + sizeof(uint32_t), compImg->pixels, compressedSize);
+
+    return true;
+}
 
 // MARK: TestClient
 class TestClient : public NDSessionClientBase {

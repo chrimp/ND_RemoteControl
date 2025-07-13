@@ -304,9 +304,28 @@ bool Duplication::GetStagedTexture(_Out_ ID3D11Texture2D*& dst) {
     D3D11_TEXTURE2D_DESC desc;
     frame->GetDesc(&desc);
 
+    if (desc.Format != DXGI_FORMAT_B8G8R8A8_UNORM) {
+        D3D11_TEXTURE2D_DESC destDesc = desc;
+        destDesc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+        destDesc.Usage = D3D11_USAGE_DEFAULT;
+        destDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS;
+        destDesc.CPUAccessFlags = 0;
+        destDesc.MiscFlags = 0;
+
+        ComPtr<ID3D11Texture2D> convertedTex;
+        HRESULT hr = m_Device->CreateTexture2D(&destDesc, nullptr, convertedTex.GetAddressOf());
+        if (FAILED(hr)) {
+            ReleaseFrame();
+            return false;
+        }
+
+        
+    }
+
     desc.Usage = D3D11_USAGE_STAGING;
     desc.BindFlags = 0;
     desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
     desc.MiscFlags = 0;
 
     m_Device->CreateTexture2D(&desc, nullptr, &dst);
