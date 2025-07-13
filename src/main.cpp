@@ -27,67 +27,6 @@ constexpr size_t LENGTH_PER_FRAME = 1 + (WIDTH * HEIGHT * 4);
 
 static size_t maxSge = -1;
 
-bool SaveFrameFromBuffer(const std::filesystem::path& path, const uint8_t* buffer, size_t length, unsigned int width, unsigned int height) {
-    IWICImagingFactory* factory = nullptr;
-    IWICBitmapEncoder* encoder = nullptr;
-    IWICBitmapFrameEncode* frame = nullptr;
-    IWICStream* stream = nullptr;
-
-    HRESULT hr = CoInitialize(nullptr);
-    if (FAILED(hr)) return false;
-
-    hr = CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&factory));
-    if (FAILED(hr)) return false;
-
-    hr = factory->CreateStream(&stream);
-    if (FAILED(hr)) return false;
-
-    std::time_t now = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
-    std::tm localTime;
-    localtime_s(&localTime, &now);
-
-    std::string time = std::format("{:04d}-{:02d}-{:02d}_{:02d}-{:02d}-{:02d}", localTime.tm_year + 1900, localTime.tm_mon + 1, localTime.tm_mday, localTime.tm_hour, localTime.tm_min, localTime.tm_sec);
-
-    std::filesystem::path savePath = path / std::format("DeskDupl_{}.png", time);
-
-    hr = stream->InitializeFromFilename(savePath.c_str(), GENERIC_WRITE);
-    if (FAILED(hr)) return false;
-
-    hr = factory->CreateEncoder(GUID_ContainerFormatPng, nullptr, &encoder);
-    if (FAILED(hr)) return false;
-
-    hr = encoder->Initialize(stream, WICBitmapEncoderNoCache);
-    if (FAILED(hr)) return false;
-
-    hr = encoder->CreateNewFrame(&frame, nullptr);
-    if (FAILED(hr)) return false;
-
-    hr = frame->Initialize(nullptr);
-    if (FAILED(hr)) return false;
-
-    hr = frame->SetSize(width, height);
-    if (FAILED(hr)) return false;
-
-    WICPixelFormatGUID format = GUID_WICPixelFormat32bppBGRA;
-    hr = frame->SetPixelFormat(&format);
-    if (FAILED(hr)) return false;
-
-    hr = frame->WritePixels(height, width * 4, length, const_cast<unsigned char*>(buffer));
-    if (FAILED(hr)) return false;
-
-    frame->Commit();
-    encoder->Commit();
-
-    stream->Release();
-    frame->Release();
-    encoder->Release();
-    factory->Release();
-
-    CoUninitialize();
-
-    return true;
-}
-
 std::string FormatBytes(uint64_t bytes) {
     if (bytes >= 1024ULL * 1024 * 1024) {
         return std::to_string(bytes / (1024ULL * 1024 * 1024)) + "GB";
