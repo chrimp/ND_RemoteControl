@@ -2,11 +2,14 @@
 #include "DesktopDuplication.hpp"
 #include "D2DRenderer.hpp"
 #include "D2DWindow.hpp"
+
 #include <conio.h>
 #include <iostream>
 #include <thread>
 #include <chrono>
 #include <wincodec.h>
+
+#include <lz4.h>
 
 constexpr char TEST_PORT[] = "54321";
 
@@ -17,6 +20,8 @@ constexpr char TEST_PORT[] = "54321";
 
 #undef max
 #undef min
+
+#pragma comment(lib, "liblz4_static.lib")
 
 constexpr size_t WIDTH = 2560;
 constexpr size_t HEIGHT = 1440;
