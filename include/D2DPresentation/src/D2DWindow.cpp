@@ -30,6 +30,7 @@ D2DWindow::D2DWindow(
     m_windowTitle = title;
     m_width = width;
     m_height = height;
+    m_aspectRatio = static_cast<float>(width) / static_cast<float>(height);
 }
 
 D2DWindow::~D2DWindow() {
@@ -65,7 +66,7 @@ void D2DWindow::WindowThread(
         0,
         m_className.c_str(),
         title,
-        WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
+        WS_OVERLAPPEDWINDOW,
         CW_USEDEFAULT, CW_USEDEFAULT, width, height,
         NULL, NULL, hInstance, this
     );
@@ -108,7 +109,9 @@ void D2DWindow::Start() {
 
 void D2DWindow::Stop() {
     if (m_windowThread.joinable()) {
-        DestroyWindow(m_hwnd);
+        //DestroyWindow(m_hwnd);
+        PostMessage(m_hwnd, WM_CLOSE, 0, 0);
+
         m_isRunning = false;
         m_windowThread.join();
     }
@@ -148,10 +151,105 @@ LRESULT CALLBACK D2DWindow::StaticWndProc(HWND hWnd, UINT message, WPARAM wParam
 
 LRESULT CALLBACK D2DWindow::WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) {
     switch (message) {
+        case WM_CLOSE:
+            DestroyWindow(hWnd);
+            return 0;
         case WM_DESTROY:
             m_isRunning = false;
             PostQuitMessage(0);
             return 0;
+        case WM_SIZING:
+        {
+            RECT* pRect = reinterpret_cast<RECT*>(lParam);
+            float sourceAspect = m_aspectRatio;
+
+            DWORD style = GetWindowLong(hWnd, GWL_STYLE);
+            DWORD exStyle = GetWindowLong(hWnd, GWL_EXSTYLE);
+
+            // Get proposed window dimensions
+            int windowWidth = pRect->right - pRect->left;
+            int windowHeight = pRect->bottom - pRect->top;
+            
+            // Calculate border sizes once
+            RECT borderRect = { 0, 0, 0, 0 };
+            AdjustWindowRectEx(&borderRect, style, FALSE, exStyle);
+            int borderWidth = (borderRect.right - borderRect.left);
+            int borderHeight = (borderRect.bottom - borderRect.top);
+            
+            // Extract client dimensions
+            int clientWidth = windowWidth - borderWidth;
+            int clientHeight = windowHeight - borderHeight;
+
+            int edge = static_cast<int>(wParam);
+            
+            // Calculate new client dimensions
+            int newClientWidth, newClientHeight;
+            
+            if (edge == WMSZ_LEFT || edge == WMSZ_RIGHT) {
+                // Width is primary
+                newClientWidth = clientWidth;
+                newClientHeight = static_cast<int>(clientWidth / sourceAspect + 0.5f); // Round to nearest
+            } else if (edge == WMSZ_TOP || edge == WMSZ_BOTTOM) {
+                // Height is primary
+                newClientHeight = clientHeight;
+                newClientWidth = static_cast<int>(clientHeight * sourceAspect + 0.5f); // Round to nearest
+            } else {
+                // Corner - prefer the larger change to avoid jitter
+                float currentAspect = static_cast<float>(clientWidth) / static_cast<float>(clientHeight);
+                
+                if (currentAspect > sourceAspect) {
+                    // Current is too wide - constrain by height
+                    newClientHeight = clientHeight;
+                    newClientWidth = static_cast<int>(clientHeight * sourceAspect + 0.5f);
+                } else {
+                    // Current is too tall - constrain by width
+                    newClientWidth = clientWidth;
+                    newClientHeight = static_cast<int>(clientWidth / sourceAspect + 0.5f);
+                }
+            }
+            
+            // Convert back to window dimensions
+            int newWindowWidth = newClientWidth + borderWidth;
+            int newWindowHeight = newClientHeight + borderHeight;
+            
+            // Apply new dimensions with proper anchoring
+            switch (edge) {
+                case WMSZ_LEFT:
+                    pRect->left = pRect->right - newWindowWidth;
+                    pRect->bottom = pRect->top + newWindowHeight;
+                    break;
+                case WMSZ_RIGHT:
+                    pRect->right = pRect->left + newWindowWidth;
+                    pRect->bottom = pRect->top + newWindowHeight;
+                    break;
+                case WMSZ_TOP:
+                    pRect->top = pRect->bottom - newWindowHeight;
+                    pRect->right = pRect->left + newWindowWidth;
+                    break;
+                case WMSZ_BOTTOM:
+                    pRect->bottom = pRect->top + newWindowHeight;
+                    pRect->right = pRect->left + newWindowWidth;
+                    break;
+                case WMSZ_TOPLEFT:
+                    pRect->left = pRect->right - newWindowWidth;
+                    pRect->top = pRect->bottom - newWindowHeight;
+                    break;
+                case WMSZ_TOPRIGHT:
+                    pRect->right = pRect->left + newWindowWidth;
+                    pRect->top = pRect->bottom - newWindowHeight;
+                    break;
+                case WMSZ_BOTTOMLEFT:
+                    pRect->left = pRect->right - newWindowWidth;
+                    pRect->bottom = pRect->top + newWindowHeight;
+                    break;
+                case WMSZ_BOTTOMRIGHT:
+                    pRect->right = pRect->left + newWindowWidth;
+                    pRect->bottom = pRect->top + newWindowHeight;
+                    break;
+            }
+
+            return TRUE;
+        }
         default:
             return DefWindowProc(hWnd, message, wParam, lParam);
     }

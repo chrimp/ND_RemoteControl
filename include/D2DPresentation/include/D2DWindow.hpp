@@ -65,6 +65,8 @@ namespace D2DPresentation {
 
         UINT m_width = 800;
         UINT m_height = 600;
+
+        float m_aspectRatio = -1.0f;
     };
 }
 

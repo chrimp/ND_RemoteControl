@@ -227,50 +227,87 @@ public:
 
         auto now = std::chrono::steady_clock::now();
         ID3D11Texture2D* frameTex = nullptr;
+        
+        std::vector<uint8_t> previousTex(LENGTH_PER_FRAME - 1, 0);
+
+        auto lastDraw = std::chrono::steady_clock::time_point::max();
 
         while (true) {
-            while (true) {
+            for (;;) {
                 flag = *static_cast<unsigned char*>(m_Buf);
                 if (flag == 1) {
-                    break;
+                    std::atomic_thread_fence(std::memory_order_acquire);
+                    goto emptyRun;
                 }
+                if (std::chrono::steady_clock::now() - lastDraw > std::chrono::milliseconds(1000 / FPS)) goto noFrame;
                 _mm_pause();
             }
 
-            D3D11_TEXTURE2D_DESC desc;
-            desc.Width = WIDTH;
-            desc.Height = HEIGHT;
-            desc.MipLevels = 1;
-            desc.ArraySize = 1;
-            desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
-            desc.SampleDesc.Count = 1;
-            desc.SampleDesc.Quality = 0;
-            desc.Usage = D3D11_USAGE_DEFAULT;
-            desc.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
-            desc.CPUAccessFlags = 0;
-            desc.MiscFlags = 0;
+            newFrame:
+            {
+                D3D11_TEXTURE2D_DESC desc;
+                desc.Width = WIDTH;
+                desc.Height = HEIGHT;
+                desc.MipLevels = 1;
+                desc.ArraySize = 1;
+                desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+                desc.SampleDesc.Count = 1;
+                desc.SampleDesc.Quality = 0;
+                desc.Usage = D3D11_USAGE_DEFAULT;
+                desc.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+                desc.CPUAccessFlags = 0;
+                desc.MiscFlags = 0;
 
-            D3D11_SUBRESOURCE_DATA initData = {};
-            initData.pSysMem = reinterpret_cast<uint8_t*>(m_Buf) + 1; // Skip the first byte which is the flag
-            initData.SysMemPitch = desc.Width * 4;
-            initData.SysMemSlicePitch = 0;
+                D3D11_SUBRESOURCE_DATA initData = {};
+                initData.pSysMem = reinterpret_cast<uint8_t*>(m_Buf) + 1; // Skip the first byte which is the flag
+                initData.SysMemPitch = desc.Width * 4;
+                initData.SysMemSlicePitch = 0;
 
-            HRESULT hr = d3dDevice->CreateTexture2D(&desc, &initData, &frameTex);
-            if (FAILED(hr)) {
-                std::cerr << "CreateTexture2D failed: " << std::hex << hr << std::endl;
-                throw new std::exception();
+                std::copy(reinterpret_cast<uint8_t*>(m_Buf) + 1, 
+                        reinterpret_cast<uint8_t*>(m_Buf) + LENGTH_PER_FRAME, 
+                        previousTex.data());
+
+                HRESULT hr = d3dDevice->CreateTexture2D(&desc, &initData, &frameTex);
+                if (FAILED(hr)) {
+                    std::cerr << "CreateTexture2D failed: " << std::hex << hr << std::endl;
+                    throw new std::exception();
+                }
             }
 
+            noFrame:
+            {
+                D3D11_TEXTURE2D_DESC desc;
+                desc.Width = WIDTH;
+                desc.Height = HEIGHT;
+                desc.MipLevels = 1;
+                desc.ArraySize = 1;
+                desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+                desc.SampleDesc.Count = 1;
+                desc.SampleDesc.Quality = 0;
+                desc.Usage = D3D11_USAGE_DEFAULT;
+                desc.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+                desc.CPUAccessFlags = 0;
+                desc.MiscFlags = 0;
+
+                D3D11_SUBRESOURCE_DATA initData = {};
+                initData.pSysMem = previousTex.data();
+                initData.SysMemPitch = desc.Width * 4;
+                initData.SysMemSlicePitch = 0;
+
+                HRESULT hr = d3dDevice->CreateTexture2D(&desc, &initData, &frameTex);
+                if (FAILED(hr)) {
+                    std::cerr << "CreateTexture2D failed: " << std::hex << hr << std::endl;
+                    throw new std::exception();
+                }
+            }
+
+            lastDraw = std::chrono::steady_clock::now();
             renderer.SetSourceSurface(frameTex);
             renderer.Render();
 
             frameTex->Release();
 
-            /*
-            if (!SaveFrameFromBuffer("./", reinterpret_cast<uint8_t*>(m_Buf) + 1, LENGTH_PER_FRAME - 1, WIDTH, HEIGHT)) {
-                std::cerr << "Failed to save frame." << std::endl;
-            }
-            */
+            emptyRun:
 
             memset(m_Buf, 0, LENGTH_PER_FRAME);
             memset(m_Buf, 2, 1);
@@ -311,6 +348,39 @@ public:
         CoUninitialize();
     }
 };
+
+bool CompressFrameLZ4(const void* buf, size_t srcSize, size_t& compressedSize) {
+    auto compressStart = std::chrono::steady_clock::now();
+
+    void* holder = VirtualAlloc(nullptr, LZ4_compressBound(srcSize), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+
+    uint8_t* holderChar = reinterpret_cast<uint8_t*>(holder);
+
+    holderChar[0] = 0;
+
+    compressedSize = LZ4_compress_default(
+        reinterpret_cast<const char*>(buf),
+        reinterpret_cast<char*>(holderChar) + 1,
+        static_cast<int>(srcSize),
+        static_cast<int>(LENGTH_PER_FRAME - 1)
+    );
+
+    // Copy to the original buffer
+    memset(const_cast<void*>(buf), 0, LENGTH_PER_FRAME);
+
+    std::copy(holderChar, holderChar + compressedSize + 1, 
+              reinterpret_cast<uint8_t*>(const_cast<void*>(buf)));
+
+    VirtualFree(holder, 0, MEM_RELEASE);
+
+    auto compressEnd = std::chrono::steady_clock::now();
+    auto duration = std::chrono::duration_cast<std::chrono::nanoseconds>(compressEnd - compressStart).count();
+
+    std::cout << "                                                                                \r" << std::flush;
+    std::cout << "Compressed size: " << compressedSize << " Compression time: " << duration / 1000000 << " ms" << std::flush;
+
+    return true;
+}
 
 // MARK: TestClient
 class TestClient : public NDSessionClientBase {
@@ -471,9 +541,15 @@ public:
             frame->Release();
             frame = nullptr;
 
+            size_t compressedSize = 0;
+            if (!CompressFrameLZ4(m_Buf, LENGTH_PER_FRAME - 1, compressedSize)) {
+                std::cerr << "Frame compression failed." << std::endl;
+                return;
+            }
+
             // Send the frame data
             sge.Buffer = m_Buf;
-            sge.BufferLength = LENGTH_PER_FRAME;
+            sge.BufferLength = compressedSize + 1;
             sge.MemoryRegionToken = m_pMr->GetLocalToken();
 
             if (FAILED(Write(&sge, 1, remoteInfo.remoteAddr, remoteInfo.remoteToken, 0, WRITE_CTXT))) {
