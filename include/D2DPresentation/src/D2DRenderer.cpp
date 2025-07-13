@@ -1,6 +1,11 @@
 #include "../include/D2DRenderer.hpp"
 #include <exception>
 
+#undef min
+#undef max
+
+#include <algorithm>
+
 /*
 * ======================================================================
 * NOTICE: This code contains a mix of human-authored and AI-generated
@@ -142,9 +147,49 @@ void D2DRenderer::Render() {
     m_d2dContext->Clear(D2D1::ColorF(D2D1::ColorF::Black));
 
     if (m_d2dSourceBitmap) {
+        D2D1_SIZE_F sourceBitmapSize = m_d2dSourceBitmap->GetSize();
+        float sourceWidth = sourceBitmapSize.width;
+        float sourceHeight = sourceBitmapSize.height;
+
+        float scaleX = static_cast<float>(m_width) / sourceWidth;
+        float scaleY = static_cast<float>(m_height) / sourceHeight;
+        float scale = std::min(scaleX, scaleY);
+
+        float scaleWidth = sourceWidth * scale;
+        float scaleHeight = sourceHeight * scale;
+        float offsetX = (static_cast<float>(m_width) - scaleWidth) / 2.0f;
+        float offsetY = (static_cast<float>(m_height) - scaleHeight) / 2.0f;
+
+        D2D1_RECT_F destRect = D2D1::RectF(offsetX, offsetY, offsetX + scaleWidth, offsetY + scaleHeight);
+
+        D2D1_BITMAP_INTERPOLATION_MODE interpolationMode;
+
+        if (scale >= 1.0f) {
+            float integerScale = floorf(scale);
+            if (integerScale >= 1.0f && fabsf(scale - integerScale) < 0.01f) {
+                interpolationMode = D2D1_BITMAP_INTERPOLATION_MODE_NEAREST_NEIGHBOR;
+
+                float exactWidth = sourceWidth * integerScale;
+                float exactHeight = sourceHeight * integerScale;
+                float exactOffsetX = (static_cast<float>(m_width) - exactWidth) / 2.0f;
+                float exactOffsetY = (static_cast<float>(m_height) - exactHeight) / 2.0f;
+                destRect = D2D1::RectF(exactOffsetX, exactOffsetY, exactOffsetX + exactWidth, exactOffsetY + exactHeight);
+            } else {
+                interpolationMode = D2D1_BITMAP_INTERPOLATION_MODE_LINEAR;
+            }
+        } else {
+            interpolationMode = D2D1_BITMAP_INTERPOLATION_MODE_LINEAR;
+        }
+
+        m_d2dContext->DrawBitmap(m_d2dSourceBitmap.Get(), destRect, 1.0f, interpolationMode);
+    }
+
+    /*
+    if (m_d2dSourceBitmap) {
         D2D1_RECT_F destRect = D2D1::RectF(0.0f, 0.0f, static_cast<float>(m_width), static_cast<float>(m_height));
         m_d2dContext->DrawBitmap(m_d2dSourceBitmap.Get(), destRect, 1.0f, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
     }
+    */
 
     HRESULT hr = m_d2dContext->EndDraw();
     if (FAILED(hr)) {
