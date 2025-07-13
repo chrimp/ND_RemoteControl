@@ -7,6 +7,8 @@
 #include <thread>
 #include <chrono>
 #include <wincodec.h>
+
+#include <d3d11.h>
 #include <DirectXTex.h>
 
 #ifdef _DEBUG
@@ -29,12 +31,12 @@ constexpr size_t WIDTH = 2560;
 constexpr size_t HEIGHT = 1440;
 constexpr size_t FPS = 120;
 
-constexpr size_t BC7_BLOCK_SIZE = 16;
-constexpr size_t BC7_BLOCKS_WIDE = (WIDTH + 3) / 4;
-constexpr size_t BC7_BLOCKS_HIGH = (HEIGHT + 3) / 4;
-constexpr size_t BC7_COMPRESSED_SIZE = BC7_BLOCKS_WIDE * BC7_BLOCKS_HIGH * BC7_BLOCK_SIZE;
+constexpr size_t BC_BLOCK_SIZE = 16;
+constexpr size_t BC_BLOCKS_WIDE = (WIDTH + 3) / 4;
+constexpr size_t BC_BLOCKS_HIGH = (HEIGHT + 3) / 4;
+constexpr size_t BC_COMPRESSED_SIZE = BC_BLOCKS_WIDE * BC_BLOCKS_HIGH * BC_BLOCK_SIZE;
 
-constexpr size_t LENGTH_PER_FRAME = 1 + BC7_COMPRESSED_SIZE;
+constexpr size_t LENGTH_PER_FRAME = 1 + BC_COMPRESSED_SIZE;
 
 static size_t maxSge = -1;
 
@@ -304,7 +306,7 @@ public:
                 flag = *static_cast<unsigned char*>(m_Buf);
                 if (flag == 1) {
                     std::atomic_thread_fence(std::memory_order_acquire);
-                    goto newFrame;
+                    goto emptyRun;
                 }
                 if (std::chrono::steady_clock::now() - lastDraw > std::chrono::milliseconds(1000 / FPS)) goto noFrame;
                 _mm_pause();
@@ -374,6 +376,8 @@ public:
 
             frameTex->Release();
 
+            emptyRun:
+
             memset(m_Buf, 0, LENGTH_PER_FRAME);
             memset(m_Buf, 2, 1);
 
@@ -414,72 +418,26 @@ public:
     }
 };
 
-// MARK: ClientUtils
-
-bool TextureToImage(ID3D11Device* device, ID3D11DeviceContext* context, ID3D11Texture2D* texture, DirectX::ScratchImage& image) {
-    D3D11_TEXTURE2D_DESC desc;
-    texture->GetDesc(&desc);
-
-    // Create staging texture for reading
-    D3D11_TEXTURE2D_DESC stagingDesc = desc;
-    stagingDesc.Usage = D3D11_USAGE_STAGING;
-    stagingDesc.BindFlags = 0;
-    stagingDesc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-    stagingDesc.MiscFlags = 0;
-
-    ComPtr<ID3D11Texture2D> stagingTexture;
-    HRESULT hr = device->CreateTexture2D(&stagingDesc, nullptr, stagingTexture.GetAddressOf());
-    if (FAILED(hr)) return false;
-
-    // Copy to staging texture
-    context->CopyResource(stagingTexture.Get(), texture);
-
-    // Map and read data
-    D3D11_MAPPED_SUBRESOURCE mapped;
-    hr = context->Map(stagingTexture.Get(), 0, D3D11_MAP_READ, 0, &mapped);
-    if (FAILED(hr)) return false;
-
-    // Create DirectXTex image
-    hr = image.Initialize2D(desc.Format, desc.Width, desc.Height, 1, 1);
-    if (FAILED(hr)) {
-        context->Unmap(stagingTexture.Get(), 0);
-        return false;
-    }
-
-    // Copy data to DirectXTex image
-    const DirectX::Image* img = image.GetImage(0, 0, 0);
-    const uint8_t* src = static_cast<const uint8_t*>(mapped.pData);
-    uint8_t* dst = img->pixels;
-
-    for (size_t y = 0; y < desc.Height; ++y) {
-        memcpy(dst + y * img->rowPitch, 
-               src + y * mapped.RowPitch, 
-               desc.Width * 4); // 4 bytes per pixel for BGRA
-    }
-
-    context->Unmap(stagingTexture.Get(), 0);
-    return true;
-}
 
 // Simplified compress function that writes directly to m_Buf
-bool CompressImageToBuf(const DirectX::ScratchImage& srcImage, void* destBuf, size_t& compressedSize) {
+bool CompressImageToBuf(const DirectX::ScratchImage& srcImage, void* destBuf, size_t compressedSize, ID3D11Device* device) {
     DirectX::ScratchImage compressedImage;
+    auto compressStart = std::chrono::high_resolution_clock::now();
+    HRESULT hr = DirectX::Compress(device, srcImage.GetImages(), srcImage.GetImageCount(), srcImage.GetMetadata(), DXGI_FORMAT_BC7_UNORM,
+                                    DirectX::TEX_COMPRESS_BC7_QUICK | DirectX::TEX_COMPRESS_PARALLEL, DirectX::TEX_ALPHA_WEIGHT_DEFAULT, compressedImage);
     
-    HRESULT hr = DirectX::Compress(
-        srcImage.GetImages(), 
-        srcImage.GetImageCount(), 
-        srcImage.GetMetadata(),
-        DXGI_FORMAT_BC7_UNORM,
-        DirectX::TEX_COMPRESS_DEFAULT,
-        DirectX::TEX_THRESHOLD_DEFAULT,
-        compressedImage
-    );
-
+    
+    //HRESULT hr = DirectX::Compress(srcImage.GetImages(), srcImage.GetImageCount(), srcImage.GetMetadata(), DXGI_FORMAT_BC1_UNORM,
+    //                        DirectX::TEX_COMPRESS_PARALLEL, DirectX::TEX_THRESHOLD_DEFAULT, compressedImage);
+    
     if (FAILED(hr)) {
         std::cerr << "Compression failed: " << std::hex << hr << std::endl;
         return false;
     }
+    auto compressEnd = std::chrono::high_resolution_clock::now();
+    auto compressDuration = std::chrono::duration_cast<std::chrono::nanoseconds>(compressEnd - compressStart).count();
 
+    auto copyStart = std::chrono::high_resolution_clock::now();
     // Get compressed data and copy directly to buffer
     const DirectX::Image* compImg = compressedImage.GetImage(0, 0, 0);
     compressedSize = compImg->slicePitch;
@@ -489,6 +447,10 @@ bool CompressImageToBuf(const DirectX::ScratchImage& srcImage, void* destBuf, si
     buf[0] = 0; // Flag
     *reinterpret_cast<uint32_t*>(buf + 1) = static_cast<uint32_t>(compressedSize);
     memcpy(buf + 1 + sizeof(uint32_t), compImg->pixels, compressedSize);
+    auto copyEnd = std::chrono::high_resolution_clock::now();
+    auto copyDuration = std::chrono::duration_cast<std::chrono::nanoseconds>(copyEnd - copyStart).count();
+
+    std::cout << "Compression: " << compressDuration / 1000000 << " ms | Copy: " << copyDuration / 1000000 << " ms" << std::flush;
 
     return true;
 }
@@ -622,37 +584,47 @@ public:
         std::cout << "Sending a frame to the server." << std::endl;
         DesktopDuplication::Duplication& dupl = DesktopDuplication::Singleton<DesktopDuplication::Duplication>::Instance();
 
+        int frames = 0;
+        auto nowfps = std::chrono::steady_clock::now();
+
+        unsigned long long totalDelay = 0;
+
         while (true) {
             ID3D11Texture2D* frame;
 
-            bool success = dupl.GetStagedTexture(frame);
-            if (!success) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(1000/FPS)); // Timed out--probably no movement on the screen
+            int success = dupl.GetFrame(frame, int(1000/FPS));
+            if (success == -1) {
                 continue;
+            } else if (success != 0) {
+                std::cerr << "Failed to get frame from duplication." << std::endl;
+                return;
             }
+
+            std::cout << "                                                                                               \r" << std::flush;
 
             auto getTime = std::chrono::steady_clock::now();
 
-            D3D11_TEXTURE2D_DESC desc;
-            frame->GetDesc(&desc);
-            uint8_t* frameData = reinterpret_cast<uint8_t*>(m_Buf);
-
-            frameData[0] = 0;
-
-            D3D11_MAPPED_SUBRESOURCE mappedResource;
-            dupl.GetContext()->Map(frame, 0, D3D11_MAP_READ, 0 , &mappedResource);
-
-            for (unsigned int i = 0; i < desc.Height; i++) {
-                memcpy(frameData + 1 + i * desc.Width * 4, 
-                    (uint8_t*)mappedResource.pData + i * mappedResource.RowPitch, 
-                    desc.Width * 4);
+            DirectX::ScratchImage srcImage;
+            HRESULT hr = DirectX::CaptureTexture(dupl.GetDevice(), dupl.GetContext(), frame, srcImage);
+            if (FAILED(hr)) {
+                std::cerr << "CaptureTexture failed: " << std::hex << hr << std::endl;
+                frame->Release();
+                return;
             }
 
-            dupl.GetContext()->Unmap(frame, 0);
-            frame->Release();
-            frame = nullptr;
+            auto conversionDone = std::chrono::steady_clock::now();
+            auto conversionElapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(conversionDone - getTime).count();
 
-            // Send the frame data
+            std::cout << "Conversion: " << conversionElapsed / 1000000.0 << " ms " << std::flush;
+
+            CompressImageToBuf(srcImage, m_Buf, LENGTH_PER_FRAME, dupl.GetDevice());
+
+            dupl.ReleaseFrame();
+
+            auto compressDone = std::chrono::steady_clock::now();
+            auto compressElapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(compressDone - getTime).count();
+            totalDelay += compressElapsed;
+
             sge.Buffer = m_Buf;
             sge.BufferLength = LENGTH_PER_FRAME;
             sge.MemoryRegionToken = m_pMr->GetLocalToken();
@@ -707,6 +679,17 @@ public:
                 }
                 _mm_pause();
             }
+
+            auto now2 = std::chrono::steady_clock::now();
+            auto elapsed2 = std::chrono::duration_cast<std::chrono::nanoseconds>(now2 - nowfps).count();
+            if (elapsed2 <= -1000000000) {
+                std::cout << "\r                " << std::flush;
+                std::cout << "FPS: " << frames << " | Compression time: " << totalDelay / 1000000.0 / frames << " ms" << std::flush;
+                frames = 0;
+                totalDelay = 0;
+                nowfps = now2;
+            }
+            frames++;
         }
 
         Shutdown();

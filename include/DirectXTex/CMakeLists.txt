@@ -25,3 +25,4 @@ target_compile_definitions(DirectXTex INTERFACE
 )
 
 target_compile_definitions(DirectXTex INTERFACE DIRECTXTEX_LIB_PATH="${CMAKE_CURRENT_SOURCE_DIR}/lib")
+target_link_directories(DirectXTex INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/lib)
