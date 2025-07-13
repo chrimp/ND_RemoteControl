@@ -349,35 +349,35 @@ public:
     }
 };
 
-bool CompressFrameLZ4(const void* buf, size_t srcSize, size_t& compressedSize) {
+bool CompressFrameLZ4(void* buf, size_t srcSize, size_t& compressedSize) {
     auto compressStart = std::chrono::steady_clock::now();
 
-    void* holder = VirtualAlloc(nullptr, LZ4_compressBound(srcSize), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    //void* holder = VirtualAlloc(nullptr, LZ4_compressBound(srcSize), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
 
-    uint8_t* holderChar = reinterpret_cast<uint8_t*>(holder);
+    //uint8_t* holderChar = reinterpret_cast<uint8_t*>(holder);
 
-    holderChar[0] = 0;
+    uint8_t* frameData = static_cast<uint8_t*>(buf);
+    size_t maxCompressedSize = LZ4_compressBound(srcSize - 1);
+    std::vector<char> temp(maxCompressedSize);
 
-    compressedSize = LZ4_compress_default(
-        reinterpret_cast<const char*>(buf),
-        reinterpret_cast<char*>(holderChar) + 1,
-        static_cast<int>(srcSize),
-        static_cast<int>(LENGTH_PER_FRAME - 1)
+    compressedSize = LZ4_compress_fast(
+        reinterpret_cast<const char*>(frameData + 1),  // Skip flag byte
+        temp.data(),
+        static_cast<int>(srcSize - 1),  // Don't compress the flag
+        LZ4_compressBound(srcSize - 1),
+        1  // Maximum speed
     );
 
     // Copy to the original buffer
-    memset(const_cast<void*>(buf), 0, LENGTH_PER_FRAME);
+    memcpy(frameData + 1, temp.data(), compressedSize);
 
-    std::copy(holderChar, holderChar + compressedSize + 1, 
-              reinterpret_cast<uint8_t*>(const_cast<void*>(buf)));
-
-    VirtualFree(holder, 0, MEM_RELEASE);
+    //VirtualFree(holder, 0, MEM_RELEASE);
 
     auto compressEnd = std::chrono::steady_clock::now();
     auto duration = std::chrono::duration_cast<std::chrono::nanoseconds>(compressEnd - compressStart).count();
 
     std::cout << "                                                                                \r" << std::flush;
-    std::cout << "Compressed size: " << compressedSize << " Compression time: " << duration / 1000000 << " ms" << std::flush;
+    std::cout << "Compressed size: " << FormatBytes(compressedSize) << " Compression time: " << duration / 1000000 << " ms" << std::flush;
 
     return true;
 }
