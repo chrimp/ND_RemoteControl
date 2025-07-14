@@ -105,7 +105,7 @@ namespace DesktopDuplication {
 
     void ChooseOutput();
     bool ChooseOutput(_Out_ UINT& adapterIndex, _Out_ UINT& outputIndex);
-    UINT enumOutputs(IDXGIAdapter* adapter);
+    int enumOutputs(IDXGIAdapter* adapter);
     std::wstring GetMonitorFriendlyName(const DXGI_OUTPUT_DESC1& desc);
     std::wstring GetMonitorNameFromEDID(const std::wstring& deviceName);
 
