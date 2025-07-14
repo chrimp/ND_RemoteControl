@@ -63,7 +63,7 @@ namespace DesktopDuplication {
         ComPtr<ID3D11Texture2D> m_AcquiredDesktopImage;
 
         UINT m_Output;
-
+        UINT m_AdapterIndex;
         bool m_IsDuplRunning;
     };
 

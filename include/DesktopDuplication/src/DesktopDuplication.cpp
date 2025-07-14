@@ -352,7 +352,7 @@ bool Duplication::GetStagedTexture(_Out_ ID3D11Texture2D*& dst, _In_ unsigned lo
 
 void Duplication::SetOutput(UINT adapterIndex, UINT outputIndex) {
     m_Output = outputIndex;
-    // adapterIndex is not used for now
+    m_AdapterIndex = adapterIndex;
 }
 
 // MARK: DuplicationThread

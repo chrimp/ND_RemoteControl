@@ -18,9 +18,9 @@ constexpr char TEST_PORT[] = "54321";
 #undef max
 #undef min
 
-constexpr size_t WIDTH = 2560;
-constexpr size_t HEIGHT = 1440;
-constexpr size_t FPS = 240;
+constexpr size_t WIDTH = 1920;
+constexpr size_t HEIGHT = 1080;
+constexpr size_t FPS = 60;
 
 constexpr size_t LENGTH_PER_FRAME = 1 + (WIDTH * HEIGHT * 4);
 // Approx. 8.3MB per frame (FHD), consider batching. Send/Recv latency is around < 1 ms though.
@@ -221,93 +221,60 @@ public:
         int frames = 0;
 
         auto now = std::chrono::steady_clock::now();
-        ID3D11Texture2D* frameTex = nullptr;
 
         flag = 0;
 
         auto lastDraw = std::chrono::steady_clock::time_point::max();
-        std::vector<uint8_t> previousTex(LENGTH_PER_FRAME - 1, 0);
+
+        D3D11_TEXTURE2D_DESC desc;
+        desc.Width = WIDTH;
+        desc.Height = HEIGHT;
+        desc.MipLevels = 1;
+        desc.ArraySize = 1;
+        desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+        desc.SampleDesc.Count = 1;
+        desc.SampleDesc.Quality = 0;
+        desc.Usage = D3D11_USAGE_DEFAULT;
+        desc.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+        desc.CPUAccessFlags = 0;
+        desc.MiscFlags = 0;
+
+        ID3D11Texture2D* frameTex = nullptr;
+        hr = d3dDevice->CreateTexture2D(&desc, nullptr, &frameTex);
+
+        ID3D11Texture2D* previousTex = nullptr;
+        hr = d3dDevice->CreateTexture2D(&desc, nullptr, &previousTex);
 
         while (true) {
-            for (;;) {
-                flag = *static_cast<unsigned char*>(m_Buf);
-                if (flag == 1) {
-                    std::atomic_thread_fence(std::memory_order_acquire);
-                    goto newFrame;
-                }
-                if (std::chrono::steady_clock::now() - lastDraw > std::chrono::milliseconds(1000 / FPS)) goto noFrame;
-                _mm_pause();
+            sge.Buffer = m_Buf;
+            sge.BufferLength = 1;
+            sge.MemoryRegionToken = m_pMr->GetLocalToken();
+            if (FAILED(PostReceive(&sge, 1, RECV_CTXT))) {
+                std::cerr << "PostReceive for frame data failed." << std::endl;
+                return;
             }
 
-            newFrame:
-            {
-                D3D11_TEXTURE2D_DESC desc;
-                desc.Width = WIDTH;
-                desc.Height = HEIGHT;
-                desc.MipLevels = 1;
-                desc.ArraySize = 1;
-                desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
-                desc.SampleDesc.Count = 1;
-                desc.SampleDesc.Quality = 0;
-                desc.Usage = D3D11_USAGE_DEFAULT;
-                desc.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
-                desc.CPUAccessFlags = 0;
-                desc.MiscFlags = 0;
-
-                D3D11_SUBRESOURCE_DATA initData = {};
-                initData.pSysMem = reinterpret_cast<uint8_t*>(m_Buf) + 1; // Skip the first byte which is the flag
-                initData.SysMemPitch = desc.Width * 4;
-                initData.SysMemSlicePitch = 0;
-
-                std::copy(reinterpret_cast<uint8_t*>(m_Buf) + 1, 
-                        reinterpret_cast<uint8_t*>(m_Buf) + LENGTH_PER_FRAME, 
-                        previousTex.data());
-
-                HRESULT hr = d3dDevice->CreateTexture2D(&desc, &initData, &frameTex);
-                if (FAILED(hr)) {
-                    std::cerr << "CreateTexture2D failed: " << std::hex << hr << std::endl;
-                    throw new std::exception();
-                }
-            }
-
-            goto draw;
-
-            noFrame:
-            {
-                D3D11_TEXTURE2D_DESC desc;
-                desc.Width = WIDTH;
-                desc.Height = HEIGHT;
-                desc.MipLevels = 1;
-                desc.ArraySize = 1;
-                desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
-                desc.SampleDesc.Count = 1;
-                desc.SampleDesc.Quality = 0;
-                desc.Usage = D3D11_USAGE_DEFAULT;
-                desc.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
-                desc.CPUAccessFlags = 0;
-                desc.MiscFlags = 0;
-
-                D3D11_SUBRESOURCE_DATA initData = {};
-                initData.pSysMem = previousTex.data();
-                initData.SysMemPitch = desc.Width * 4;
-                initData.SysMemSlicePitch = 0;
-
-                HRESULT hr = d3dDevice->CreateTexture2D(&desc, &initData, &frameTex);
-                if (FAILED(hr)) {
-                    std::cerr << "CreateTexture2D failed: " << std::hex << hr << std::endl;
-                    throw new std::exception();
-                }
-            }
-
-            draw:
-            lastDraw = std::chrono::steady_clock::now();
-            renderer.SetSourceSurface(frameTex);
-            renderer.Render();
-
-            frameTex->Release();
-
-            //memset(m_Buf, 0, LENGTH_PER_FRAME);
             memset(m_Buf, 2, 1);
+
+            if (FAILED(WaitForCompletionAndCheckContext(RECV_CTXT))) {
+                std::cerr << "WaitForCompletion for frame data failed." << std::endl;
+                return;
+            }
+
+            flag = *static_cast<unsigned char*>(m_Buf);
+
+            if (flag == 1) {
+                std::atomic_thread_fence(std::memory_order_acquire);
+                d3dContext->UpdateSubresource(frameTex, 0, nullptr, reinterpret_cast<uint8_t*>(m_Buf) + 1, WIDTH * 4, 0);
+                d3dContext->CopyResource(previousTex, frameTex);
+                renderer.SetSourceSurface(frameTex);
+            } else if (flag == 3) {
+                renderer.SetSourceSurface(previousTex);
+            }
+
+            lastDraw = std::chrono::steady_clock::now();
+            
+            renderer.Render();
 
             if (_kbhit()) {
                 char c = _getch();
@@ -467,14 +434,29 @@ public:
         DesktopDuplication::Duplication& dupl = DesktopDuplication::Singleton<DesktopDuplication::Duplication>::Instance();
 
         while (true) {
+            auto entry = std::chrono::steady_clock::now();
+
             ID3D11Texture2D* frame;
             memset(m_Buf, 0, LENGTH_PER_FRAME);
 
             bool success = dupl.GetStagedTexture(frame, 1000 / FPS);
+            
+            sge.Buffer = m_Buf;
+            sge.BufferLength = 1;
+            sge.MemoryRegionToken = m_pMr->GetLocalToken();
+
             if (!success) {
-                //std::this_thread::sleep_for(std::chrono::milliseconds(1000/FPS/2)); // Timed out--probably no movement on the screen
+                *reinterpret_cast<uint8_t*>(m_Buf) = 3;
+                if (FAILED(Send(&sge, 1, 0, SEND_CTXT))) {
+                    std::cerr << "Send of no frame failed." << std::endl;
+                    return;
+                }
+                if (!WaitForCompletionAndCheckContext(SEND_CTXT)) {
+                    std::cerr << "WaitForCompletion for no frame send failed." << std::endl;
+                }
                 continue;
             }
+            
 
             D3D11_TEXTURE2D_DESC desc;
             frame->GetDesc(&desc);
@@ -511,19 +493,19 @@ public:
                 return;
             }
 
-            // Now set the flag
-            reinterpret_cast<unsigned char*>(m_Buf)[0] = 1;
+            sge.Buffer = m_Buf;
             sge.BufferLength = 1;
-            if (FAILED(Write(&sge, 1, remoteInfo.remoteAddr, remoteInfo.remoteToken, 0, WRITE_CTXT))) {
-                std::cerr << "Write to set flag failed." << std::endl;
-                return;
-            }
-            if (!WaitForCompletionAndCheckContext(WRITE_CTXT)) {
-                std::cerr << "WaitForCompletion for flag set failed." << std::endl;
-                return;
-            }
+            sge.MemoryRegionToken = m_pMr->GetLocalToken();
 
-            auto lastSend = std::chrono::steady_clock::now();
+            *reinterpret_cast<uint8_t*>(m_Buf) = 1;
+            if (FAILED(Send(&sge, 1, 0, SEND_CTXT))) {
+                std::cerr << "Send of frame data failed." << std::endl;
+                return;
+            }
+            if (!WaitForCompletionAndCheckContext(SEND_CTXT)) {
+                std::cerr << "WaitForCompletion for frame data send failed." << std::endl;
+                return;
+            }
 
             // Wait for server to acknowledge the frame
             sge.Buffer = m_Buf;
@@ -541,15 +523,19 @@ public:
                 }
 
                 flag = *reinterpret_cast<uint8_t*>(m_Buf);
+                _mm_pause();
             }
 
+            /*
             auto now = std::chrono::steady_clock::now();
-            auto dur = std::chrono::duration_cast<std::chrono::nanoseconds>(now - lastSend).count();
+            auto dur = std::chrono::duration_cast<std::chrono::nanoseconds>(now - entry).count();
 
             while (dur < 1000000000 / FPS) {
                 now = std::chrono::steady_clock::now();
-                dur = std::chrono::duration_cast<std::chrono::nanoseconds>(now - lastSend).count();
+                dur = std::chrono::duration_cast<std::chrono::nanoseconds>(now - entry).count();
+                _mm_pause();
             }
+            */
         }
 
         Shutdown();
