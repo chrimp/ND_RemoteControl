@@ -317,6 +317,39 @@ bool Duplication::GetStagedTexture(_Out_ ID3D11Texture2D*& dst) {
     return true;
 }
 
+bool Duplication::GetStagedTexture(_Out_ ID3D11Texture2D*& dst, _In_ unsigned long timeout) {
+    ID3D11Texture2D* frame = nullptr;
+    int result = GetFrame(frame, timeout);
+
+    switch (result) {
+        case 1:
+            #ifdef _DEBUG
+            abort();
+            #endif
+            return false;
+        case -1:
+            return false;
+    }
+
+    D3D11_TEXTURE2D_DESC desc;
+    frame->GetDesc(&desc);
+
+    desc.Usage = D3D11_USAGE_STAGING;
+    desc.BindFlags = 0;
+    desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    desc.MiscFlags = 0;
+
+    m_Device->CreateTexture2D(&desc, nullptr, &dst);
+    m_Context->CopyResource(dst, frame);
+    ReleaseFrame();
+
+    dst->GetDesc(&desc);
+    if (desc.Format != DXGI_FORMAT_B8G8R8A8_UNORM) abort();
+
+    return true;
+}
+
 void Duplication::SetOutput(UINT adapterIndex, UINT outputIndex) {
     m_Output = outputIndex;
     // adapterIndex is not used for now

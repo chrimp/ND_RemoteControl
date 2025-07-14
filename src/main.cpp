@@ -20,73 +20,12 @@ constexpr char TEST_PORT[] = "54321";
 
 constexpr size_t WIDTH = 2560;
 constexpr size_t HEIGHT = 1440;
-constexpr size_t FPS = 120;
+constexpr size_t FPS = 240;
 
-constexpr size_t LENGTH_PER_FRAME = 1 + (WIDTH * HEIGHT * 3);
+constexpr size_t LENGTH_PER_FRAME = 1 + (WIDTH * HEIGHT * 4);
 // Approx. 8.3MB per frame (FHD), consider batching. Send/Recv latency is around < 1 ms though.
 
 static size_t maxSge = -1;
-
-bool SaveFrameFromBuffer(const std::filesystem::path& path, const uint8_t* buffer, size_t length, unsigned int width, unsigned int height) {
-    IWICImagingFactory* factory = nullptr;
-    IWICBitmapEncoder* encoder = nullptr;
-    IWICBitmapFrameEncode* frame = nullptr;
-    IWICStream* stream = nullptr;
-
-    HRESULT hr = CoInitialize(nullptr);
-    if (FAILED(hr)) return false;
-
-    hr = CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&factory));
-    if (FAILED(hr)) return false;
-
-    hr = factory->CreateStream(&stream);
-    if (FAILED(hr)) return false;
-
-    std::time_t now = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
-    std::tm localTime;
-    localtime_s(&localTime, &now);
-
-    std::string time = std::format("{:04d}-{:02d}-{:02d}_{:02d}-{:02d}-{:02d}", localTime.tm_year + 1900, localTime.tm_mon + 1, localTime.tm_mday, localTime.tm_hour, localTime.tm_min, localTime.tm_sec);
-
-    std::filesystem::path savePath = path / std::format("DeskDupl_{}.png", time);
-
-    hr = stream->InitializeFromFilename(savePath.c_str(), GENERIC_WRITE);
-    if (FAILED(hr)) return false;
-
-    hr = factory->CreateEncoder(GUID_ContainerFormatPng, nullptr, &encoder);
-    if (FAILED(hr)) return false;
-
-    hr = encoder->Initialize(stream, WICBitmapEncoderNoCache);
-    if (FAILED(hr)) return false;
-
-    hr = encoder->CreateNewFrame(&frame, nullptr);
-    if (FAILED(hr)) return false;
-
-    hr = frame->Initialize(nullptr);
-    if (FAILED(hr)) return false;
-
-    hr = frame->SetSize(width, height);
-    if (FAILED(hr)) return false;
-
-    WICPixelFormatGUID format = GUID_WICPixelFormat32bppBGRA;
-    hr = frame->SetPixelFormat(&format);
-    if (FAILED(hr)) return false;
-
-    hr = frame->WritePixels(height, width * 4, length, const_cast<unsigned char*>(buffer));
-    if (FAILED(hr)) return false;
-
-    frame->Commit();
-    encoder->Commit();
-
-    stream->Release();
-    frame->Release();
-    encoder->Release();
-    factory->Release();
-
-    CoUninitialize();
-
-    return true;
-}
 
 std::string FormatBytes(uint64_t bytes) {
     if (bytes >= 1024ULL * 1024 * 1024) {
@@ -284,61 +223,91 @@ public:
         auto now = std::chrono::steady_clock::now();
         ID3D11Texture2D* frameTex = nullptr;
 
+        flag = 0;
+
+        auto lastDraw = std::chrono::steady_clock::time_point::max();
+        std::vector<uint8_t> previousTex(LENGTH_PER_FRAME - 1, 0);
+
         while (true) {
-            while (true) {
+            for (;;) {
                 flag = *static_cast<unsigned char*>(m_Buf);
                 if (flag == 1) {
-                    break;
+                    std::atomic_thread_fence(std::memory_order_acquire);
+                    goto newFrame;
                 }
+                if (std::chrono::steady_clock::now() - lastDraw > std::chrono::milliseconds(1000 / FPS)) goto noFrame;
                 _mm_pause();
             }
 
-            D3D11_TEXTURE2D_DESC desc;
-            desc.Width = WIDTH;
-            desc.Height = HEIGHT;
-            desc.MipLevels = 1;
-            desc.ArraySize = 1;
-            desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
-            desc.SampleDesc.Count = 1;
-            desc.SampleDesc.Quality = 0;
-            desc.Usage = D3D11_USAGE_DEFAULT;
-            desc.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
-            desc.CPUAccessFlags = 0;
-            desc.MiscFlags = 0;
+            newFrame:
+            {
+                D3D11_TEXTURE2D_DESC desc;
+                desc.Width = WIDTH;
+                desc.Height = HEIGHT;
+                desc.MipLevels = 1;
+                desc.ArraySize = 1;
+                desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+                desc.SampleDesc.Count = 1;
+                desc.SampleDesc.Quality = 0;
+                desc.Usage = D3D11_USAGE_DEFAULT;
+                desc.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+                desc.CPUAccessFlags = 0;
+                desc.MiscFlags = 0;
 
-            D3D11_SUBRESOURCE_DATA initData = {};
-            initData.pSysMem = reinterpret_cast<uint8_t*>(m_Buf) + 1; // Skip the first byte which is the flag
-            initData.SysMemPitch = desc.Width * 4;
-            initData.SysMemSlicePitch = 0;
+                D3D11_SUBRESOURCE_DATA initData = {};
+                initData.pSysMem = reinterpret_cast<uint8_t*>(m_Buf) + 1; // Skip the first byte which is the flag
+                initData.SysMemPitch = desc.Width * 4;
+                initData.SysMemSlicePitch = 0;
 
-            HRESULT hr = d3dDevice->CreateTexture2D(&desc, &initData, &frameTex);
-            if (FAILED(hr)) {
-                std::cerr << "CreateTexture2D failed: " << std::hex << hr << std::endl;
-                throw new std::exception();
+                std::copy(reinterpret_cast<uint8_t*>(m_Buf) + 1, 
+                        reinterpret_cast<uint8_t*>(m_Buf) + LENGTH_PER_FRAME, 
+                        previousTex.data());
+
+                HRESULT hr = d3dDevice->CreateTexture2D(&desc, &initData, &frameTex);
+                if (FAILED(hr)) {
+                    std::cerr << "CreateTexture2D failed: " << std::hex << hr << std::endl;
+                    throw new std::exception();
+                }
             }
 
+            goto draw;
+
+            noFrame:
+            {
+                D3D11_TEXTURE2D_DESC desc;
+                desc.Width = WIDTH;
+                desc.Height = HEIGHT;
+                desc.MipLevels = 1;
+                desc.ArraySize = 1;
+                desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+                desc.SampleDesc.Count = 1;
+                desc.SampleDesc.Quality = 0;
+                desc.Usage = D3D11_USAGE_DEFAULT;
+                desc.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+                desc.CPUAccessFlags = 0;
+                desc.MiscFlags = 0;
+
+                D3D11_SUBRESOURCE_DATA initData = {};
+                initData.pSysMem = previousTex.data();
+                initData.SysMemPitch = desc.Width * 4;
+                initData.SysMemSlicePitch = 0;
+
+                HRESULT hr = d3dDevice->CreateTexture2D(&desc, &initData, &frameTex);
+                if (FAILED(hr)) {
+                    std::cerr << "CreateTexture2D failed: " << std::hex << hr << std::endl;
+                    throw new std::exception();
+                }
+            }
+
+            draw:
+            lastDraw = std::chrono::steady_clock::now();
             renderer.SetSourceSurface(frameTex);
             renderer.Render();
 
             frameTex->Release();
 
-            /*
-            if (!SaveFrameFromBuffer("./", reinterpret_cast<uint8_t*>(m_Buf) + 1, LENGTH_PER_FRAME - 1, WIDTH, HEIGHT)) {
-                std::cerr << "Failed to save frame." << std::endl;
-            }
-            */
-
-            memset(m_Buf, 0, LENGTH_PER_FRAME);
+            //memset(m_Buf, 0, LENGTH_PER_FRAME);
             memset(m_Buf, 2, 1);
-
-            if (FAILED(Write(&sge, 1, remoteInfo.remoteAddr, remoteInfo.remoteToken, 0, WRITE_CTXT))) {
-                std::cerr << "Write to reset flag failed." << std::endl;
-                return;
-            }
-            if (!WaitForCompletionAndCheckContext(WRITE_CTXT)) {
-                std::cerr << "WaitForCompletion for reset flag write failed." << std::endl;
-                return;
-            }
 
             if (_kbhit()) {
                 char c = _getch();
@@ -499,14 +468,13 @@ public:
 
         while (true) {
             ID3D11Texture2D* frame;
+            memset(m_Buf, 0, LENGTH_PER_FRAME);
 
-            bool success = dupl.GetStagedTexture(frame);
+            bool success = dupl.GetStagedTexture(frame, 1000 / FPS);
             if (!success) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(1000/FPS)); // Timed out--probably no movement on the screen
+                //std::this_thread::sleep_for(std::chrono::milliseconds(1000/FPS/2)); // Timed out--probably no movement on the screen
                 continue;
             }
-
-            auto getTime = std::chrono::steady_clock::now();
 
             D3D11_TEXTURE2D_DESC desc;
             frame->GetDesc(&desc);
@@ -526,6 +494,8 @@ public:
             dupl.GetContext()->Unmap(frame, 0);
             frame->Release();
             frame = nullptr;
+
+            uint8_t flag = *reinterpret_cast<uint8_t*>(m_Buf);
 
             // Send the frame data
             sge.Buffer = m_Buf;
@@ -553,21 +523,14 @@ public:
                 return;
             }
 
-            auto now = std::chrono::steady_clock::now();
-            auto elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(now - getTime).count();
-            while (elapsed < 1000000000/FPS) {
-                _mm_pause();
-                now = std::chrono::steady_clock::now();
-                elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(now - getTime).count();
-            }
+            auto lastSend = std::chrono::steady_clock::now();
 
             // Wait for server to acknowledge the frame
-            memset(m_Buf, 0, LENGTH_PER_FRAME);
             sge.Buffer = m_Buf;
             sge.BufferLength = 1;
             sge.MemoryRegionToken = m_pMr->GetLocalToken();
 
-            while (true) {
+            while (flag != 2) {
                 if (FAILED(Read(&sge, 1, remoteInfo.remoteAddr, remoteInfo.remoteToken, 0, READ_CTXT))) {
                     std::cerr << "Read failed." << std::endl;
                     return;
@@ -577,10 +540,15 @@ public:
                     return;
                 }
 
-                if (reinterpret_cast<uint8_t*>(m_Buf)[0] == 2) {
-                    break;
-                }
-                _mm_pause();
+                flag = *reinterpret_cast<uint8_t*>(m_Buf);
+            }
+
+            auto now = std::chrono::steady_clock::now();
+            auto dur = std::chrono::duration_cast<std::chrono::nanoseconds>(now - lastSend).count();
+
+            while (dur < 1000000000 / FPS) {
+                now = std::chrono::steady_clock::now();
+                dur = std::chrono::duration_cast<std::chrono::nanoseconds>(now - lastSend).count();
             }
         }
 
