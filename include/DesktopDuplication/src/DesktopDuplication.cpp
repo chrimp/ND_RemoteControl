@@ -11,9 +11,6 @@
 #include <chrono>
 #include <format>
 #include <wincodec.h>
-#include <d3dcompiler.h>
-
-#pragma comment(lib, "d3dcompiler.lib")
 
 using namespace DesktopDuplication;
 
@@ -24,17 +21,6 @@ Duplication::Duplication() {
     m_AcquiredDesktopImage = nullptr;
     m_Output = -1;
     m_IsDuplRunning = false;
-
-    m_CursorTexture = nullptr;
-    m_CursorSRV = nullptr;
-    m_FrameRTV = nullptr;
-    m_AlphaBlendState = nullptr;
-    m_CursorVS = nullptr;
-    m_CursorPS = nullptr;
-    m_CursorVertexBuffer = nullptr;
-    m_CursorConstantBuffer = nullptr;
-    m_CursorInputLayout = nullptr;
-    m_CursorSampler = nullptr;
 }
 
 Duplication::~Duplication() {
@@ -65,7 +51,7 @@ bool Duplication::InitDuplication() {
         return true;
     }
 
-    UINT flag = 0;
+    UINT flag = D3D11_CREATE_DEVICE_BGRA_SUPPORT;
     #ifdef _DEBUG
     flag |= D3D11_CREATE_DEVICE_DEBUG;
     #endif
@@ -89,13 +75,15 @@ bool Duplication::InitDuplication() {
         return false;
     }
 
+    D3D_FEATURE_LEVEL featureLevel = D3D_FEATURE_LEVEL_11_1;
+
     hr = D3D11CreateDevice(
         adapter,
         D3D_DRIVER_TYPE_UNKNOWN,
         nullptr,
         flag,
-        nullptr,
-        0,
+        &featureLevel,
+        1,
         D3D11_SDK_VERSION,
         &device,
         nullptr,
@@ -124,6 +112,47 @@ bool Duplication::InitDuplication() {
     hr = device->QueryInterface(IID_PPV_ARGS(m_Device.GetAddressOf()));
     if (FAILED(hr)) {
         std::cerr << "Failed to query D3D11Device5 interface. Reason: 0x" << std::hex << hr << std::endl;
+        return false;
+    }
+
+    // Create D2D
+    D2D1_FACTORY_OPTIONS options = {};
+    #ifdef _DEBUG
+    options.debugLevel = D2D1_DEBUG_LEVEL_INFORMATION;
+    #endif
+    hr = D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, __uuidof(ID2D1Factory3), &options, (void**)m_D2DFactory.GetAddressOf());
+    if (FAILED(hr)) {
+        std::cerr << "Failed to create D2D factory. Reason: 0x" << std::hex << hr << std::endl;
+        return false;
+    }
+
+    IDXGIDevice* d2dDxgiDevice = nullptr;
+    hr = m_Device->QueryInterface(IID_PPV_ARGS(&d2dDxgiDevice));
+
+    hr = m_D2DFactory->CreateDevice(d2dDxgiDevice, m_D2DDevice.GetAddressOf());
+    if (FAILED(hr)) {
+        std::cerr << "Failed to create D2D device. Reason: 0x" << std::hex << hr << std::endl;
+        d2dDxgiDevice->Release();
+        return false;
+    }
+
+    hr = m_D2DDevice->CreateDeviceContext(D2D1_DEVICE_CONTEXT_OPTIONS_NONE, m_D2DContext.GetAddressOf());
+    if (FAILED(hr)) {
+        std::cerr << "Failed to create D2D device context. Reason: 0x" << std::hex << hr << std::endl;
+        d2dDxgiDevice->Release();
+        return false;
+    }
+
+    hr = m_D2DContext->CreateSolidColorBrush(D2D1::ColorF(D2D1::ColorF::Black), m_BlackBrush.GetAddressOf());
+    if (FAILED(hr)) {
+        std::cerr << "Failed to create D2D solid color brush. Reason: 0x" << std::hex << hr << std::endl;
+        d2dDxgiDevice->Release();
+        return false;
+    }
+    hr = m_D2DContext->CreateSolidColorBrush(D2D1::ColorF(D2D1::ColorF::White), m_WhiteBrush.GetAddressOf());
+    if (FAILED(hr)) {
+        std::cerr << "Failed to create D2D solid color brush. Reason: 0x" << std::hex << hr << std::endl;
+        d2dDxgiDevice->Release();
         return false;
     }
 
@@ -280,7 +309,9 @@ int Duplication::GetFrame(ID3D11Texture2D*& frame, unsigned long timeout) {
     DXGI_OUTDUPL_FRAME_INFO frameInfo;
 
     HRESULT hr = m_DesktopDupl->AcquireNextFrame(timeout, &frameInfo, &desktopResource);
-    if (hr == DXGI_ERROR_WAIT_TIMEOUT) return -1;
+    if (hr == DXGI_ERROR_WAIT_TIMEOUT) {
+        return -1;
+    }
 
     if (FAILED(hr)) {
         std::cerr << "Failed to acquire next frame. Reason: 0x" << std::hex << hr << std::endl;
@@ -298,389 +329,152 @@ int Duplication::GetFrame(ID3D11Texture2D*& frame, unsigned long timeout) {
         return 1;
     }
 
-    if (frameInfo.PointerPosition.Visible && frameInfo.PointerShapeBufferSize > 0) {
-        CompositeCursorOnFrame(m_AcquiredDesktopImage.Get(), frameInfo);
+    if (!m_CompositionTexture) {
+        D3D11_TEXTURE2D_DESC desc;
+        m_AcquiredDesktopImage->GetDesc(&desc);
+        
+        desc.BindFlags = D3D11_BIND_RENDER_TARGET;
+        desc.MiscFlags = 0;
+        hr = m_Device->CreateTexture2D(&desc, nullptr, m_CompositionTexture.GetAddressOf());
+        if (FAILED(hr)) {
+            ReleaseFrame();
+            std::cerr << "Failed to create composition texture. Reason: 0x" << std::hex << hr << std::endl;
+            return 1;
+        }
     }
 
-    frame = m_AcquiredDesktopImage.Get();
+    if (!m_LastCleanTexture) {
+        D3D11_TEXTURE2D_DESC desc;
+        m_AcquiredDesktopImage->GetDesc(&desc);
+        
+        hr = m_Device->CreateTexture2D(&desc, nullptr, m_LastCleanTexture.GetAddressOf());
+        if (FAILED(hr)) {
+            ReleaseFrame();
+            std::cerr << "Failed to create composition texture. Reason: 0x" << std::hex << hr << std::endl;
+            return 1;
+        }
+    }
 
+    // This copy is the fix for mouse cursor trail/ghosting.
+    // I cannot assure why this works, but this is the information pulled from LLM after some discussion:
+    // DXGI returns the same pointer to the same texture if there's no update to the desktop (LastPresentTime == 0) despite calling ReleaseFrame().
+    // GPU (or driver), as m_AcquiredDesktopImage being the same, sees CopyResource(m_CompositionTexture, m_AcquiredDesktopImage) as a redundant operation, therfore optimizes away.
+    // This prevents m_CompositionTexture from cleared with the clean frame, leaving the last cursor in the texture.
+    // However, by placing a new texture, m_LastCleanTexture, GPU cannot assure that m_AcquiredDesktopImage or m_CompositionTexture and m_LastCleanTexture are the same, so it performs the copy.
+    // This can be mitigated by placing a fence (Begin() -> End() -> GetData()) between the problematic CopyResource call, but it will be costly.
+
+    if (frameInfo.LastPresentTime.QuadPart == 0) {
+        m_Context->CopyResource(m_CompositionTexture.Get(), m_LastCleanTexture.Get());
+    } else {
+        m_Context->CopyResource(m_CompositionTexture.Get(), m_AcquiredDesktopImage.Get());
+        m_Context->CopyResource(m_LastCleanTexture.Get(), m_AcquiredDesktopImage.Get());
+    }
+
+    // Draw cursor if visible
+    if (frameInfo.PointerPosition.Visible) {
+        // Get new cursor shape if needed
+        if (frameInfo.PointerShapeBufferSize != 0) {
+            m_CursorShape.resize(frameInfo.PointerShapeBufferSize);
+            UINT requiredSize = 0;
+            hr = m_DesktopDupl->GetFramePointerShape(frameInfo.PointerShapeBufferSize, m_CursorShape.data(), &requiredSize, &m_CursorShapeInfo);
+            if (FAILED(hr)) {
+                ReleaseFrame();
+                return 1;
+            }
+        }
+
+        ComPtr<IDXGISurface> dxgiSurface;
+        hr = m_CompositionTexture.As(&dxgiSurface);
+        if (SUCCEEDED(hr)) {
+            ComPtr<ID2D1Bitmap1> d2dBitmap;
+            D2D1_BITMAP_PROPERTIES1 bitmapProperties = D2D1::BitmapProperties1(
+                D2D1_BITMAP_OPTIONS_TARGET | D2D1_BITMAP_OPTIONS_CANNOT_DRAW,
+                D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED)
+            );
+            hr = m_D2DContext->CreateBitmapFromDxgiSurface(dxgiSurface.Get(), &bitmapProperties, &d2dBitmap);
+
+            if (SUCCEEDED(hr)) {
+                m_D2DContext->SetTarget(d2dBitmap.Get());
+                m_D2DContext->BeginDraw();
+
+                POINT pos = frameInfo.PointerPosition.Position;
+                if (m_CursorShapeInfo.Type == DXGI_OUTDUPL_POINTER_SHAPE_TYPE_COLOR) {
+                    ComPtr<ID2D1Bitmap> cursorBitmap;
+                    hr = m_D2DContext->CreateBitmap(
+                        D2D1::SizeU(m_CursorShapeInfo.Width, m_CursorShapeInfo.Height),
+                        m_CursorShape.data(),
+                        m_CursorShapeInfo.Pitch,
+                        D2D1::BitmapProperties(D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED)),
+                        &cursorBitmap
+                    );
+                    if (SUCCEEDED(hr)) {
+                        D2D1_RECT_F rect = D2D1::RectF(
+                            static_cast<float>(pos.x),
+                            static_cast<float>(pos.y),
+                            static_cast<float>(pos.x + m_CursorShapeInfo.Width),
+                            static_cast<float>(pos.y + m_CursorShapeInfo.Height)
+                        );
+                        m_D2DContext->DrawBitmap(cursorBitmap.Get(), rect);
+                    }
+                } else if (m_CursorShapeInfo.Type == DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MONOCHROME) {
+                    // Manually build the monochrome cursor image as RGBA
+                    std::vector<BYTE> cursorPixels(m_CursorShapeInfo.Width * (m_CursorShapeInfo.Height / 2) * 4);
+                    BYTE* andMask = m_CursorShape.data();
+                    BYTE* xorMask = m_CursorShape.data() + (m_CursorShapeInfo.Height / 2 * m_CursorShapeInfo.Pitch);
+
+                    for (UINT y = 0; y < m_CursorShapeInfo.Height / 2; ++y) {
+                        for (UINT x = 0; x < m_CursorShapeInfo.Width; ++x) {
+                            BYTE andByte = andMask[y * m_CursorShapeInfo.Pitch + x / 8];
+                            BYTE xorByte = xorMask[y * m_CursorShapeInfo.Pitch + x / 8];
+                            
+                            BYTE andBit = (andByte >> (7 - (x % 8))) & 1;
+                            BYTE xorBit = (xorByte >> (7 - (x % 8))) & 1;
+
+                            BYTE* pixel = &cursorPixels[(y * m_CursorShapeInfo.Width + x) * 4];
+                            if (andBit == 0 && xorBit == 0) { // Black
+                                pixel[0] = 0; pixel[1] = 0; pixel[2] = 0; pixel[3] = 255;
+                            } else if (andBit == 0 && xorBit == 1) { // White
+                                pixel[0] = 255; pixel[1] = 255; pixel[2] = 255; pixel[3] = 255;
+                            } else if (andBit == 1 && xorBit == 0) { // Transparent
+                                pixel[0] = 0; pixel[1] = 0; pixel[2] = 0; pixel[3] = 0;
+                            } else { // Inverted (we'll treat as transparent for simplicity)
+                                pixel[0] = 0; pixel[1] = 0; pixel[2] = 0; pixel[3] = 0;
+                            }
+                        }
+                    }
+
+                    ComPtr<ID2D1Bitmap> cursorBitmap;
+                    hr = m_D2DContext->CreateBitmap(
+                        D2D1::SizeU(m_CursorShapeInfo.Width, m_CursorShapeInfo.Height / 2),
+                        cursorPixels.data(),
+                        m_CursorShapeInfo.Width * 4,
+                        D2D1::BitmapProperties(D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED)),
+                        &cursorBitmap
+                    );
+
+                    if (SUCCEEDED(hr)) {
+                         D2D1_RECT_F cursorRect = D2D1::RectF(
+                            static_cast<float>(pos.x),
+                            static_cast<float>(pos.y),
+                            static_cast<float>(pos.x + m_CursorShapeInfo.Width),
+                            static_cast<float>(pos.y + m_CursorShapeInfo.Height / 2)
+                        );
+                        m_D2DContext->DrawBitmap(cursorBitmap.Get(), cursorRect);
+                    }
+                }
+
+                m_D2DContext->EndDraw();
+                m_D2DContext->SetTarget(nullptr);
+            } else {
+                abort();
+            }
+        }
+    }
+
+    ReleaseFrame();
+
+    frame = m_CompositionTexture.Get();
     return 0;
-}
-
-bool Duplication::UpdateCursorTexture(const DXGI_OUTDUPL_FRAME_INFO& frameInfo) {
-    // Get cursor shape data
-    std::vector<BYTE> shapeBuffer(frameInfo.PointerShapeBufferSize);
-    DXGI_OUTDUPL_POINTER_SHAPE_INFO shapeInfo;
-    UINT bufferSizeRequired;
-    
-    HRESULT hr = m_DesktopDupl->GetFramePointerShape(
-        frameInfo.PointerShapeBufferSize,
-        shapeBuffer.data(),
-        &bufferSizeRequired,
-        &shapeInfo
-    );
-    
-    if (FAILED(hr)) return false;
-    
-    // Check if shape changed
-    if (memcmp(&m_LastShapeInfo, &shapeInfo, sizeof(shapeInfo)) == 0 && 
-        m_LastCursorShape == shapeBuffer) {
-        return true; // No change needed
-    }
-    
-    // Create new cursor texture
-    D3D11_TEXTURE2D_DESC desc = {};
-    desc.Width = shapeInfo.Width;
-    desc.Height = shapeInfo.Height;
-    desc.MipLevels = 1;
-    desc.ArraySize = 1;
-    desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
-    desc.SampleDesc.Count = 1;
-    desc.Usage = D3D11_USAGE_DEFAULT;
-    desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-    
-    // Convert cursor shape data based on type
-    std::vector<uint32_t> cursorPixels(shapeInfo.Width * shapeInfo.Height);
-    
-    if (shapeInfo.Type == DXGI_OUTDUPL_POINTER_SHAPE_TYPE_COLOR) {
-        // Color cursor - direct copy
-        memcpy(cursorPixels.data(), shapeBuffer.data(), shapeBuffer.size());
-    }
-    else if (shapeInfo.Type == DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MONOCHROME) {
-        // Monochrome cursor - convert to BGRA
-        ConvertMonochromeCursor(shapeBuffer.data(), cursorPixels.data(), shapeInfo);
-    }
-    else if (shapeInfo.Type == DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MASKED_COLOR) {
-        // Masked color cursor
-        ConvertMaskedColorCursor(shapeBuffer.data(), cursorPixels.data(), shapeInfo);
-    }
-    
-    D3D11_SUBRESOURCE_DATA initData = {};
-    initData.pSysMem = cursorPixels.data();
-    initData.SysMemPitch = shapeInfo.Width * 4;
-    
-    m_CursorTexture.Reset();
-    m_CursorSRV.Reset();
-    
-    hr = m_Device->CreateTexture2D(&desc, &initData, m_CursorTexture.GetAddressOf());
-    if (FAILED(hr)) return false;
-    
-    hr = m_Device->CreateShaderResourceView(m_CursorTexture.Get(), nullptr, m_CursorSRV.GetAddressOf());
-    if (FAILED(hr)) return false;
-    
-    m_LastShapeInfo = shapeInfo;
-    m_LastCursorShape = shapeBuffer;
-    
-    return true;
-}
-
-bool Duplication::CompositeCursorOnFrame(ID3D11Texture2D* frame, const DXGI_OUTDUPL_FRAME_INFO& frameInfo) {
-    // Initialize cursor rendering resources if not done yet
-    if (!m_CursorVS) {
-        if (!InitializeCursorRendering()) {
-            return false;
-        }
-    }
-    
-    // Update cursor texture if shape changed
-    if (frameInfo.PointerShapeBufferSize > 0) {
-        if (!UpdateCursorTexture(frameInfo)) {
-            return false;
-        }
-    }
-    
-    // Need a cursor texture to render
-    if (!m_CursorSRV) {
-        return true; // No cursor to render, but not an error
-    }
-    
-    // Create or update RTV for the frame
-    m_FrameRTV.Reset();
-    HRESULT hr = m_Device->CreateRenderTargetView(frame, nullptr, m_FrameRTV.GetAddressOf());
-    if (FAILED(hr)) return false;
-    
-    // Set up rendering pipeline
-    m_Context->OMSetRenderTargets(1, m_FrameRTV.GetAddressOf(), nullptr);
-    m_Context->OMSetBlendState(m_AlphaBlendState.Get(), nullptr, 0xFFFFFFFF);
-    
-    // Set viewport
-    D3D11_TEXTURE2D_DESC frameDesc;
-    frame->GetDesc(&frameDesc);
-    
-    D3D11_VIEWPORT viewport = {};
-    viewport.Width = static_cast<float>(frameDesc.Width);
-    viewport.Height = static_cast<float>(frameDesc.Height);
-    viewport.MinDepth = 0.0f;
-    viewport.MaxDepth = 1.0f;
-    m_Context->RSSetViewports(1, &viewport);
-    
-    // Set shaders and resources
-    m_Context->VSSetShader(m_CursorVS.Get(), nullptr, 0);
-    m_Context->PSSetShader(m_CursorPS.Get(), nullptr, 0);
-    m_Context->PSSetShaderResources(0, 1, m_CursorSRV.GetAddressOf());
-    m_Context->PSSetSamplers(0, 1, m_CursorSampler.GetAddressOf());
-    
-    // Update cursor position constants
-    struct CursorConstants {
-        float cursorPosX, cursorPosY;
-        float cursorSizeX, cursorSizeY;
-        float screenSizeX, screenSizeY;
-        float hotSpotX, hotSpotY;
-    } constants;
-    
-    constants.cursorPosX = static_cast<float>(frameInfo.PointerPosition.Position.x - m_LastShapeInfo.HotSpot.x);
-    constants.cursorPosY = static_cast<float>(frameInfo.PointerPosition.Position.y - m_LastShapeInfo.HotSpot.y);
-    constants.cursorSizeX = static_cast<float>(m_LastShapeInfo.Width);
-    constants.cursorSizeY = static_cast<float>(m_LastShapeInfo.Height);
-    constants.screenSizeX = static_cast<float>(frameDesc.Width);
-    constants.screenSizeY = static_cast<float>(frameDesc.Height);
-    constants.hotSpotX = static_cast<float>(m_LastShapeInfo.HotSpot.x);
-    constants.hotSpotY = static_cast<float>(m_LastShapeInfo.HotSpot.y);
-    
-    // Update constant buffer
-    D3D11_MAPPED_SUBRESOURCE mappedResource;
-    hr = m_Context->Map(m_CursorConstantBuffer.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mappedResource);
-    if (SUCCEEDED(hr)) {
-        memcpy(mappedResource.pData, &constants, sizeof(constants));
-        m_Context->Unmap(m_CursorConstantBuffer.Get(), 0);
-    }
-    
-    m_Context->VSSetConstantBuffers(0, 1, m_CursorConstantBuffer.GetAddressOf());
-    
-    // Set vertex buffer and draw cursor quad
-    UINT stride = sizeof(float) * 4;
-    UINT offset = 0;
-    m_Context->IASetVertexBuffers(0, 1, m_CursorVertexBuffer.GetAddressOf(), &stride, &offset);
-    m_Context->IASetInputLayout(m_CursorInputLayout.Get());
-    m_Context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
-    
-    m_Context->Draw(4, 0);
-    
-    // Reset render targets to avoid issues
-    ID3D11RenderTargetView* nullRTV = nullptr;
-    m_Context->OMSetRenderTargets(1, &nullRTV, nullptr);
-    
-    return true;
-}
-
-bool Duplication::InitializeCursorRendering() {
-    // Create blend state for alpha blending
-    D3D11_BLEND_DESC blendDesc = {};
-    blendDesc.RenderTarget[0].BlendEnable = TRUE;
-    blendDesc.RenderTarget[0].SrcBlend = D3D11_BLEND_SRC_ALPHA;
-    blendDesc.RenderTarget[0].DestBlend = D3D11_BLEND_INV_SRC_ALPHA;
-    blendDesc.RenderTarget[0].BlendOp = D3D11_BLEND_OP_ADD;
-    blendDesc.RenderTarget[0].SrcBlendAlpha = D3D11_BLEND_ONE;
-    blendDesc.RenderTarget[0].DestBlendAlpha = D3D11_BLEND_ZERO;
-    blendDesc.RenderTarget[0].BlendOpAlpha = D3D11_BLEND_OP_ADD;
-    blendDesc.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
-    
-    HRESULT hr = m_Device->CreateBlendState(&blendDesc, m_AlphaBlendState.GetAddressOf());
-    if (FAILED(hr)) return false;
-    
-    // Create sampler state
-    D3D11_SAMPLER_DESC samplerDesc = {};
-    samplerDesc.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
-    samplerDesc.AddressU = D3D11_TEXTURE_ADDRESS_CLAMP;
-    samplerDesc.AddressV = D3D11_TEXTURE_ADDRESS_CLAMP;
-    samplerDesc.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
-    samplerDesc.ComparisonFunc = D3D11_COMPARISON_NEVER;
-    samplerDesc.MinLOD = 0;
-    samplerDesc.MaxLOD = D3D11_FLOAT32_MAX;
-    
-    hr = m_Device->CreateSamplerState(&samplerDesc, m_CursorSampler.GetAddressOf());
-    if (FAILED(hr)) return false;
-    
-    // Vertex shader source
-    const char* vsSource = R"(
-    struct VS_INPUT {
-        float2 pos : POSITION;
-        float2 uv : TEXCOORD;
-    };
-    
-    struct VS_OUTPUT {
-        float4 pos : SV_POSITION;
-        float2 uv : TEXCOORD;
-    };
-    
-    cbuffer CursorConstants : register(b0) {
-        float cursorPosX;
-        float cursorPosY;
-        float cursorSizeX;
-        float cursorSizeY;
-        float screenSizeX;
-        float screenSizeY;
-        float hotSpotX;
-        float hotSpotY;
-    };
-    
-    VS_OUTPUT main(VS_INPUT input) {
-        VS_OUTPUT output;
-        
-        // Transform cursor quad to screen space
-        float2 screenPos = (float2(cursorPosX, cursorPosY) + input.pos * float2(cursorSizeX, cursorSizeY)) / float2(screenSizeX, screenSizeY);
-        screenPos = screenPos * 2.0 - 1.0;
-        screenPos.y = -screenPos.y;
-        
-        output.pos = float4(screenPos, 0.0, 1.0);
-        output.uv = input.uv;
-        return output;
-    })";
-    
-    // Pixel shader source
-    const char* psSource = R"(
-    Texture2D cursorTexture : register(t0);
-    SamplerState cursorSampler : register(s0);
-    
-    struct PS_INPUT {
-        float4 pos : SV_POSITION;
-        float2 uv : TEXCOORD;
-    };
-    
-    float4 main(PS_INPUT input) : SV_TARGET {
-        return cursorTexture.Sample(cursorSampler, input.uv);
-    })";
-    
-    // Compile vertex shader
-    ComPtr<ID3DBlob> vsBlob, psBlob, errorBlob;
-    hr = D3DCompile(vsSource, strlen(vsSource), nullptr, nullptr, nullptr, 
-                   "main", "vs_5_0", 0, 0, vsBlob.GetAddressOf(), errorBlob.GetAddressOf());
-    if (FAILED(hr)) {
-        if (errorBlob) {
-            std::cerr << "VS Compile Error: " << (char*)errorBlob->GetBufferPointer() << std::endl;
-        }
-        return false;
-    }
-    
-    // Compile pixel shader
-    hr = D3DCompile(psSource, strlen(psSource), nullptr, nullptr, nullptr,
-                   "main", "ps_5_0", 0, 0, psBlob.GetAddressOf(), errorBlob.GetAddressOf());
-    if (FAILED(hr)) {
-        if (errorBlob) {
-            std::cerr << "PS Compile Error: " << (char*)errorBlob->GetBufferPointer() << std::endl;
-        }
-        return false;
-    }
-    
-    // Create shaders
-    hr = m_Device->CreateVertexShader(vsBlob->GetBufferPointer(), vsBlob->GetBufferSize(), 
-                                     nullptr, m_CursorVS.GetAddressOf());
-    if (FAILED(hr)) return false;
-    
-    hr = m_Device->CreatePixelShader(psBlob->GetBufferPointer(), psBlob->GetBufferSize(),
-                                    nullptr, m_CursorPS.GetAddressOf());
-    if (FAILED(hr)) return false;
-    
-    // Create input layout
-    D3D11_INPUT_ELEMENT_DESC layout[] = {
-        {"POSITION", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 0, D3D11_INPUT_PER_VERTEX_DATA, 0},
-        {"TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 8, D3D11_INPUT_PER_VERTEX_DATA, 0}
-    };
-    
-    hr = m_Device->CreateInputLayout(layout, 2, vsBlob->GetBufferPointer(), 
-                                    vsBlob->GetBufferSize(), m_CursorInputLayout.GetAddressOf());
-    if (FAILED(hr)) return false;
-    
-    // Create cursor quad vertex buffer
-    struct CursorVertex {
-        float x, y, u, v;
-    };
-    
-    CursorVertex vertices[] = {
-        {0.0f, 0.0f, 0.0f, 0.0f},  // Top-left
-        {1.0f, 0.0f, 1.0f, 0.0f},  // Top-right  
-        {0.0f, 1.0f, 0.0f, 1.0f},  // Bottom-left
-        {1.0f, 1.0f, 1.0f, 1.0f}   // Bottom-right
-    };
-    
-    D3D11_BUFFER_DESC bufferDesc = {};
-    bufferDesc.Usage = D3D11_USAGE_DEFAULT;
-    bufferDesc.ByteWidth = sizeof(vertices);
-    bufferDesc.BindFlags = D3D11_BIND_VERTEX_BUFFER;
-    
-    D3D11_SUBRESOURCE_DATA initData = {};
-    initData.pSysMem = vertices;
-    
-    hr = m_Device->CreateBuffer(&bufferDesc, &initData, m_CursorVertexBuffer.GetAddressOf());
-    if (FAILED(hr)) return false;
-    
-    // Create constant buffer
-    D3D11_BUFFER_DESC cbDesc = {};
-    cbDesc.Usage = D3D11_USAGE_DYNAMIC;
-    cbDesc.ByteWidth = sizeof(float) * 8; // 8 floats for constants
-    cbDesc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
-    cbDesc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
-    
-    hr = m_Device->CreateBuffer(&cbDesc, nullptr, m_CursorConstantBuffer.GetAddressOf());
-    return SUCCEEDED(hr);
-}
-
-void Duplication::ConvertMonochromeCursor(const BYTE* srcBuffer, uint32_t* dstBuffer, const DXGI_OUTDUPL_POINTER_SHAPE_INFO& shapeInfo) {
-    UINT height = shapeInfo.Height / 2; // Monochrome cursors have AND mask + XOR mask
-    UINT width = shapeInfo.Width;
-    UINT pitch = shapeInfo.Pitch;
-    
-    const BYTE* andMask = srcBuffer;
-    const BYTE* xorMask = srcBuffer + (height * pitch);
-    
-    for (UINT y = 0; y < height; y++) {
-        for (UINT x = 0; x < width; x++) {
-            UINT byteIndex = (y * pitch) + (x / 8);
-            UINT bitIndex = 7 - (x % 8);
-            
-            bool andBit = (andMask[byteIndex] >> bitIndex) & 1;
-            bool xorBit = (xorMask[byteIndex] >> bitIndex) & 1;
-            
-            uint32_t pixel = 0;
-            if (andBit) {
-                if (xorBit) {
-                    // Invert background
-                    pixel = 0x00FFFFFF; // White with 0 alpha (will be handled by blend)
-                } else {
-                    // Transparent
-                    pixel = 0x00000000;
-                }
-            } else {
-                if (xorBit) {
-                    // White
-                    pixel = 0xFFFFFFFF;
-                } else {
-                    // Black
-                    pixel = 0xFF000000;
-                }
-            }
-            
-            dstBuffer[y * width + x] = pixel;
-        }
-    }
-}
-
-void Duplication::ConvertMaskedColorCursor(const BYTE* srcBuffer, uint32_t* dstBuffer, const DXGI_OUTDUPL_POINTER_SHAPE_INFO& shapeInfo) {
-    UINT width = shapeInfo.Width;
-    UINT height = shapeInfo.Height;
-    UINT pitch = shapeInfo.Pitch;
-    
-    // First part is the color data, second part is the mask
-    const uint32_t* colorData = reinterpret_cast<const uint32_t*>(srcBuffer);
-    const BYTE* maskData = srcBuffer + (height * pitch);
-    
-    for (UINT y = 0; y < height; y++) {
-        for (UINT x = 0; x < width; x++) {
-            UINT pixelIndex = y * (pitch / 4) + x;
-            UINT maskByteIndex = (y * (pitch / 4) / 8) + (x / 8);
-            UINT maskBitIndex = 7 - (x % 8);
-            
-            bool maskBit = (maskData[maskByteIndex] >> maskBitIndex) & 1;
-            
-            if (maskBit) {
-                // Masked - make transparent
-                dstBuffer[y * width + x] = 0x00000000;
-            } else {
-                // Use color data
-                dstBuffer[y * width + x] = colorData[pixelIndex];
-            }
-        }
-    }
 }
 
 void Duplication::ReleaseFrame() {

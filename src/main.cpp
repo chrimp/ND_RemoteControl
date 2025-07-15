@@ -20,7 +20,7 @@ constexpr char TEST_PORT[] = "54321";
 
 constexpr size_t WIDTH = 2560;
 constexpr size_t HEIGHT = 1440;
-constexpr size_t FPS = 60;
+constexpr size_t FPS = 240;
 
 constexpr size_t LENGTH_PER_FRAME = 1 + (WIDTH * HEIGHT * 4);
 // Approx. 8.3MB per frame (FHD), consider batching. Send/Recv latency is around < 1 ms though.
@@ -231,14 +231,14 @@ public:
             sge.MemoryRegionToken = m_pMr->GetLocalToken();
             if (FAILED(PostReceive(&sge, 1, RECV_CTXT))) {
                 std::cerr << "PostReceive for frame data failed." << std::endl;
-                return;
+                break;
             }
 
             memset(m_Buf, 2, 1);
 
-            if (FAILED(WaitForCompletionAndCheckContext(RECV_CTXT))) {
+            if (!WaitForCompletionAndCheckContext(RECV_CTXT)) {
                 std::cerr << "WaitForCompletion for frame data failed." << std::endl;
-                return;
+                break;
             }
 
             uint8_t flag = *static_cast<unsigned char*>(m_Buf);
@@ -267,7 +267,7 @@ public:
             auto now2 = std::chrono::steady_clock::now();
             auto elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(now2 - now).count();
             if (elapsed >= 1000000000) {
-                std::cout << "\r                " << std::flush;
+                std::cout << "\r                            \r" << std::flush;
                 std::cout << "FPS: " << frames << std::flush;
                 frames = 0;
                 now = now2;
@@ -400,15 +400,16 @@ public:
         std::cout << "Sending frames to the server." << std::endl;
         DesktopDuplication::Duplication& dupl = DesktopDuplication::Singleton<DesktopDuplication::Duplication>::Instance();
 
-        while (true) {
-            auto entry = std::chrono::steady_clock::now();
+        auto now = std::chrono::steady_clock::now();
 
+        int frames = 0;
+        ND2_SGE sge = { 0 };
+
+        while (true) {
             ID3D11Texture2D* frame;
             memset(m_Buf, 0, LENGTH_PER_FRAME);
 
             bool success = dupl.GetStagedTexture(frame, 1000 / FPS);
-            
-            ND2_SGE sge = { 0 };
 
             sge.Buffer = m_Buf;
             sge.BufferLength = 1;
@@ -462,6 +463,8 @@ public:
                 return;
             }
 
+            frames++;
+
             sge.Buffer = m_Buf;
             sge.BufferLength = 1;
             sge.MemoryRegionToken = m_pMr->GetLocalToken();
@@ -495,16 +498,14 @@ public:
                 _mm_pause();
             }
 
-            /*
-            auto now = std::chrono::steady_clock::now();
-            auto dur = std::chrono::duration_cast<std::chrono::nanoseconds>(now - entry).count();
-
-            while (dur < 1000000000 / FPS) {
-                now = std::chrono::steady_clock::now();
-                dur = std::chrono::duration_cast<std::chrono::nanoseconds>(now - entry).count();
-                _mm_pause();
+            auto now2 = std::chrono::steady_clock::now();
+            auto elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(now2 - now).count();
+            if (elapsed >= 1000000000) {
+                std::cout << "\r                      \r" << std::flush;
+                std::cout << "FPS: " << frames << std::flush;
+                frames = 0;
+                now = now2;
             }
-            */
         }
 
         Shutdown();
