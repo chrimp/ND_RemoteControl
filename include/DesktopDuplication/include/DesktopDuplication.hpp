@@ -65,6 +65,27 @@ namespace DesktopDuplication {
         UINT m_Output;
         UINT m_AdapterIndex;
         bool m_IsDuplRunning;
+
+        // Cursors
+        ComPtr<ID3D11Texture2D> m_CursorTexture;
+        ComPtr<ID3D11ShaderResourceView> m_CursorSRV;
+        ComPtr<ID3D11RenderTargetView> m_FrameRTV;
+        ComPtr<ID3D11BlendState> m_AlphaBlendState;
+        ComPtr<ID3D11VertexShader> m_CursorVS;
+        ComPtr<ID3D11PixelShader> m_CursorPS;
+        ComPtr<ID3D11Buffer> m_CursorVertexBuffer;
+        ComPtr<ID3D11Buffer> m_CursorConstantBuffer;
+        ComPtr<ID3D11InputLayout> m_CursorInputLayout;
+        ComPtr<ID3D11SamplerState> m_CursorSampler;
+        
+        std::vector<BYTE> m_LastCursorShape;
+        DXGI_OUTDUPL_POINTER_SHAPE_INFO m_LastShapeInfo{};
+    
+        bool InitializeCursorRendering();
+        bool UpdateCursorTexture(const DXGI_OUTDUPL_FRAME_INFO& frameInfo);
+        bool CompositeCursorOnFrame(ID3D11Texture2D* frame, const DXGI_OUTDUPL_FRAME_INFO& frameInfo);
+        void ConvertMonochromeCursor(const BYTE* srcBuffer, uint32_t* dstBuffer, const DXGI_OUTDUPL_POINTER_SHAPE_INFO& shapeInfo);
+        void ConvertMaskedColorCursor(const BYTE* srcBuffer, uint32_t* dstBuffer, const DXGI_OUTDUPL_POINTER_SHAPE_INFO& shapeInfo);
     };
 
     class DuplicationThread {

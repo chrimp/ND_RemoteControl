@@ -18,12 +18,29 @@ constexpr char TEST_PORT[] = "54321";
 #undef max
 #undef min
 
-constexpr size_t WIDTH = 1920;
-constexpr size_t HEIGHT = 1080;
+constexpr size_t WIDTH = 2560;
+constexpr size_t HEIGHT = 1440;
 constexpr size_t FPS = 60;
 
 constexpr size_t LENGTH_PER_FRAME = 1 + (WIDTH * HEIGHT * 4);
 // Approx. 8.3MB per frame (FHD), consider batching. Send/Recv latency is around < 1 ms though.
+
+enum class InputType : uint8_t {
+    Key = 0,
+    MouseMove = 1,
+    MouseButton = 2
+};
+
+#pragma pack(push, 1)
+struct InputEvent {
+    InputType type;
+    union {
+        struct { uint16_t vk; bool down; } key;
+        struct { float dx; float dy; } mouseMove;
+        struct { uint8_t button; bool down; } mouseButton;
+    };
+};
+#pragma pack(pop)
 
 static size_t maxSge = -1;
 
@@ -39,23 +56,10 @@ std::string FormatBytes(uint64_t bytes) {
     }
 }
 
-uint64_t GetCurrentTimestamp() {
-    return std::chrono::high_resolution_clock::now().time_since_epoch().count();
-}
-
-double CalculateGbps(uint64_t bytes, uint64_t nanoseconds) {
-    return (static_cast<double>(bytes) * 8.0) / (static_cast<double>(nanoseconds) / 1e9) / 1e9;
-}
-
-double CalculateLatencyMicroseconds(uint64_t nanoseconds) {
-    return static_cast<double>(nanoseconds) / 1000.0;
-}
-
 struct PeerInfo {
     UINT64 remoteAddr;
     UINT32 remoteToken;
 };
-
 
 void ShowUsage() {
     printf("main.exe [options]\n"
@@ -94,34 +98,54 @@ public:
         if (FAILED(CreateListener())) return false;
         if (FAILED(CreateConnector())) return false;
 
-        return true;
-    }
-
-    void Run(const char* localAddr) {
-        // Initialize D2DRenderer
         HRESULT com_hr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
         if (FAILED(com_hr)) {
             std::cerr << "CoInitializeEx failed: " << std::hex << com_hr << std::endl;
-            return;
+            return false;
         }
 
-        D2DPresentation::D2DRenderer renderer;
-        D2DPresentation::D2DWindow window("RDMA Texture Preview", WIDTH, HEIGHT);
+        m_Renderer = std::make_unique<D2DPresentation::D2DRenderer>();
+        m_Window = std::make_unique<D2DPresentation::D2DWindow>("RDMA Texture Preview", WIDTH, HEIGHT);
 
-        window.Start();
+        m_Window->Start();
 
-        HWND hwnd = NULL;
-        while ((hwnd = window.GetHwnd()) == NULL) {
+        while ((m_hWnd = m_Window->GetHwnd()) == NULL) {
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
         }
 
-        HRESULT hr = renderer.Initialize(nullptr, hwnd, WIDTH, HEIGHT, nullptr);
+        HRESULT hr = m_Renderer->Initialize(nullptr, m_hWnd, WIDTH, HEIGHT, nullptr);
         if (FAILED(hr)) {
             std::cerr << "D2DRenderer initialization failed: " << std::hex << hr << std::endl;
             CoUninitialize();
-            return;
+            return false;
         }
 
+        ComPtr<ID3D11Device> d3dDevice = m_Renderer->GetD3DDevice();
+        ComPtr<ID3D11DeviceContext> d3dContext = m_Renderer->GetD3DContext();
+
+        D3D11_TEXTURE2D_DESC desc;
+        desc.Width = WIDTH;
+        desc.Height = HEIGHT;
+        desc.MipLevels = 1;
+        desc.ArraySize = 1;
+        desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+        desc.SampleDesc.Count = 1;
+        desc.SampleDesc.Quality = 0;
+        desc.Usage = D3D11_USAGE_DEFAULT;
+        desc.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+        desc.CPUAccessFlags = 0;
+        desc.MiscFlags = 0;
+
+        m_FrameTexture = nullptr;
+        hr = d3dDevice->CreateTexture2D(&desc, nullptr, m_FrameTexture.GetAddressOf());
+
+        m_PreviousTexture = nullptr;
+        hr = d3dDevice->CreateTexture2D(&desc, nullptr, m_PreviousTexture.GetAddressOf());
+
+        return true;
+    }
+
+    void OpenListener(const char* localAddr) {
         char fullAddress[INET_ADDRSTRLEN + 6];
         sprintf_s(fullAddress, "%s:%s", localAddr, TEST_PORT);
         std::cout << "Listening on " << fullAddress << "..." << std::endl;
@@ -138,7 +162,9 @@ public:
         
         CreateMW();
         Bind(m_Buf, LENGTH_PER_FRAME, ND_OP_FLAG_ALLOW_WRITE | ND_OP_FLAG_ALLOW_READ);
+    }
 
+    void ExchangePeerInfo() {
         std::cout << "Connection established. Waiting for client's PeerInfo..." << std::endl;
         std::cout << "My address: " << reinterpret_cast<UINT64>(m_Buf) << ", token: " << m_pMw->GetRemoteToken() << std::endl;
         
@@ -186,64 +212,18 @@ public:
         }
 
         memset(m_Buf, 0, LENGTH_PER_FRAME);
+    }
 
-        // Flag test (0 = Nothing, 1 = Client has written, 2 = Server has read)
-        // Reset to 0 after send completion
-        // First bit of the memory is used as a flag
-        unsigned char flag = 0;
-        while (flag != 1) {
-            flag = *static_cast<unsigned char*>(m_Buf);
-            _mm_pause();
-        }
-
-        std::cout << "Flag is 1." << std::endl;
-
-        memset(m_Buf, 2, 1);
-
-        sge.Buffer = m_Buf;
-        sge.BufferLength = 1;
-        sge.MemoryRegionToken = m_pMr->GetLocalToken();
-
-        if (FAILED(Write(&sge, 1, remoteInfo.remoteAddr, remoteInfo.remoteToken, 0, WRITE_CTXT))) {
-            std::cerr << "Write failed." << std::endl;
-            return;
-        }
-        if (!WaitForCompletionAndCheckContext(WRITE_CTXT)) {
-            std::cerr << "WaitForCompletion for write failed." << std::endl;
-            return;
-        }
-
-        ComPtr<ID3D11Device> d3dDevice = renderer.GetD3DDevice();
-        ComPtr<ID3D11DeviceContext> d3dContext = renderer.GetD3DContext();
+    void Loop() {
+        ComPtr<ID3D11Device> d3dDevice = m_Renderer->GetD3DDevice();
+        ComPtr<ID3D11DeviceContext> d3dContext = m_Renderer->GetD3DContext();
 
         std::cout << "Waiting for the frame..." << std::endl;
 
         int frames = 0;
-
         auto now = std::chrono::steady_clock::now();
-
-        flag = 0;
-
         auto lastDraw = std::chrono::steady_clock::time_point::max();
-
-        D3D11_TEXTURE2D_DESC desc;
-        desc.Width = WIDTH;
-        desc.Height = HEIGHT;
-        desc.MipLevels = 1;
-        desc.ArraySize = 1;
-        desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
-        desc.SampleDesc.Count = 1;
-        desc.SampleDesc.Quality = 0;
-        desc.Usage = D3D11_USAGE_DEFAULT;
-        desc.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
-        desc.CPUAccessFlags = 0;
-        desc.MiscFlags = 0;
-
-        ID3D11Texture2D* frameTex = nullptr;
-        hr = d3dDevice->CreateTexture2D(&desc, nullptr, &frameTex);
-
-        ID3D11Texture2D* previousTex = nullptr;
-        hr = d3dDevice->CreateTexture2D(&desc, nullptr, &previousTex);
+        ND2_SGE sge = { 0 };
 
         while (true) {
             sge.Buffer = m_Buf;
@@ -261,20 +241,20 @@ public:
                 return;
             }
 
-            flag = *static_cast<unsigned char*>(m_Buf);
+            uint8_t flag = *static_cast<unsigned char*>(m_Buf);
 
             if (flag == 1) {
                 std::atomic_thread_fence(std::memory_order_acquire);
-                d3dContext->UpdateSubresource(frameTex, 0, nullptr, reinterpret_cast<uint8_t*>(m_Buf) + 1, WIDTH * 4, 0);
-                d3dContext->CopyResource(previousTex, frameTex);
-                renderer.SetSourceSurface(frameTex);
+                d3dContext->UpdateSubresource(m_FrameTexture.Get(), 0, nullptr, reinterpret_cast<uint8_t*>(m_Buf) + 1, WIDTH * 4, 0);
+                d3dContext->CopyResource(m_PreviousTexture.Get(), m_FrameTexture.Get());
+                m_Renderer->SetSourceSurface(m_FrameTexture.Get());
             } else if (flag == 3) {
-                renderer.SetSourceSurface(previousTex);
+                m_Renderer->SetSourceSurface(m_PreviousTexture);
             }
 
             lastDraw = std::chrono::steady_clock::now();
             
-            renderer.Render();
+            m_Renderer->Render();
 
             if (_kbhit()) {
                 char c = _getch();
@@ -298,10 +278,24 @@ public:
         
         Shutdown();
 
-        renderer.Cleanup();
-        window.Stop();
+        m_Renderer->Cleanup();
+        m_Window->Stop();
         CoUninitialize();
     }
+
+    void Run(const char* localAddr) {
+        OpenListener(localAddr);
+        ExchangePeerInfo();
+        Loop();
+    }
+
+    private:
+    std::unique_ptr<D2DPresentation::D2DRenderer> m_Renderer;
+    std::unique_ptr<D2DPresentation::D2DWindow> m_Window;
+    HWND m_hWnd = nullptr;
+
+    ComPtr<ID3D11Texture2D> m_FrameTexture;
+    ComPtr<ID3D11Texture2D> m_PreviousTexture;
 };
 
 // MARK: TestClient
@@ -324,7 +318,7 @@ public:
         return true;
     }
 
-    void Run(const char* localAddr, const char* serverAddr) {
+    void OpenConnector(const char* localAddr, const char* serverAddr) {
         ND2_SGE sge = { 0 };
         sge.Buffer = m_Buf;
         sge.BufferLength = LENGTH_PER_FRAME;
@@ -351,7 +345,9 @@ public:
 
         CreateMW();
         Bind(m_Buf, LENGTH_PER_FRAME, ND_OP_FLAG_ALLOW_WRITE | ND_OP_FLAG_ALLOW_READ);
+    }
 
+    void ExchangePeerInfo() {
         PeerInfo* myInfo = reinterpret_cast<PeerInfo*>(m_Buf);
         myInfo->remoteAddr = reinterpret_cast<UINT64>(m_Buf);
         myInfo->remoteToken = m_pMw->GetRemoteToken();
@@ -359,6 +355,11 @@ public:
         std::cout << "My address: " << myInfo->remoteAddr << ", token: " << myInfo->remoteToken << std::endl;
 
         std::this_thread::sleep_for(std::chrono::seconds(1));
+        
+        ND2_SGE sge = { 0 };
+        sge.Buffer = m_Buf;
+        sge.BufferLength = sizeof(PeerInfo);
+        sge.MemoryRegionToken = m_pMr->GetLocalToken();
 
         sge = { m_Buf, sizeof(PeerInfo), m_pMr->GetLocalToken() };
         if (FAILED(Send(&sge, 1, 0, SEND_CTXT))) {
@@ -389,48 +390,14 @@ public:
                   << reinterpret_cast<PeerInfo*>(m_Buf)->remoteAddr
                   << ", remoteToken = " << reinterpret_cast<PeerInfo*>(m_Buf)->remoteToken << std::endl;
 
-        PeerInfo remoteInfo;
         remoteInfo.remoteAddr = reinterpret_cast<PeerInfo*>(m_Buf)->remoteAddr;
         remoteInfo.remoteToken = reinterpret_cast<PeerInfo*>(m_Buf)->remoteToken;
 
         memset(m_Buf, 0, LENGTH_PER_FRAME);
+    }
 
-        memset(m_Buf, 1, 1);
-        sge.Buffer = m_Buf;
-        sge.BufferLength = 1;
-        sge.MemoryRegionToken = m_pMr->GetLocalToken();
-
-        if (FAILED(Write(&sge, 1, remoteInfo.remoteAddr, remoteInfo.remoteToken, 0, WRITE_CTXT))) {
-            std::cerr << "Write to server failed." << std::endl;
-            return;
-        }
-        if (!WaitForCompletionAndCheckContext(WRITE_CTXT)) {
-            std::cerr << "WaitForCompletion for write to server failed." << std::endl;
-            return;
-        }
-
-        std::cout << "Write to server completed. Waiting for the flag..." << std::endl;
-        unsigned char flag = 0;
-
-        while (flag != 2) {
-            flag = *static_cast<unsigned char*>(m_Buf);
-            _mm_pause();
-        }
-        std::cout << "Flag is 2." << std::endl;
-
-        memset(m_Buf, 0, LENGTH_PER_FRAME);
-
-        std::cout << "Resetting the flag." << std::endl;
-        if (FAILED(Write(&sge, 1, remoteInfo.remoteAddr, remoteInfo.remoteToken, 0, WRITE_CTXT))) {
-            std::cerr << "Write to reset flag failed." << std::endl;
-            return;
-        }
-        if (!WaitForCompletionAndCheckContext(WRITE_CTXT)) {
-            std::cerr << "WaitForCompletion for reset flag write failed." << std::endl;
-            return;
-        }
-
-        std::cout << "Sending a frame to the server." << std::endl;
+    void Loop() {
+        std::cout << "Sending frames to the server." << std::endl;
         DesktopDuplication::Duplication& dupl = DesktopDuplication::Singleton<DesktopDuplication::Duplication>::Instance();
 
         while (true) {
@@ -441,6 +408,8 @@ public:
 
             bool success = dupl.GetStagedTexture(frame, 1000 / FPS);
             
+            ND2_SGE sge = { 0 };
+
             sge.Buffer = m_Buf;
             sge.BufferLength = 1;
             sge.MemoryRegionToken = m_pMr->GetLocalToken();
@@ -540,6 +509,15 @@ public:
 
         Shutdown();
     }
+
+    void Run(const char* localAddr, const char* serverAddr) {
+        OpenConnector(localAddr, serverAddr);
+        ExchangePeerInfo();
+        Loop();
+    }
+
+    private:
+    PeerInfo remoteInfo;
 };
 
 int main(int argc, char* argv[]) {
