@@ -444,8 +444,6 @@ public:
             frame->Release();
             frame = nullptr;
 
-            uint8_t flag = *reinterpret_cast<uint8_t*>(m_Buf);
-
             // Send the frame data
             sge.Buffer = m_Buf;
             sge.BufferLength = LENGTH_PER_FRAME;
@@ -480,7 +478,8 @@ public:
             sge.Buffer = m_Buf;
             sge.BufferLength = 1;
             sge.MemoryRegionToken = m_pMr->GetLocalToken();
-
+            
+            uint8_t flag = *reinterpret_cast<uint8_t*>(m_Buf);
             while (flag != 2) {
                 if (FAILED(Read(&sge, 1, remoteInfo.remoteAddr, remoteInfo.remoteToken, 0, READ_CTXT))) {
                     std::cerr << "Read failed." << std::endl;
