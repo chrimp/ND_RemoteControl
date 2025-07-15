@@ -20,7 +20,7 @@ constexpr char TEST_PORT[] = "54321";
 
 constexpr size_t WIDTH = 2560;
 constexpr size_t HEIGHT = 1440;
-constexpr size_t FPS = 240;
+constexpr size_t FPS = 500;
 
 constexpr size_t LENGTH_PER_FRAME = 1 + (WIDTH * HEIGHT * 4);
 // Approx. 8.3MB per frame (FHD), consider batching. Send/Recv latency is around < 1 ms though.
@@ -222,7 +222,6 @@ public:
 
         int frames = 0;
         auto now = std::chrono::steady_clock::now();
-        auto lastDraw = std::chrono::steady_clock::time_point::max();
         ND2_SGE sge = { 0 };
 
         while (true) {
@@ -251,8 +250,6 @@ public:
             } else if (flag == 3) {
                 m_Renderer->SetSourceSurface(m_PreviousTexture);
             }
-
-            lastDraw = std::chrono::steady_clock::now();
             
             m_Renderer->Render();
 
