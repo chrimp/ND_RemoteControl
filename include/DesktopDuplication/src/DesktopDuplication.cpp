@@ -308,13 +308,29 @@ int Duplication::GetFrame(ID3D11Texture2D*& frame, unsigned long timeout) {
     ComPtr<IDXGIResource> desktopResource;
     DXGI_OUTDUPL_FRAME_INFO frameInfo;
 
-    HRESULT hr = m_DesktopDupl->AcquireNextFrame(timeout, &frameInfo, &desktopResource);
-    if (hr == DXGI_ERROR_WAIT_TIMEOUT) {
+    auto waitStart = std::chrono::steady_clock::now();
+    auto waitEnd = waitStart + std::chrono::milliseconds(timeout);
+
+    HRESULT acqHr = S_FALSE;
+
+    while (std::chrono::steady_clock::now() < waitEnd && acqHr != S_OK) {
+        acqHr = m_DesktopDupl->AcquireNextFrame(0, &frameInfo, &desktopResource);
+        if (acqHr != S_OK && acqHr != DXGI_ERROR_WAIT_TIMEOUT) {
+            std::cerr << "Failed to acquire next frame. Reason: 0x" << std::hex << acqHr << std::endl;
+            throw std::exception();
+            return -1;
+        }
+        _mm_pause();
+    }
+
+    //HRESULT hr = m_DesktopDupl->AcquireNextFrame(0, &frameInfo, &desktopResource);
+    if (acqHr == DXGI_ERROR_WAIT_TIMEOUT) {
         return -1;
     }
 
-    if (FAILED(hr)) {
-        std::cerr << "Failed to acquire next frame. Reason: 0x" << std::hex << hr << std::endl;
+    if (FAILED(acqHr)) {
+        std::cerr << "Failed to acquire next frame. Reason: 0x" << std::hex << acqHr << std::endl;
+        abort();
         return 1;
     }
 
@@ -323,7 +339,7 @@ int Duplication::GetFrame(ID3D11Texture2D*& frame, unsigned long timeout) {
     }
 
     // QI for ID3D11Texture2D
-    hr = desktopResource->QueryInterface(IID_PPV_ARGS(m_AcquiredDesktopImage.GetAddressOf()));
+    HRESULT hr = desktopResource->QueryInterface(IID_PPV_ARGS(m_AcquiredDesktopImage.GetAddressOf()));
     if (FAILED(hr)) {
         std::cerr << "Failed to query ID3D11Texture2D interface. Reason: 0x" << std::hex << hr << std::endl;
         return 1;

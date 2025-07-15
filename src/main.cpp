@@ -6,7 +6,10 @@
 #include <iostream>
 #include <thread>
 #include <chrono>
+#include <timeapi.h>
 #include <wincodec.h>
+
+#pragma comment(lib, "Winmm.lib")
 
 constexpr char TEST_PORT[] = "54321";
 
@@ -20,7 +23,7 @@ constexpr char TEST_PORT[] = "54321";
 
 constexpr size_t WIDTH = 2560;
 constexpr size_t HEIGHT = 1440;
-constexpr size_t FPS = 500;
+constexpr size_t FPS = 240;
 
 constexpr size_t LENGTH_PER_FRAME = 1 + (WIDTH * HEIGHT * 4);
 // Approx. 8.3MB per frame (FHD), consider batching. Send/Recv latency is around < 1 ms though.
@@ -119,6 +122,8 @@ public:
             CoUninitialize();
             return false;
         }
+
+        m_Window->m_show = true;
 
         ComPtr<ID3D11Device> d3dDevice = m_Renderer->GetD3DDevice();
         ComPtr<ID3D11DeviceContext> d3dContext = m_Renderer->GetD3DContext();
@@ -224,10 +229,16 @@ public:
         auto now = std::chrono::steady_clock::now();
         ND2_SGE sge = { 0 };
 
-        while (true) {
+        bool windowOpen = true;
+
+        auto totalWait = std::chrono::milliseconds::zero();
+
+        while (true || windowOpen) {
+            windowOpen = m_Window->isRunning();
             sge.Buffer = m_Buf;
             sge.BufferLength = 1;
             sge.MemoryRegionToken = m_pMr->GetLocalToken();
+            /*
             if (FAILED(PostReceive(&sge, 1, RECV_CTXT))) {
                 std::cerr << "PostReceive for frame data failed." << std::endl;
                 break;
@@ -239,8 +250,19 @@ public:
                 std::cerr << "WaitForCompletion for frame data failed." << std::endl;
                 break;
             }
+            */
+
+            memset(m_Buf, 2, 1);
 
             uint8_t flag = *static_cast<unsigned char*>(m_Buf);
+            auto preWait = std::chrono::steady_clock::now();
+            while (flag == 2) {
+                flag = *static_cast<unsigned char*>(m_Buf);
+                _mm_pause();
+            }
+            auto postWait = std::chrono::steady_clock::now();
+            totalWait += std::chrono::duration_cast<std::chrono::milliseconds>(postWait - preWait);
+
 
             if (flag == 1) {
                 std::atomic_thread_fence(std::memory_order_acquire);
@@ -264,10 +286,12 @@ public:
             auto now2 = std::chrono::steady_clock::now();
             auto elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(now2 - now).count();
             if (elapsed >= 1000000000) {
+                auto avgWait = totalWait.count() / frames;
                 std::cout << "\r                            \r" << std::flush;
-                std::cout << "FPS: " << frames << std::flush;
+                std::cout << "FPS: " << frames << " | Wait: " << avgWait << std::flush;
                 frames = 0;
                 now = now2;
+                totalWait = std::chrono::milliseconds::zero();
             }
 
             frames++;
@@ -402,10 +426,18 @@ public:
         int frames = 0;
         ND2_SGE sge = { 0 };
 
+        timeBeginPeriod(1);
+
+        auto GetAndFlagTotal = std::chrono::milliseconds::zero();
+        auto MapTotal = std::chrono::milliseconds::zero();
+        auto WriteTotal = std::chrono::milliseconds::zero();
+        auto FlagWaitTotal = std::chrono::milliseconds::zero();
+
         while (true) {
             ID3D11Texture2D* frame;
             memset(m_Buf, 0, LENGTH_PER_FRAME);
 
+            auto GetAndFlagStart = std::chrono::steady_clock::now();
             bool success = dupl.GetStagedTexture(frame, 1000 / FPS);
 
             sge.Buffer = m_Buf;
@@ -414,6 +446,7 @@ public:
 
             if (!success) {
                 *reinterpret_cast<uint8_t*>(m_Buf) = 3;
+                /*
                 if (FAILED(Send(&sge, 1, 0, SEND_CTXT))) {
                     std::cerr << "Send of no frame failed." << std::endl;
                     return;
@@ -421,15 +454,26 @@ public:
                 if (!WaitForCompletionAndCheckContext(SEND_CTXT)) {
                     std::cerr << "WaitForCompletion for no frame send failed." << std::endl;
                 }
+                */
+                if (FAILED(Write(&sge, 1, remoteInfo.remoteAddr, remoteInfo.remoteToken, 0, WRITE_CTXT))) {
+                    std::cerr << "Write of no frame failed." << std::endl;
+                    return;
+                }
+                if (!WaitForCompletionAndCheckContext(WRITE_CTXT)) {
+                    std::cerr << "WaitForCompletion for no frame write failed." << std::endl;
+                    return;
+                }
                 continue;
             }
-            
+            auto GetAndFlagEnd = std::chrono::steady_clock::now();
+            GetAndFlagTotal += std::chrono::duration_cast<std::chrono::milliseconds>(GetAndFlagEnd - GetAndFlagStart);
 
+            auto MapStart = std::chrono::steady_clock::now();
             D3D11_TEXTURE2D_DESC desc;
             frame->GetDesc(&desc);
             uint8_t* frameData = reinterpret_cast<uint8_t*>(m_Buf);
 
-            frameData[0] = 0;
+            frameData[0] = 2;
 
             D3D11_MAPPED_SUBRESOURCE mappedResource;
             dupl.GetContext()->Map(frame, 0, D3D11_MAP_READ, 0 , &mappedResource);
@@ -443,7 +487,10 @@ public:
             dupl.GetContext()->Unmap(frame, 0);
             frame->Release();
             frame = nullptr;
+            auto MapEnd = std::chrono::steady_clock::now();
+            MapTotal += std::chrono::duration_cast<std::chrono::milliseconds>(MapEnd - MapStart);
 
+            auto WriteStart = std::chrono::steady_clock::now();
             // Send the frame data
             sge.Buffer = m_Buf;
             sge.BufferLength = LENGTH_PER_FRAME;
@@ -465,6 +512,7 @@ public:
             sge.MemoryRegionToken = m_pMr->GetLocalToken();
 
             *reinterpret_cast<uint8_t*>(m_Buf) = 1;
+            /*
             if (FAILED(Send(&sge, 1, 0, SEND_CTXT))) {
                 std::cerr << "Send of frame data failed." << std::endl;
                 return;
@@ -473,7 +521,21 @@ public:
                 std::cerr << "WaitForCompletion for frame data send failed." << std::endl;
                 return;
             }
+            */
+            if (FAILED(Write(&sge, 1, remoteInfo.remoteAddr, remoteInfo.remoteToken, ND_OP_FLAG_SILENT_SUCCESS, WRITE_CTXT))) {
+                std::cerr << "Write of frame data failed." << std::endl;
+                return;
+            }
+            /*
+            if (!WaitForCompletionAndCheckContext(WRITE_CTXT)) {
+                std::cerr << "WaitForCompletion for frame data write failed." << std::endl;
+                return;
+            }
+            */
+            auto WriteEnd = std::chrono::steady_clock::now();
+            WriteTotal += std::chrono::duration_cast<std::chrono::milliseconds>(WriteEnd - WriteStart);
 
+            auto FlagWaitStart = std::chrono::steady_clock::now();
             // Wait for server to acknowledge the frame
             sge.Buffer = m_Buf;
             sge.BufferLength = 1;
@@ -493,17 +555,30 @@ public:
                 flag = *reinterpret_cast<uint8_t*>(m_Buf);
                 _mm_pause();
             }
+            auto FlagWaitEnd = std::chrono::steady_clock::now();
+            FlagWaitTotal += std::chrono::duration_cast<std::chrono::milliseconds>(FlagWaitEnd - FlagWaitStart);
 
             auto now2 = std::chrono::steady_clock::now();
             auto elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(now2 - now).count();
             if (elapsed >= 1000000000) {
-                std::cout << "\r                      \r" << std::flush;
-                std::cout << "FPS: " << frames << std::flush;
+                auto GetAndFlagAvg = GetAndFlagTotal.count() / frames;
+                auto MapAvg = MapTotal.count() / frames;
+                auto WriteAvg = WriteTotal.count() / frames;
+                auto FlagWaitAvg = FlagWaitTotal.count() / frames;
+
+                std::cout << "\r                                              \r" << std::flush;
+                std::cout << "FPS: " << frames << "| Get: " << GetAndFlagAvg << " Map: " << MapAvg << " Write: " << WriteAvg << " Flag: " << FlagWaitAvg << std::flush;
                 frames = 0;
+                GetAndFlagTotal = std::chrono::milliseconds::zero();
+                MapTotal = std::chrono::milliseconds::zero();
+                WriteTotal = std::chrono::milliseconds::zero();
+                FlagWaitTotal = std::chrono::milliseconds::zero();
+
                 now = now2;
             }
         }
 
+        timeEndPeriod(1);
         Shutdown();
     }
 

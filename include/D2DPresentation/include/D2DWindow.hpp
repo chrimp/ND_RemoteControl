@@ -41,6 +41,9 @@ namespace D2DPresentation {
         void Stop();
 
         HWND GetHwnd() const { return m_hwnd; }
+        bool isRunning() const { return m_isRunning; }
+
+        std::atomic<bool> m_show = false;
 
     private:
         void WindowThread(
