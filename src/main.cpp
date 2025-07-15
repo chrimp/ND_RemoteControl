@@ -426,16 +426,16 @@ public:
         int frames = 0;
         ND2_SGE sge = { 0 };
 
-        timeBeginPeriod(1);
+        //timeBeginPeriod(1);
 
-        auto GetAndFlagTotal = std::chrono::milliseconds::zero();
-        auto MapTotal = std::chrono::milliseconds::zero();
-        auto WriteTotal = std::chrono::milliseconds::zero();
-        auto FlagWaitTotal = std::chrono::milliseconds::zero();
+        auto GetAndFlagTotal = std::chrono::microseconds::zero();
+        auto MapTotal = std::chrono::microseconds::zero();
+        auto WriteTotal = std::chrono::microseconds::zero();
+        auto FlagWaitTotal = std::chrono::microseconds::zero();
 
         while (true) {
             ID3D11Texture2D* frame;
-            memset(m_Buf, 0, LENGTH_PER_FRAME);
+            //memset(m_Buf, 0, LENGTH_PER_FRAME);
 
             auto GetAndFlagStart = std::chrono::steady_clock::now();
             bool success = dupl.GetStagedTexture(frame, 1000 / FPS);
@@ -466,7 +466,7 @@ public:
                 continue;
             }
             auto GetAndFlagEnd = std::chrono::steady_clock::now();
-            GetAndFlagTotal += std::chrono::duration_cast<std::chrono::milliseconds>(GetAndFlagEnd - GetAndFlagStart);
+            GetAndFlagTotal += std::chrono::duration_cast<std::chrono::microseconds>(GetAndFlagEnd - GetAndFlagStart);
 
             auto MapStart = std::chrono::steady_clock::now();
             D3D11_TEXTURE2D_DESC desc;
@@ -488,7 +488,7 @@ public:
             frame->Release();
             frame = nullptr;
             auto MapEnd = std::chrono::steady_clock::now();
-            MapTotal += std::chrono::duration_cast<std::chrono::milliseconds>(MapEnd - MapStart);
+            MapTotal += std::chrono::duration_cast<std::chrono::microseconds>(MapEnd - MapStart);
 
             auto WriteStart = std::chrono::steady_clock::now();
             // Send the frame data
@@ -533,7 +533,7 @@ public:
             }
             */
             auto WriteEnd = std::chrono::steady_clock::now();
-            WriteTotal += std::chrono::duration_cast<std::chrono::milliseconds>(WriteEnd - WriteStart);
+            WriteTotal += std::chrono::duration_cast<std::chrono::microseconds>(WriteEnd - WriteStart);
 
             auto FlagWaitStart = std::chrono::steady_clock::now();
             // Wait for server to acknowledge the frame
@@ -556,29 +556,28 @@ public:
                 _mm_pause();
             }
             auto FlagWaitEnd = std::chrono::steady_clock::now();
-            FlagWaitTotal += std::chrono::duration_cast<std::chrono::milliseconds>(FlagWaitEnd - FlagWaitStart);
+            FlagWaitTotal += std::chrono::duration_cast<std::chrono::microseconds>(FlagWaitEnd - FlagWaitStart);
 
             auto now2 = std::chrono::steady_clock::now();
-            auto elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(now2 - now).count();
-            if (elapsed >= 1000000000) {
-                auto GetAndFlagAvg = GetAndFlagTotal.count() / frames;
-                auto MapAvg = MapTotal.count() / frames;
-                auto WriteAvg = WriteTotal.count() / frames;
-                auto FlagWaitAvg = FlagWaitTotal.count() / frames;
+            auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now2 - now).count();
+            if (elapsed >= 1000) {
+                auto GetAndFlagAvg = GetAndFlagTotal.count() / 1000.0f / frames;
+                auto MapAvg = MapTotal.count() / 1000.0f / frames;
+                auto WriteAvg = WriteTotal.count() / 1000.0f / frames;
+                auto FlagWaitAvg = FlagWaitTotal.count() / 1000.0f / frames;
 
                 std::cout << "\r                                              \r" << std::flush;
                 std::cout << "FPS: " << frames << "| Get: " << GetAndFlagAvg << " Map: " << MapAvg << " Write: " << WriteAvg << " Flag: " << FlagWaitAvg << std::flush;
                 frames = 0;
-                GetAndFlagTotal = std::chrono::milliseconds::zero();
-                MapTotal = std::chrono::milliseconds::zero();
-                WriteTotal = std::chrono::milliseconds::zero();
-                FlagWaitTotal = std::chrono::milliseconds::zero();
+                GetAndFlagTotal = std::chrono::microseconds::zero();
+                MapTotal = std::chrono::microseconds::zero();
+                WriteTotal = std::chrono::microseconds::zero();
+                FlagWaitTotal = std::chrono::microseconds::zero();
 
                 now = now2;
             }
         }
 
-        timeEndPeriod(1);
         Shutdown();
     }
 
