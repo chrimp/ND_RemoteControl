@@ -92,6 +92,13 @@ HRESULT D2DRenderer::Initialize(IDXGIAdapter* pAdapter, HWND hwnd, UINT width, U
         abort();
         return hr;
     }
+
+    m_d2dContext->BeginDraw();
+    m_d2dContext->SetTarget(m_d2dTargetBitmap.Get());
+    m_d2dContext->Clear(D2D1::ColorF(D2D1::ColorF::Black));
+    m_d2dContext->EndDraw();
+    m_swapChain->Present(1, 0);
+
     m_isRunning = true;
 
     D3D11_TEXTURE2D_DESC desc = {};

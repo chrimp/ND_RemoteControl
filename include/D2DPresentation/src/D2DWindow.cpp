@@ -76,6 +76,10 @@ void D2DWindow::WindowThread(
         throw std::exception();
     }
 
+    while (!m_show) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+
     ShowWindow(m_hwnd, SW_SHOW);
     UpdateWindow(m_hwnd);
 

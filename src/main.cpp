@@ -124,6 +124,8 @@ public:
             return false;
         }
 
+        m_Window->DisplayWindow();
+
         ComPtr<ID3D11Device> d3dDevice = m_Renderer->GetD3DDevice();
         ComPtr<ID3D11DeviceContext> d3dContext = m_Renderer->GetD3DContext();
 

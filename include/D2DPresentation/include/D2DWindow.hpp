@@ -40,6 +40,10 @@ namespace D2DPresentation {
         void Start();
         void Stop();
 
+        void DisplayWindow() {
+            m_show = true;
+        }
+
         HWND GetHwnd() const { return m_hwnd; }
 
     private:
@@ -67,6 +71,8 @@ namespace D2DPresentation {
         UINT m_height = 600;
 
         float m_aspectRatio = -1.0f;
+
+        std::atomic<bool> m_show = false;
     };
 }
 
