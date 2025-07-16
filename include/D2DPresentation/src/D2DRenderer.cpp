@@ -5,6 +5,10 @@
 #undef max
 
 #include <algorithm>
+#include <iostream>
+#include <d3dcompiler.h>
+
+#pragma comment(lib, "d3dcompiler.lib")
 
 /*
 * ======================================================================
@@ -67,21 +71,25 @@ HRESULT D2DRenderer::Initialize(IDXGIAdapter* pAdapter, HWND hwnd, UINT width, U
 
     HRESULT hr = CreateDXGIFactory1(IID_PPV_ARGS(m_dxgiFactory.GetAddressOf()));
     if (FAILED(hr)) {
+        abort();
         return hr;
     }
 
     hr = createD3DDeviceAndSwapChain(pAdapter);
     if (FAILED(hr)) {
+        abort();
         return hr;
     }
 
     hr = createD2DResources();
     if (FAILED(hr)) {
+        abort();
         return hr;
     }
 
     hr = createSwapChainRenderTarget();
     if (FAILED(hr)) {
+        abort();
         return hr;
     }
     m_isRunning = true;
@@ -101,6 +109,26 @@ HRESULT D2DRenderer::Initialize(IDXGIAdapter* pAdapter, HWND hwnd, UINT width, U
 
     hr = m_d3dDevice->CreateTexture2D(&desc, nullptr, m_sharedTexture.GetAddressOf());
     if (FAILED(hr)) {
+        abort();
+        return hr;
+    }
+
+    // Compile shader
+    ComPtr<ID3DBlob> shaderBlob;
+    ComPtr<ID3DBlob> errorBlob;
+    hr = D3DCompileFromFile(L"shaders/440_2BGRA.hlsl", nullptr, nullptr, "main", "cs_5_0", 0, 0, &shaderBlob, &errorBlob);
+    if (FAILED(hr)) {
+        if (errorBlob) {
+            std::cerr << "Shader compilation error: " << static_cast<const char*>(errorBlob->GetBufferPointer()) << std::endl;
+        }
+        abort();
+        return hr;
+    }
+
+    hr = m_d3dDevice->CreateComputeShader(shaderBlob->GetBufferPointer(), shaderBlob->GetBufferSize(), nullptr, m_DecompressShader.GetAddressOf());
+    if (hr == S_FALSE || FAILED(hr)) {
+        std::cerr << "Failed to create compute shader: " << std::hex << hr << std::endl;
+        abort();
         return hr;
     }
 
@@ -137,6 +165,73 @@ void D2DRenderer::SetSourceSurface(const ComPtr<ID3D11Texture2D>& sourceSurface)
     if (FAILED(hr)) {
         m_d2dSourceBitmap.Reset();
     }
+}
+
+bool D2DRenderer::DecompressTexture(ID3D11Texture2D* yPlane, ID3D11Texture2D* uvPlane, ID3D11Texture2D* outputTexture) {
+    D3D11_QUERY_DESC queryDesc = {};
+    queryDesc.Query = D3D11_QUERY_EVENT;
+    queryDesc.MiscFlags = 0;
+    ComPtr<ID3D11Query> query;
+    HRESULT hr = m_d3dDevice->CreateQuery(&queryDesc, query.GetAddressOf());
+    if (FAILED(hr)) {
+        std::cerr << "Failed to create query for decompression. Reason: 0x" << std::hex << hr << std::endl;
+        throw std::exception();
+        return false;
+    }
+
+    D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
+    srvDesc.Format = DXGI_FORMAT_R8_UNORM;
+    srvDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+    srvDesc.Texture2D.MipLevels = 1;
+    srvDesc.Texture2D.MostDetailedMip = 0;
+    
+    ComPtr<ID3D11ShaderResourceView> ySRV;
+    hr = m_d3dDevice->CreateShaderResourceView(yPlane, &srvDesc, &ySRV);
+    if (FAILED(hr)) return hr;
+    
+    srvDesc.Format = DXGI_FORMAT_R8G8_UNORM;
+    ComPtr<ID3D11ShaderResourceView> uvSRV;
+    hr = m_d3dDevice->CreateShaderResourceView(uvPlane, &srvDesc, &uvSRV);
+    if (FAILED(hr)) return hr;
+    
+    // Create unordered access view for output texture
+    D3D11_UNORDERED_ACCESS_VIEW_DESC uavDesc = {};
+    uavDesc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    uavDesc.ViewDimension = D3D11_UAV_DIMENSION_TEXTURE2D;
+    uavDesc.Texture2D.MipSlice = 0;
+    
+    ComPtr<ID3D11UnorderedAccessView> outputUAV;
+    hr = m_d3dDevice->CreateUnorderedAccessView(outputTexture, &uavDesc, &outputUAV);
+    if (FAILED(hr)) return hr;
+    
+    // Set compute shader and resources
+    m_d3dContext->CSSetShader(m_DecompressShader.Get(), nullptr, 0);
+    
+    ID3D11ShaderResourceView* srvs[] = { ySRV.Get(), uvSRV.Get() };
+    m_d3dContext->CSSetShaderResources(0, 2, srvs);
+    
+    ID3D11UnorderedAccessView* uavs[] = { outputUAV.Get() };
+    m_d3dContext->CSSetUnorderedAccessViews(0, 1, uavs, nullptr);
+    
+    // Dispatch compute shader (assuming 1920x1080 resolution)
+    UINT dispatchX = (2560 + 15) / 16;  // Round up for 16x16 thread groups
+    UINT dispatchY = (1440 + 15) / 16;
+    m_d3dContext->Dispatch(dispatchX, dispatchY, 1);
+    
+    m_d3dContext->End(query.Get());
+
+    // Cleanup
+    ID3D11ShaderResourceView* nullSRV[] = { nullptr, nullptr };
+    m_d3dContext->CSSetShaderResources(0, 2, nullSRV);
+    
+    ID3D11UnorderedAccessView* nullUAV[] = { nullptr };
+    m_d3dContext->CSSetUnorderedAccessViews(0, 1, nullUAV, nullptr);
+    
+    m_d3dContext->CSSetShader(nullptr, nullptr, 0);
+    
+    while (m_d3dContext->GetData(query.Get(), nullptr, 0, 0) == S_FALSE) _mm_pause();
+
+    return S_OK;
 }
 
 void D2DRenderer::Render() {
@@ -262,26 +357,37 @@ HRESULT D2DRenderer::createD3DDeviceAndSwapChain(IDXGIAdapter* pAdapter) {
     flags |= D3D11_CREATE_DEVICE_DEBUG;
     #endif
 
+    flags |= D3D11_CREATE_DEVICE_BGRA_SUPPORT;
+
     D3D_FEATURE_LEVEL featureLevels[] = {D3D_FEATURE_LEVEL_11_1}; // Does not work with 11.0 or lower.
+
+    ID3D11Device* d3dDevice = nullptr;
+    ID3D11DeviceContext* d3dContext = nullptr;
 
     HRESULT hr = D3D11CreateDeviceAndSwapChain(
         nullptr,
         D3D_DRIVER_TYPE_HARDWARE,
         nullptr,
-        D3D11_CREATE_DEVICE_BGRA_SUPPORT | flags,
+        flags,
         featureLevels,
         1,
         D3D11_SDK_VERSION,
         &swapChainDesc,
         m_swapChain.GetAddressOf(),
-        m_d3dDevice.GetAddressOf(),
+        &d3dDevice,
         nullptr,
-        m_d3dContext.GetAddressOf()
+        &d3dContext
     );
 
     if (FAILED(hr)) {
         return hr;
     }
+
+    d3dDevice->QueryInterface(IID_PPV_ARGS(m_d3dDevice.GetAddressOf()));
+    d3dContext->QueryInterface(IID_PPV_ARGS(m_d3dContext.GetAddressOf()));
+
+    d3dDevice->Release();
+    d3dContext->Release();
 
     return S_OK;
 }

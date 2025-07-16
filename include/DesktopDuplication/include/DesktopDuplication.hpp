@@ -53,12 +53,15 @@ namespace DesktopDuplication {
         bool SaveFrame(const std::filesystem::path& path);
         bool GetStagedTexture(_Out_ ID3D11Texture2D*& dst);
         bool GetStagedTexture(_Out_ ID3D11Texture2D*& dst, _In_ unsigned long timeout);
+        bool GetStagedTexture(_Out_ ID3D11Texture2D*& YPlane, _Out_ ID3D11Texture2D*& UVPlane, _In_ unsigned long timeout = 16);
 
         int GetFrame(_Out_ ID3D11Texture2D*& frame, _In_ unsigned long timemout = 16);
 
         void ReleaseFrame();
 
         private:
+        int GetAndCompressTexture(unsigned long timeout);
+
         ComPtr<ID3D11Device5> m_Device;
         ComPtr<ID3D11DeviceContext4> m_Context;
         ComPtr<IDXGIOutputDuplication> m_DesktopDupl;
@@ -78,6 +81,15 @@ namespace DesktopDuplication {
 
         std::vector<uint8_t> m_CursorShape;
         DXGI_OUTDUPL_POINTER_SHAPE_INFO m_CursorShapeInfo;
+
+        void CompressTexture(ID3D11Texture2D* inputTexture);
+
+        ComPtr<ID3D11Texture2D> m_YPlaneTexture;  // Stores the Y (luminance) plane
+        ComPtr<ID3D11Texture2D> m_UVPlaneTexture; // Stores the UV (chroma) plane
+        ComPtr<ID3D11ComputeShader> m_CompressShader;   // Shader for 4:4:0 compression
+        ComPtr<ID3D11Buffer> m_ConstantsBuffer; // Buffer for shader constants (e.g., width, height)
+
+        ComPtr<ID3D11Texture2D> m_SRTexture;
     };
 
     class DuplicationThread {

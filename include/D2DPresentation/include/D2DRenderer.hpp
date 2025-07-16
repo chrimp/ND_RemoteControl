@@ -1,5 +1,6 @@
 #ifndef D2DPRESENTATION_H
 #define D2DPRESENTATION_H
+
 #pragma once
 
 #include <Windows.h>
@@ -7,6 +8,7 @@
 #include <d3d11_4.h>
 #include <dxgi1_6.h>
 #include <wrl/client.h>
+#include <cstdint>
 
 /*
 * ======================================================================
@@ -52,6 +54,8 @@ namespace D2DPresentation {
         ComPtr<ID3D11Device> GetD3DDevice() const { return m_d3dDevice; }
         ComPtr<ID3D11DeviceContext> GetD3DContext() const { return m_d3dContext; }
 
+        bool DecompressTexture(ID3D11Texture2D* yPlane, ID3D11Texture2D* uvPlane, ID3D11Texture2D* outputTexture);
+
         private:
         HRESULT createD3DDeviceAndSwapChain(IDXGIAdapter* pAdapter);
         HRESULT createD2DResources();
@@ -64,8 +68,8 @@ namespace D2DPresentation {
         UINT m_height = 0;
         bool m_isRunning = false;
 
-        ComPtr<ID3D11Device> m_d3dDevice;
-        ComPtr<ID3D11DeviceContext> m_d3dContext;
+        ComPtr<ID3D11Device5> m_d3dDevice;
+        ComPtr<ID3D11DeviceContext4> m_d3dContext;
 
         ComPtr<IDXGIFactory5> m_dxgiFactory;
         ComPtr<IDXGISwapChain> m_swapChain;
@@ -77,6 +81,12 @@ namespace D2DPresentation {
 
         ComPtr<ID3D11Texture2D> m_sharedTexture;
         ComPtr<ID2D1Bitmap1> m_d2dSourceBitmap;
+
+        ComPtr<ID3D11ComputeShader> m_DecompressShader;
+
+        ComPtr<ID3D11ShaderResourceView> m_YPlaneSRV;
+        ComPtr<ID3D11ShaderResourceView> m_UVPlaneSRV;
+        ComPtr<ID3D11UnorderedAccessView> m_outputUAV;
     };
 }
 
