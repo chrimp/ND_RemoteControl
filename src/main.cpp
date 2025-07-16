@@ -277,7 +277,11 @@ public:
         auto FlagWaitTotal = std::chrono::microseconds(0);
         auto DecompressTotal = std::chrono::microseconds(0);
         auto DrawTotal = std::chrono::microseconds(0);
-        while (true) {
+
+        bool isWindowOpen = true;
+
+        while (true || isWindowOpen) {
+            isWindowOpen = m_Window->isRunning();
             auto flagWaitStart = std::chrono::steady_clock::now();
             sge.Buffer = m_Buf;
             sge.BufferLength = 1;

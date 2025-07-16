@@ -44,6 +44,10 @@ namespace D2DPresentation {
             m_show = true;
         }
 
+        bool isRunning() const {
+            return m_isRunning;
+        }
+
         HWND GetHwnd() const { return m_hwnd; }
 
     private:
