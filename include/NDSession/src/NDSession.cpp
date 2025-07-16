@@ -28,7 +28,7 @@ NDSessionBase::~NDSessionBase() {
     if (m_hAdapterFile) CloseHandle(m_hAdapterFile);
     SafeRelease(m_pAdapter);
     if (m_Buf) {
-        HeapFree(GetProcessHeap(), 0, m_Buf);
+        VirtualFree(m_Buf, 0, MEM_RELEASE);
         m_Buf = nullptr;
     }
 }
@@ -50,12 +50,12 @@ HRESULT NDSessionBase::RegisterDataBuffer(DWORD bufferLength, ULONG type) {
             #endif
             return hr;
         }
-        HeapFree(GetProcessHeap(), 0, m_Buf);
+        VirtualFree(m_Buf, 0, MEM_RELEASE);
         m_Buf = nullptr;
     }
 
     m_Buf_Len = bufferLength;
-    m_Buf = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, m_Buf_Len);
+    m_Buf = VirtualAlloc(nullptr, m_Buf_Len, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
     if (!m_Buf) {
         std::cerr << "Failed to allocate memory for buffer." << std::endl;
         return E_OUTOFMEMORY;

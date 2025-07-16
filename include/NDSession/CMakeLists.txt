@@ -22,7 +22,7 @@ target_include_directories(NDSession
 if (WIN32)
     target_link_libraries(NDSession 
         PUBLIC 
-            NetworkDirect  # If MyNDSession depends on NetworkDirect
+            NetworkDirect
         PRIVATE
             ws2_32
     )

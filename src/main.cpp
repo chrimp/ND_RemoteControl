@@ -7,13 +7,11 @@
 #include <thread>
 #include <chrono>
 #include <wincodec.h>
+#include <mutex>
+
+#include "InputNDSession.hpp"
 
 constexpr char TEST_PORT[] = "54321";
-
-#define RECV_CTXT ((void*)0x1000)
-#define SEND_CTXT ((void*)0x2000)
-#define READ_CTXT ((void*)0x3000)
-#define WRITE_CTXT ((void*)0x4000)
 
 #undef max
 #undef min
@@ -59,11 +57,6 @@ std::string FormatBytes(uint64_t bytes) {
         return std::to_string(bytes) + "B";
     }
 }
-
-struct PeerInfo {
-    UINT64 remoteAddr;
-    UINT32 remoteToken;
-};
 
 void ShowUsage() {
     printf("main.exe [options]\n"
@@ -237,7 +230,6 @@ public:
 
         sge = { m_Buf, sizeof(PeerInfo), m_pMr->GetLocalToken() };
 
-        PeerInfo remoteInfo;
         remoteInfo.remoteAddr = receivedInfo->remoteAddr;
         remoteInfo.remoteToken = receivedInfo->remoteToken;
 
@@ -280,7 +272,7 @@ public:
 
         bool isWindowOpen = true;
 
-        while (true || isWindowOpen) {
+        while (isWindowOpen) {
             isWindowOpen = m_Window->isRunning();
             auto flagWaitStart = std::chrono::steady_clock::now();
             sge.Buffer = m_Buf;
@@ -372,9 +364,11 @@ public:
     }
 
     void Run(const char* localAddr) {
+        inputSession.Start(const_cast<char*>(localAddr));
         OpenListener(localAddr);
         ExchangePeerInfo();
         Loop();
+        inputSession.Stop();
     }
 
     private:
@@ -385,11 +379,19 @@ public:
     ComPtr<ID3D11Texture2D> m_YPlaneTexture;
     ComPtr<ID3D11Texture2D> m_UVPlaneTexture;
     ComPtr<ID3D11Texture2D> m_FrameTexture;
+
+    std::atomic<bool> m_isRunning = true;
+
+    PeerInfo remoteInfo;
+
+    InputNDSessionServer inputSession;
 };
 
 // MARK: TestClient
 class TestClient : public NDSessionClientBase {
 public:
+    TestClient() : m_CoutMutex(), inputSession(m_CoutMutex) {}
+
     bool Setup(char* localAddr) {
         if (!Initialize(localAddr)) return false;
 
@@ -421,6 +423,8 @@ public:
         sprintf_s(fullServerAddress, "%s:%s", serverAddr, TEST_PORT);
 
         std::cout << "Connecting from " << localAddr << " to " << fullServerAddress << "..." << std::endl;
+        std::this_thread::sleep_for(std::chrono::seconds(1));
+
         if (FAILED(Connect(localAddr, fullServerAddress, 1, 1, nullptr, 0))) {
              std::cerr << "Connect failed." << std::endl;
              return;
@@ -630,6 +634,7 @@ public:
                 auto WriteAvg = WriteTotal.count() / 1000.0f / frames;
                 auto FlagWaitAvg = FlagWaitTotal.count() / 1000.0f / frames;
 
+                std::scoped_lock<std::mutex> lock(m_CoutMutex);
                 std::cout << "\r                                                                         \r" << std::flush;
                 std::cout << "FPS: " << frames << "| Comp: " << GetAndFlagAvg << " Map: " << MapAvg << " Write: " << WriteAvg << " Flag: " << FlagWaitAvg << std::flush;
                 frames = 0;
@@ -646,13 +651,20 @@ public:
     }
 
     void Run(const char* localAddr, const char* serverAddr) {
+        inputSession.Start(const_cast<char*>(localAddr), serverAddr);
         OpenConnector(localAddr, serverAddr);
         ExchangePeerInfo();
         Loop();
+        inputSession.Stop();
     }
 
     private:
     PeerInfo remoteInfo;
+
+    std::atomic<bool> m_isRunning = true;
+    std::mutex m_CoutMutex;
+
+    InputNDSessionClient inputSession;
 };
 
 int main(int argc, char* argv[]) {
