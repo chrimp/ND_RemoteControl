@@ -5,6 +5,7 @@
 #include <Windows.h>
 #include <thread>
 #include <atomic>
+#include <functional>
 
 #include "tstring.hpp"
 
@@ -28,6 +29,10 @@
 */
 
 namespace D2DPresentation {
+    struct Point {
+        int x;
+        int y;
+    };
     class D2DWindow {
     public:
         D2DWindow(
@@ -50,7 +55,13 @@ namespace D2DPresentation {
 
         HWND GetHwnd() const { return m_hwnd; }
 
+        void RegisterRawInputCallback(std::function<void(RAWINPUT)> callback, HANDLE hEvent) {
+            m_rawInputCallback = callback;
+            m_hCallbackEvent = hEvent;
+        }
+
     private:
+        void RegisterRawInput();
         void WindowThread(
             LPCTSTR title,
             UINT width,
@@ -77,6 +88,12 @@ namespace D2DPresentation {
         float m_aspectRatio = -1.0f;
 
         std::atomic<bool> m_show = false;
+
+        POINT m_lastMousePos = { 0, 0 };
+        Point m_VirtAbsPos = {0, 0};
+        std::function<void(RAWINPUT)> m_rawInputCallback;
+        bool m_cursorTrapped = false; // Whether the cursor is trapped
+        HANDLE m_hCallbackEvent = nullptr; // Event for mouse callback
     };
 }
 

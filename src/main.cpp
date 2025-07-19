@@ -2,6 +2,7 @@
 #include "DesktopDuplication.hpp"
 #include "D2DRenderer.hpp"
 #include "D2DWindow.hpp"
+#include "InputNDSession.hpp"
 #include <conio.h>
 #include <iostream>
 #include <thread>
@@ -9,15 +10,13 @@
 #include <wincodec.h>
 #include <mutex>
 
-#include "InputNDSession.hpp"
-
 constexpr char TEST_PORT[] = "54321";
 
 #undef max
 #undef min
 
-constexpr size_t WIDTH = 2560;
-constexpr size_t HEIGHT = 1440;
+constexpr size_t WIDTH = 1920;
+constexpr size_t HEIGHT = 1080;
 constexpr size_t FPS = 240;
 
 constexpr size_t Y_PLANE_SIZE = WIDTH * HEIGHT;
@@ -77,6 +76,7 @@ public:
         std::cout << "Max transfer length: " << info.MaxTransferLength << std::endl;
         std::cout << "Max inline length: " << info.MaxInlineDataSize << std::endl;
         std::cout << "Max send sge: " << info.MaxInitiatorSge << std::endl;
+        std::cout << "Max receive sge: " << info.MaxReceiveSge << std::endl;
 
         maxSge = info.MaxInitiatorSge;
 
@@ -118,6 +118,7 @@ public:
         }
 
         m_Window->DisplayWindow();
+        PostMessage(m_hWnd, WM_SYSCOMMAND, SC_MINIMIZE, 0);
 
         ComPtr<ID3D11Device> d3dDevice = m_Renderer->GetD3DDevice();
         ComPtr<ID3D11DeviceContext> d3dContext = m_Renderer->GetD3DContext();
@@ -335,7 +336,7 @@ public:
                     break;
                 }
             }
-
+            /*
             auto now2 = std::chrono::steady_clock::now();
             auto elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(now2 - now).count();
             if (elapsed >= 1000000000) {
@@ -352,6 +353,7 @@ public:
                 DecompressTotal = std::chrono::microseconds(0);
                 DrawTotal = std::chrono::microseconds(0);
             }
+            */
 
             frames++;
         }
@@ -365,6 +367,9 @@ public:
 
     void Run(const char* localAddr) {
         inputSession.Start(const_cast<char*>(localAddr));
+        m_Window->RegisterRawInputCallback([this](RAWINPUT rawInput) {
+            inputSession.SendEvent(rawInput);
+        }, inputSession.GetCallbackEvent());
         OpenListener(localAddr);
         ExchangePeerInfo();
         Loop();
@@ -626,6 +631,7 @@ public:
             auto WriteEnd = std::chrono::steady_clock::now();
             WriteTotal += std::chrono::duration_cast<std::chrono::microseconds>(WriteEnd - WriteStart);
 
+            /*
             auto now2 = std::chrono::steady_clock::now();
             auto elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(now2 - now).count();
             if (elapsed >= 1000000000) {
@@ -645,6 +651,7 @@ public:
 
                 now = now2;
             }
+            */
         }
 
         Shutdown();

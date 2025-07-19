@@ -1,5 +1,8 @@
 #include "../include/D2DWindow.hpp"
 #include <objbase.h>
+#include <windowsx.h>
+#include <hidusage.h>
+#include <iostream>
 
 /*
 * ======================================================================
@@ -66,7 +69,7 @@ void D2DWindow::WindowThread(
         0,
         m_className.c_str(),
         title,
-        WS_OVERLAPPEDWINDOW,
+        WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
         CW_USEDEFAULT, CW_USEDEFAULT, width, height,
         NULL, NULL, hInstance, this
     );
@@ -75,6 +78,8 @@ void D2DWindow::WindowThread(
         hr = HRESULT_FROM_WIN32(GetLastError());
         throw std::exception();
     }
+
+    RegisterRawInput();
 
     while (!m_show) {
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
@@ -93,6 +98,19 @@ void D2DWindow::WindowThread(
 
     if(SUCCEEDED(hrCoInit)) {
         CoUninitialize();
+    }
+}
+
+void D2DWindow::RegisterRawInput() {
+    RAWINPUTDEVICE rid[1];
+    rid[0].usUsagePage = HID_USAGE_PAGE_GENERIC;
+    rid[0].usUsage = HID_USAGE_GENERIC_MOUSE;
+    rid[0].dwFlags = 0;
+    rid[0].hwndTarget = m_hwnd;
+
+    if (!RegisterRawInputDevices(rid, 1, sizeof(rid[0]))) {
+        std::cerr << "Failed to register raw input devices: " << std::hex << GetLastError() << std::endl;
+        throw std::exception();
     }
 }
 
@@ -156,11 +174,49 @@ LRESULT CALLBACK D2DWindow::StaticWndProc(HWND hWnd, UINT message, WPARAM wParam
 LRESULT CALLBACK D2DWindow::WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) {
     switch (message) {
         case WM_CLOSE:
+            if (m_cursorTrapped) {
+                ClipCursor(nullptr);
+                ShowCursor(true);
+                m_cursorTrapped = false;
+            }
             DestroyWindow(hWnd);
             return 0;
         case WM_DESTROY:
             m_isRunning = false;
             PostQuitMessage(0);
+            return 0;
+        case WM_INPUT: {
+            UINT dwSize = 0;
+            GetRawInputData(reinterpret_cast<HRAWINPUT>(lParam), RID_INPUT, nullptr, &dwSize, sizeof(RAWINPUTHEADER));
+            std::vector<BYTE> lpb(dwSize);
+
+            if (GetRawInputData(reinterpret_cast<HRAWINPUT>(lParam), RID_INPUT, lpb.data(), &dwSize, sizeof(RAWINPUTHEADER)) != dwSize) {
+                std::cerr << "Failed to get raw input data: " << std::hex << GetLastError() << std::endl;
+                throw std::exception();
+            }
+            RAWINPUT* rawInput = reinterpret_cast<RAWINPUT*>(lpb.data());
+
+            if (m_rawInputCallback) {
+                m_rawInputCallback(*rawInput);
+                SetEvent(m_hCallbackEvent);
+            } 
+            return 0;
+        }
+        case WM_SETFOCUS:
+            ShowCursor(false);
+            {
+                RECT rect;
+                GetClientRect(hWnd, &rect);
+                ClientToScreen(hWnd, reinterpret_cast<POINT*>(&rect));
+                ClientToScreen(hWnd, reinterpret_cast<POINT*>(&rect) + 1);
+                ClipCursor(&rect);
+                m_cursorTrapped = true;
+            }
+            return 0;
+        case WM_KILLFOCUS:
+            ClipCursor(nullptr);
+            ShowCursor(true);
+            m_cursorTrapped = false;
             return 0;
         case WM_SIZING:
         {

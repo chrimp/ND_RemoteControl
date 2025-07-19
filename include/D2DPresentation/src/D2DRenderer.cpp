@@ -221,8 +221,8 @@ bool D2DRenderer::DecompressTexture(ID3D11Texture2D* yPlane, ID3D11Texture2D* uv
     m_d3dContext->CSSetUnorderedAccessViews(0, 1, uavs, nullptr);
     
     // Dispatch compute shader (assuming 1920x1080 resolution)
-    UINT dispatchX = (2560 + 15) / 16;  // Round up for 16x16 thread groups
-    UINT dispatchY = (1440 + 15) / 16;
+    UINT dispatchX = (m_width + 15) / 16;  // Round up for 16x16 thread groups
+    UINT dispatchY = (m_height + 15) / 16;
     m_d3dContext->Dispatch(dispatchX, dispatchY, 1);
     
     m_d3dContext->End(query.Get());

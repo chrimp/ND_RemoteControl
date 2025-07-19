@@ -299,7 +299,7 @@ bool NDSessionBase::WaitForCompletionAndCheckContext(void *expectedContext, ULON
 }
 
 HRESULT NDSessionBase::WaitForCompletion() {
-    ND2_RESULT ndRes= WaitForCompletion(ND_CQ_NOTIFY_ANY, true);
+    ND2_RESULT ndRes = WaitForCompletion(ND_CQ_NOTIFY_ANY, true);
     return ndRes.Status;
 }
 
