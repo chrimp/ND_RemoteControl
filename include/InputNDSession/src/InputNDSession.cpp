@@ -92,15 +92,13 @@ void InputNDSessionServer::SendEvent(RAWINPUT input) {
             m_Mouse.x.fetch_add(static_cast<short>(input.data.mouse.lLastX));
             m_Mouse.y.fetch_add(static_cast<short>(input.data.mouse.lLastY));
             m_Mouse.wheel.fetch_add(input.data.mouse.usButtonData);
-            m_Mouse.buttonFlags = input.data.mouse.ulButtons & ~ (RI_MOUSE_BUTTON_4_DOWN | RI_MOUSE_BUTTON_5_DOWN | RI_MOUSE_BUTTON_4_UP | RI_MOUSE_BUTTON_5_UP | RI_MOUSE_WHEEL | RI_MOUSE_HWHEEL);
-            m_Mouse.buttonFlags = input.data.mouse.ulButtons * 2;
+            //m_Mouse.buttonFlags = input.data.mouse.ulButtons & ~ (RI_MOUSE_BUTTON_4_DOWN | RI_MOUSE_BUTTON_5_DOWN | RI_MOUSE_BUTTON_4_UP | RI_MOUSE_BUTTON_5_UP | RI_MOUSE_WHEEL | RI_MOUSE_HWHEEL);
+            m_Mouse.buttonFlags = input.data.mouse.ulButtons; // Let receiver handle
         }
     }
 }
 
 void InputNDSessionServer::Loop() {
-    Point m_LastPos = {m_Mouse.x.load(), m_Mouse.y.load()};
-    Move delta = {0, 0};
     MousePacket packet = {0, 0, 0, 0};
 
     ND2_SGE flagSge = { m_Buf, 1, m_pMr->GetLocalToken() };
@@ -129,10 +127,6 @@ void InputNDSessionServer::Loop() {
             m_Mouse.wheel.exchange(0), 
             m_Mouse.buttonFlags.load()
         };
-
-        //if (delta.dx == 0 && delta.dy == 0) {
-        //    continue; // No event to process
-        //} Don't skip on zeros, now button state is also sent
 
         std::cout << "\r                                                                               \r" << std::flush;
         std::cout << "Move: " << packet.x << ", " << packet.y 
@@ -295,6 +289,8 @@ void InputNDSessionClient::Loop() {
     bool lb = false;
     bool rb = false;
     bool mb = false;
+    bool side1 = false;
+    bool side2 = false;
 
     if (FAILED(PostReceive(&sge, 1, RECV_CTXT))) {
         std::cerr << "INPUT: " << "PostReceive failed." << std::endl;
@@ -339,35 +335,61 @@ void InputNDSessionClient::Loop() {
         _mm_clflush(m_Buf);
         _mm_sfence();
 
-        /*
-        int dx, dy;
-        uint8_t* inputBuffer = reinterpret_cast<uint8_t*>(m_Buf) + 1;
-        memcpy(&dx, inputBuffer, sizeof(dx));
-        memcpy(&dy, inputBuffer + sizeof(dx), sizeof(dy));
-
-        std::cout << "\r                                                                               \r" << std::flush;
-        std::cout << "Move: " << dx << ", " << dy << std::flush;
-
-        INPUT input = {0};
-        input.type = INPUT_MOUSE;
-        input.mi.dwFlags = MOUSEEVENTF_MOVE;
-        input.mi.dx = dx;
-        input.mi.dy = dy;
-
-        if (SendInput(1, &input, sizeof(INPUT)) == 0) {
-            std::cerr << "INPUT: " << "SendInput failed with error: " << GetLastError() << std::endl;
-            abort();
-            return;
-        }
-        */
-
         MousePacket* received = reinterpret_cast<MousePacket*>(buffer);
         INPUT input = {0};
         input.type = INPUT_MOUSE;
         input.mi.dx = received->x;
         input.mi.dy = received->y;
-        //input.mi.mouseData = received->wheel;
-        input.mi.dwFlags = MOUSEEVENTF_MOVE | received->buttonFlags;
+
+        bool isWheel = (received->buttonFlags & RI_MOUSE_WHEEL);
+        bool isX = (received->buttonFlags & (RI_MOUSE_BUTTON_4_DOWN | RI_MOUSE_BUTTON_5_DOWN | RI_MOUSE_BUTTON_4_UP | RI_MOUSE_BUTTON_5_UP));
+    
+        if (isWheel && isX) { // Both can't be set at the same time
+            isX = false;
+            received->buttonFlags &= ~(RI_MOUSE_BUTTON_4_DOWN | RI_MOUSE_BUTTON_5_DOWN | RI_MOUSE_BUTTON_4_UP | RI_MOUSE_BUTTON_5_UP);
+        }
+
+        ULONG xFlag = -1;
+
+        if (isWheel) {
+            input.mi.dwFlags = received->buttonFlags * 2 | MOUSEEVENTF_MOVE;
+            input.mi.mouseData = received->wheel;
+        } else if (isX) {
+            xFlag = received->buttonFlags & (RI_MOUSE_BUTTON_4_DOWN | RI_MOUSE_BUTTON_5_DOWN | RI_MOUSE_BUTTON_4_UP | RI_MOUSE_BUTTON_5_UP);
+            input.mi.dwFlags = (received->buttonFlags & ~(RI_MOUSE_BUTTON_4_DOWN | RI_MOUSE_BUTTON_5_DOWN | RI_MOUSE_BUTTON_4_UP | RI_MOUSE_BUTTON_5_UP)) * 2 | MOUSEEVENTF_MOVE;
+        } else {
+            input.mi.dwFlags = received->buttonFlags * 2 | MOUSEEVENTF_MOVE;
+            input.mi.mouseData = 0;
+        }
+
+        
+        switch (xFlag) {
+            case RI_MOUSE_BUTTON_4_DOWN:
+                input.mi.dwFlags |= MOUSEEVENTF_XDOWN;
+                input.mi.mouseData = XBUTTON1;
+                side1 = true;
+                break;
+            case RI_MOUSE_BUTTON_5_DOWN:
+                input.mi.dwFlags |= MOUSEEVENTF_XDOWN;
+                input.mi.mouseData = XBUTTON2;
+                side2 = true;
+                break;
+            case RI_MOUSE_BUTTON_4_UP:
+                input.mi.dwFlags |= MOUSEEVENTF_XUP;
+                input.mi.mouseData = XBUTTON1;
+                side1 = false;
+                break;
+            case RI_MOUSE_BUTTON_5_UP:
+                input.mi.dwFlags |= MOUSEEVENTF_XUP;
+                input.mi.mouseData = XBUTTON2;
+                side2 = false;
+                break;
+            default: // This cannot happen
+                #ifdef _DEBUG
+                throw std::runtime_error("Unexpected X button state.");
+                #endif
+                break;
+        }
 
         if (input.mi.dwFlags & MOUSEEVENTF_LEFTDOWN) lb = true;
         if (input.mi.dwFlags & MOUSEEVENTF_RIGHTDOWN) rb = true;
@@ -383,14 +405,16 @@ void InputNDSessionClient::Loop() {
             abort();
             return;
         }
+        
         /*
         std::cout << "\r                                                                               \r" << std::flush;
         std::cout << "Move: " << received->x << ", " << received->y << " LB: " << std::boolalpha << lb
                                                                     << " RB: " << std::boolalpha << rb 
-                                                                    << " MB: " << std::boolalpha<< mb
+                                                                    << " MB: " << std::boolalpha << mb
+                                                                    << " Side1: " << std::boolalpha << side1
+                                                                    << " Side2: " << std::boolalpha << side2
                                                                     << " Flags: " << std::hex << input.mi.dwFlags << std::flush;
         */
-
         auto now = std::chrono::steady_clock::now();
         /*
         if (now - lastprobe >= std::chrono::seconds(1)) {

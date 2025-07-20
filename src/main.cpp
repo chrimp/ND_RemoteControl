@@ -633,6 +633,7 @@ public:
             auto WriteEnd = std::chrono::steady_clock::now();
             WriteTotal += std::chrono::duration_cast<std::chrono::microseconds>(WriteEnd - WriteStart);
 
+            /*
             auto now2 = std::chrono::steady_clock::now();
             auto elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(now2 - now).count();
             if (elapsed >= 1000000000) {
@@ -652,6 +653,7 @@ public:
 
                 now = now2;
             }
+            */
         }
 
         Shutdown();

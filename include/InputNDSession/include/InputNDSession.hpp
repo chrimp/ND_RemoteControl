@@ -18,7 +18,7 @@ class InputNDSessionServer : private NDSessionServerBase {
     struct AtomicMouse {
         std::atomic<short> x;
         std::atomic<short> y;
-        std::atomic<char> wheel;
+        std::atomic<short> wheel;
         std::atomic<ULONG> buttonFlags;
     };
 
@@ -30,7 +30,7 @@ class InputNDSessionServer : private NDSessionServerBase {
     struct MousePacket {
         short x;
         short y;
-        char wheel;
+        short wheel;
         ULONG buttonFlags;
     };
 
