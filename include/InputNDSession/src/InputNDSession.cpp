@@ -92,16 +92,40 @@ void InputNDSessionServer::SendEvent(RAWINPUT input) {
             m_Mouse.x.fetch_add(static_cast<short>(input.data.mouse.lLastX));
             m_Mouse.y.fetch_add(static_cast<short>(input.data.mouse.lLastY));
             m_Mouse.wheel.fetch_add(input.data.mouse.usButtonData);
-            //m_Mouse.buttonFlags = input.data.mouse.ulButtons & ~ (RI_MOUSE_BUTTON_4_DOWN | RI_MOUSE_BUTTON_5_DOWN | RI_MOUSE_BUTTON_4_UP | RI_MOUSE_BUTTON_5_UP | RI_MOUSE_WHEEL | RI_MOUSE_HWHEEL);
             m_Mouse.buttonFlags = input.data.mouse.ulButtons; // Let receiver handle
+            break;
         }
+
+        case RIM_TYPEKEYBOARD: {
+            m_Keyboard.vk.store(static_cast<unsigned char>(input.data.keyboard.VKey));
+            
+            switch (input.data.keyboard.Flags) {
+                case RI_KEY_MAKE:
+                    m_Keyboard.down.store(0); // Key down
+                    break;
+                case RI_KEY_BREAK:
+                    m_Keyboard.down.store(1); // Key up
+                    break;
+                default:
+                    m_Keyboard.down.store(2); // No change
+                    break;
+            }
+
+            break;
+        }
+
+        default:
+            break;
     }
 }
 
 void InputNDSessionServer::Loop() {
-    MousePacket packet = {0, 0, 0, 0};
+    Packet* packet = reinterpret_cast<Packet*>(reinterpret_cast<uint8_t*>(m_Buf) + 1);
+    packet->mouse = { 0, 0, 0, 0 };
+    packet->key = { 0, 2 }; // 2 - nothing
 
     ND2_SGE flagSge = { m_Buf, 1, m_pMr->GetLocalToken() };
+    ND2_SGE sge = { m_Buf, sizeof(Packet), m_pMr->GetLocalToken() };
     volatile uint8_t* flag = reinterpret_cast<uint8_t*>(m_Buf);
     flag[0] = 0; // Reset flag
     _mm_clflush(m_Buf);
@@ -121,18 +145,18 @@ void InputNDSessionServer::Loop() {
 
         WaitForSingleObject(m_hCallbackEvent, INFINITE);
         //delta = {m_Mouse.x.exchange(0), m_Mouse.y.exchange(0)};
-        packet = { 
-            m_Mouse.x.exchange(0), 
-            m_Mouse.y.exchange(0), 
-            m_Mouse.wheel.exchange(0), 
+
+        packet->mouse = {
+            m_Mouse.x.exchange(0),
+            m_Mouse.y.exchange(0),
+            m_Mouse.wheel.exchange(0),
             m_Mouse.buttonFlags.load()
         };
 
-        std::cout << "\r                                                                               \r" << std::flush;
-        std::cout << "Move: " << packet.x << ", " << packet.y 
-                  << " Wheel: " << static_cast<int>(packet.wheel) 
-                  << " Flags: " << std::hex << packet.buttonFlags 
-                  << std::dec << std::flush;
+        packet->key = {
+            m_Keyboard.vk.load(),
+            m_Keyboard.down.load()
+        };
 
         auto flagWaitStart = std::chrono::steady_clock::now();
         count++;
@@ -154,10 +178,7 @@ void InputNDSessionServer::Loop() {
         flagWaitTotal += std::chrono::duration_cast<std::chrono::microseconds>(flagWaitEnd - flagWaitStart);
     
         //ND2_SGE sge = { m_Buf, INPUT_EVENT_BUFFER_SIZE, m_pMr->GetLocalToken() };
-        ND2_SGE sge = { m_Buf, sizeof(MousePacket), m_pMr->GetLocalToken() };
-        uint8_t* inputBuffer = reinterpret_cast<uint8_t*>(m_Buf) + 1;
-        memcpy(inputBuffer, &packet, sizeof(MousePacket));
-        if (FAILED(Send(&sge, 1, 0, SEND_CTXT))) {
+        if (FAILED(Send(&sge, 1, ND_OP_FLAG_INLINE, SEND_CTXT))) {
             std::cerr << "INPUT: " << "Send failed." << std::endl;
             return;
         }
@@ -271,34 +292,22 @@ void InputNDSessionClient::ExchangePeerInfo() {
 
 void InputNDSessionClient::Loop() {
     auto lastprobe = std::chrono::steady_clock::now();
+    unsigned int count = 0;
+    unsigned char sgeCount = 0;
 
-    volatile uint8_t curSge = 0;
-    uint16_t count = 0;
-    //MousePacket received = {0, 0, 0, false, false, false};
+    ND2_SGE sge = { m_Buf, sizeof(Packet), m_pMr->GetLocalToken() };
 
-    struct ShouldUP {
-        bool leftB = false;
-        bool rightB = false;
-        bool middleB = false;
-    };
-
-    ShouldUP shouldUp = {false, false, false};
-
-    ND2_SGE sge = { m_Buf, sizeof(MousePacket), m_pMr->GetLocalToken() };
-
-    bool lb = false;
-    bool rb = false;
-    bool mb = false;
-    bool side1 = false;
-    bool side2 = false;
-
-    if (FAILED(PostReceive(&sge, 1, RECV_CTXT))) {
-        std::cerr << "INPUT: " << "PostReceive failed." << std::endl;
-        return;
+    for (int i = 0; i < 20; i++) {
+        if (FAILED(PostReceive(&sge, 1, RECV_CTXT))) {
+            std::cerr << "INPUT: " << "PostReceive failed." << std::endl;
+            return;
+        }
     }
-    curSge = 10;
+
+    sgeCount += 20;
+
     uint8_t* flag = reinterpret_cast<uint8_t*>(m_Buf); // 0 = Cannot accomodate 1 = Good to go
-    uint8_t* buffer = reinterpret_cast<uint8_t*>(m_Buf) + 1; // Buffer for MousePacket
+    Packet* received = reinterpret_cast<Packet*>(reinterpret_cast<uint8_t*>(m_Buf) + 1); // Buffer for MousePacket
 
     while (m_isRunning) {
         if (FAILED(PostReceive(&sge, 1, RECV_CTXT))) {
@@ -306,11 +315,35 @@ void InputNDSessionClient::Loop() {
             return;
         }
 
+        if (sgeCount < 10) {
+            for (int i = 0; i < 10; i++) {
+                if (FAILED(PostReceive(&sge, 1, RECV_CTXT))) {
+                    std::cerr << "INPUT: " << "PostReceive failed." << std::endl;
+                    return;
+                }
+            }
+            sgeCount += 10;
+        }
+        // Let's see this helps with the sync issue.
+        // To be honest, I think it should've worked without this, but it doesn't.
+        // Which means that with I/O depth of 1, it's exhausting despite the flagging.
+        // So if it happens the same, I think this will also eventually fail.
+        // Yup, it fails. Man, this is so weird.
+        // Okay, it failed without SGE decreasing. This means that Send() is just failing.
+        // But it's failing with ND_IO_TIMEOUT, which I think it means that there's no PostReceive().
+        // Then what's this for now? What's going on?
+
         // Wait 20 microseconds to see if it helps
+        // It failed at 1KHz on true remote session, so let's try to wait a bit more
+        // One cycle for 8KHz is 125 microseconds, and for 1KHz is 1000 microseconds.
+        // Still fails at 100 microseconds. RTT is at average like 20-30 microseconds, max is 120 microseconds.
+        // So let's try 300 microseconds. Oh god, it still fails.
+        /*
         auto waitStart = std::chrono::steady_clock::now();
-        while (std::chrono::steady_clock::now() - waitStart < std::chrono::microseconds(20)) {
+        while (std::chrono::steady_clock::now() - waitStart < std::chrono::microseconds(300)) {
             _mm_pause();
         }
+        */
         // It does help, indeed fixes the sync issue.
         // It's like tiny bit of time compared to the max USB 2.0 polling rate.
         // But still, why PostReceive is not *prompt* enough? Why 20 microseconds?
@@ -331,100 +364,119 @@ void InputNDSessionClient::Loop() {
             return;
         }
 
+        count++;
+
         flag[0] = 0;
         _mm_clflush(m_Buf);
         _mm_sfence();
 
-        MousePacket* received = reinterpret_cast<MousePacket*>(buffer);
-        INPUT input = {0};
-        input.type = INPUT_MOUSE;
-        input.mi.dx = received->x;
-        input.mi.dy = received->y;
+        MousePacket mouse = received->mouse;
+        KeyPacket key = received->key;
 
-        bool isWheel = (received->buttonFlags & RI_MOUSE_WHEEL);
-        bool isX = (received->buttonFlags & (RI_MOUSE_BUTTON_4_DOWN | RI_MOUSE_BUTTON_5_DOWN | RI_MOUSE_BUTTON_4_UP | RI_MOUSE_BUTTON_5_UP));
-    
-        if (isWheel && isX) { // Both can't be set at the same time
-            isX = false;
-            received->buttonFlags &= ~(RI_MOUSE_BUTTON_4_DOWN | RI_MOUSE_BUTTON_5_DOWN | RI_MOUSE_BUTTON_4_UP | RI_MOUSE_BUTTON_5_UP);
+        bool shouldMouse = (mouse.x != 0 || mouse.y != 0 || mouse.wheel != 0 || mouse.buttonFlags != 0);
+        bool shouldKey = (key.vk != 0 && key.down != 2);
+
+        if (!shouldMouse && !shouldKey) {
+            continue; // Nothing to do
         }
 
-        ULONG xFlag = -1;
+        if (shouldMouse) {
+            // Handle mouse
+            INPUT input = {0};
+            input.type = INPUT_MOUSE;
+            input.mi.dx = mouse.x;
+            input.mi.dy = mouse.y;
 
-        if (isWheel) {
-            input.mi.dwFlags = received->buttonFlags * 2 | MOUSEEVENTF_MOVE;
-            input.mi.mouseData = received->wheel;
-        } else if (isX) {
-            xFlag = received->buttonFlags & (RI_MOUSE_BUTTON_4_DOWN | RI_MOUSE_BUTTON_5_DOWN | RI_MOUSE_BUTTON_4_UP | RI_MOUSE_BUTTON_5_UP);
-            input.mi.dwFlags = (received->buttonFlags & ~(RI_MOUSE_BUTTON_4_DOWN | RI_MOUSE_BUTTON_5_DOWN | RI_MOUSE_BUTTON_4_UP | RI_MOUSE_BUTTON_5_UP)) * 2 | MOUSEEVENTF_MOVE;
-        } else {
-            input.mi.dwFlags = received->buttonFlags * 2 | MOUSEEVENTF_MOVE;
-            input.mi.mouseData = 0;
-        }
-
+            bool isWheel = (mouse.buttonFlags & RI_MOUSE_WHEEL);
+            bool isX = (mouse.buttonFlags & (RI_MOUSE_BUTTON_4_DOWN | RI_MOUSE_BUTTON_5_DOWN | RI_MOUSE_BUTTON_4_UP | RI_MOUSE_BUTTON_5_UP));
         
-        switch (xFlag) {
-            case RI_MOUSE_BUTTON_4_DOWN:
-                input.mi.dwFlags |= MOUSEEVENTF_XDOWN;
-                input.mi.mouseData = XBUTTON1;
-                side1 = true;
-                break;
-            case RI_MOUSE_BUTTON_5_DOWN:
-                input.mi.dwFlags |= MOUSEEVENTF_XDOWN;
-                input.mi.mouseData = XBUTTON2;
-                side2 = true;
-                break;
-            case RI_MOUSE_BUTTON_4_UP:
-                input.mi.dwFlags |= MOUSEEVENTF_XUP;
-                input.mi.mouseData = XBUTTON1;
-                side1 = false;
-                break;
-            case RI_MOUSE_BUTTON_5_UP:
-                input.mi.dwFlags |= MOUSEEVENTF_XUP;
-                input.mi.mouseData = XBUTTON2;
-                side2 = false;
-                break;
-            default: // This cannot happen
-                #ifdef _DEBUG
-                throw std::runtime_error("Unexpected X button state.");
-                #endif
-                break;
-        }
+            if (isWheel && isX) { // Both can't be set at the same time
+                isX = false;
+                mouse.buttonFlags &= ~(RI_MOUSE_BUTTON_4_DOWN | RI_MOUSE_BUTTON_5_DOWN | RI_MOUSE_BUTTON_4_UP | RI_MOUSE_BUTTON_5_UP);
+            }
 
-        if (input.mi.dwFlags & MOUSEEVENTF_LEFTDOWN) lb = true;
-        if (input.mi.dwFlags & MOUSEEVENTF_RIGHTDOWN) rb = true;
-        if (input.mi.dwFlags & MOUSEEVENTF_MIDDLEDOWN) mb = true;
-        if (input.mi.dwFlags & MOUSEEVENTF_LEFTUP) lb = false;
-        if (input.mi.dwFlags & MOUSEEVENTF_RIGHTUP) rb = false;
-        if (input.mi.dwFlags & MOUSEEVENTF_MIDDLEUP) mb = false;
+            ULONG xFlag = -1;
 
-        count++;
+            if (isWheel) {
+                input.mi.dwFlags = mouse.buttonFlags * 2 | MOUSEEVENTF_MOVE;
+                input.mi.mouseData = mouse.wheel;
+            } else if (isX) {
+                xFlag = mouse.buttonFlags & (RI_MOUSE_BUTTON_4_DOWN | RI_MOUSE_BUTTON_5_DOWN | RI_MOUSE_BUTTON_4_UP | RI_MOUSE_BUTTON_5_UP);
+                input.mi.dwFlags = (mouse.buttonFlags & ~(RI_MOUSE_BUTTON_4_DOWN | RI_MOUSE_BUTTON_5_DOWN | RI_MOUSE_BUTTON_4_UP | RI_MOUSE_BUTTON_5_UP)) * 2 | MOUSEEVENTF_MOVE;
+            } else {
+                input.mi.dwFlags = mouse.buttonFlags * 2 | MOUSEEVENTF_MOVE;
+                input.mi.mouseData = 0;
+            }
 
-        if (SendInput(1, &input, sizeof(INPUT)) == 0) {
-            std::cerr << "INPUT: " << "SendInput failed with error: " << GetLastError() << std::endl;
-            abort();
-            return;
+            switch (xFlag) {
+                case RI_MOUSE_BUTTON_4_DOWN:
+                    input.mi.dwFlags |= MOUSEEVENTF_XDOWN;
+                    input.mi.mouseData = XBUTTON1;
+                    break;
+                case RI_MOUSE_BUTTON_5_DOWN:
+                    input.mi.dwFlags |= MOUSEEVENTF_XDOWN;
+                    input.mi.mouseData = XBUTTON2;
+                    break;
+                case RI_MOUSE_BUTTON_4_UP:
+                    input.mi.dwFlags |= MOUSEEVENTF_XUP;
+                    input.mi.mouseData = XBUTTON1;
+                    break;
+                case RI_MOUSE_BUTTON_5_UP:
+                    input.mi.dwFlags |= MOUSEEVENTF_XUP;
+                    input.mi.mouseData = XBUTTON2;
+                    break;
+                default: // This cannot happen
+                    #ifdef _DEBUG
+                    throw std::runtime_error("Unexpected X button state.");
+                    #endif
+                    break;
+            }
+
+            if (SendInput(1, &input, sizeof(INPUT)) == 0) {
+                std::cerr << "INPUT: " << "SendInput failed with error: " << GetLastError() << std::endl;
+                abort();
+                return;
+            }
         }
         
-        /*
-        std::cout << "\r                                                                               \r" << std::flush;
-        std::cout << "Move: " << received->x << ", " << received->y << " LB: " << std::boolalpha << lb
-                                                                    << " RB: " << std::boolalpha << rb 
-                                                                    << " MB: " << std::boolalpha << mb
-                                                                    << " Side1: " << std::boolalpha << side1
-                                                                    << " Side2: " << std::boolalpha << side2
-                                                                    << " Flags: " << std::hex << input.mi.dwFlags << std::flush;
-        */
+        // Handle keyboard
+        if (shouldKey) {
+            INPUT input = {0};
+            input.type = INPUT_KEYBOARD;
+            input.ki.wVk = key.vk;
+
+            if (key.down == 0) { // Key down
+                input.ki.dwFlags = 0; // Key down
+            } else if (key.down == 1) { // Key up
+                input.ki.dwFlags = KEYEVENTF_KEYUP; // Key up
+            } else {
+                continue; // No change, skip
+            }
+
+            #ifdef _DEBUG
+            if (key.vk != 0 && key.down != 2) {
+                throw std::runtime_error("Unexpected key state.");
+            }
+            #endif
+
+            if (SendInput(1, &input, sizeof(INPUT)) == 0) {
+                std::cerr << "INPUT: " << "SendInput failed with error: " << GetLastError() << std::endl;
+                abort();
+                return;
+            }
+        }
+
+
         auto now = std::chrono::steady_clock::now();
-        /*
+
         if (now - lastprobe >= std::chrono::seconds(1)) {
             std::scoped_lock<std::mutex> lock(m_coutMutex);
             std::cout << "\r                                                       \r" << std::flush;
-            std::cout << "INPUT: " << "Input frequency: " << count << " Hz" << std::flush;
+            std::cout << "INPUT: " << "Input frequency: " << count << " Hz | SGE: " << static_cast<int>(sgeCount) << std::flush;
             lastprobe = now;
             count = 0;
         }
-        */
+
     }
 }
 

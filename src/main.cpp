@@ -118,7 +118,7 @@ public:
         }
 
         m_Window->DisplayWindow();
-        PostMessage(m_hWnd, WM_SYSCOMMAND, SC_MINIMIZE, 0);
+        //PostMessage(m_hWnd, WM_SYSCOMMAND, SC_MINIMIZE, 0);
 
         ComPtr<ID3D11Device> d3dDevice = m_Renderer->GetD3DDevice();
         ComPtr<ID3D11DeviceContext> d3dContext = m_Renderer->GetD3DContext();

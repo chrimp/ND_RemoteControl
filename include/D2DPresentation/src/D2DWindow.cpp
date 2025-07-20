@@ -3,6 +3,9 @@
 #include <windowsx.h>
 #include <hidusage.h>
 #include <iostream>
+#include <dwmapi.h>
+
+#pragma comment(lib, "dwmapi.lib")
 
 /*
 * ======================================================================
@@ -84,11 +87,16 @@ void D2DWindow::WindowThread(
 
     RegisterRawInput();
 
+    BOOL darkMode = TRUE;
+    DwmSetWindowAttribute(m_hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, &darkMode, sizeof(darkMode));
+    DWM_WINDOW_CORNER_PREFERENCE cornerPreference = DWM_WINDOW_CORNER_PREFERENCE::DWMWCP_DEFAULT;
+    DwmSetWindowAttribute(m_hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, &cornerPreference, sizeof(cornerPreference));
+
     while (!m_show) {
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
 
-    ShowWindow(m_hwnd, SW_SHOW);
+    ShowWindow(m_hwnd, SW_SHOWNOACTIVATE);
     UpdateWindow(m_hwnd);
 
     MSG msg;
@@ -105,13 +113,20 @@ void D2DWindow::WindowThread(
 }
 
 void D2DWindow::RegisterRawInput() {
-    RAWINPUTDEVICE rid[1];
+    RAWINPUTDEVICE rid[2];
+    // Mouse
     rid[0].usUsagePage = HID_USAGE_PAGE_GENERIC;
     rid[0].usUsage = HID_USAGE_GENERIC_MOUSE;
     rid[0].dwFlags = 0;
     rid[0].hwndTarget = m_hwnd;
 
-    if (!RegisterRawInputDevices(rid, 1, sizeof(rid[0]))) {
+    // Keyboard
+    rid[1].usUsagePage = HID_USAGE_PAGE_GENERIC;
+    rid[1].usUsage = HID_USAGE_GENERIC_KEYBOARD;
+    rid[1].dwFlags = 0;
+    rid[1].hwndTarget = m_hwnd;
+
+    if (!RegisterRawInputDevices(rid, 2, sizeof(RAWINPUTDEVICE))) {
         std::cerr << "Failed to register raw input devices: " << std::hex << GetLastError() << std::endl;
         throw std::exception();
     }
