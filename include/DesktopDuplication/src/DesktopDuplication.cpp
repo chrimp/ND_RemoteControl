@@ -17,6 +17,102 @@
 
 using namespace DesktopDuplication;
 
+bool SaveFrameFromBuf(const std::filesystem::path& path, ID3D11Texture2D* tex) {
+    IWICImagingFactory* factory = nullptr;
+    IWICBitmapEncoder* encoder = nullptr;
+    IWICBitmapFrameEncode* frame = nullptr;
+    IWICStream* stream = nullptr;
+
+    D3D11_TEXTURE2D_DESC desc;
+    tex->GetDesc(&desc);
+
+    ID3D11Texture2D* stagingTexture = nullptr;
+    D3D11_TEXTURE2D_DESC stagingDesc = desc;
+    stagingDesc.Usage = D3D11_USAGE_STAGING;
+    stagingDesc.BindFlags = 0;
+    stagingDesc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    stagingDesc.MiscFlags = 0;
+
+    ID3D11Device* d3dDevice = nullptr;
+    ID3D11DeviceContext* d3dContext = nullptr;
+    tex->GetDevice(&d3dDevice);
+    d3dDevice->GetImmediateContext(&d3dContext);
+
+    std::vector<uint8_t> buffer(desc.Width * desc.Height * 4); // Assuming BGRA format
+
+    d3dDevice->CreateTexture2D(&stagingDesc, nullptr, &stagingTexture);
+
+    d3dContext->CopyResource(stagingTexture, tex);
+
+    D3D11_MAPPED_SUBRESOURCE mappedResource;
+    HRESULT hr = d3dContext->Map(stagingTexture, 0, D3D11_MAP_READ, 0, &mappedResource);
+
+    if (FAILED(hr)) throw std::exception();
+
+    for (unsigned int i = 0; i < desc.Height; i++) {
+        memcpy(buffer.data() + i * desc.Width * 4, 
+               reinterpret_cast<uint8_t*>(mappedResource.pData) + i * mappedResource.RowPitch, 
+               desc.Width * 4);
+    }   
+
+    unsigned int width = desc.Width;
+    unsigned int height = desc.Height;
+
+    hr = CoInitialize(nullptr);
+    if (FAILED(hr)) return false;
+
+    hr = CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&factory));
+    if (FAILED(hr)) return false;
+
+    hr = factory->CreateStream(&stream);
+    if (FAILED(hr)) return false;
+
+    std::time_t now = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
+    std::tm localTime;
+    localtime_s(&localTime, &now);
+
+    std::string time = std::format("{:04d}-{:02d}-{:02d}_{:02d}-{:02d}-{:02d}", localTime.tm_year + 1900, localTime.tm_mon + 1, localTime.tm_mday, localTime.tm_hour, localTime.tm_min, localTime.tm_sec);
+
+    std::filesystem::path savePath = path / std::format("DeskDupl_{}.png", time);
+
+    hr = stream->InitializeFromFilename(savePath.c_str(), GENERIC_WRITE);
+    if (FAILED(hr)) return false;
+
+    hr = factory->CreateEncoder(GUID_ContainerFormatPng, nullptr, &encoder);
+    if (FAILED(hr)) return false;
+
+    hr = encoder->Initialize(stream, WICBitmapEncoderNoCache);
+    if (FAILED(hr)) return false;
+
+    hr = encoder->CreateNewFrame(&frame, nullptr);
+    if (FAILED(hr)) return false;
+
+    hr = frame->Initialize(nullptr);
+    if (FAILED(hr)) return false;
+
+    hr = frame->SetSize(width, height);
+    if (FAILED(hr)) return false;
+
+    WICPixelFormatGUID format = GUID_WICPixelFormat32bppBGRA;
+    hr = frame->SetPixelFormat(&format);
+    if (FAILED(hr)) return false;
+
+    hr = frame->WritePixels(height, width * 4, buffer.size(), buffer.data());
+    if (FAILED(hr)) return false;
+
+    frame->Commit();
+    encoder->Commit();
+
+    stream->Release();
+    frame->Release();
+    encoder->Release();
+    factory->Release();
+
+    CoUninitialize();
+
+    return true;
+}
+
 // MARK: Duplication
 Duplication::Duplication() {
     m_Device = nullptr;
@@ -79,6 +175,7 @@ bool Duplication::InitDuplication() {
     }
 
     D3D_FEATURE_LEVEL featureLevel = D3D_FEATURE_LEVEL_11_1;
+    D3D_FEATURE_LEVEL ActualFeatureLevel;
 
     hr = D3D11CreateDevice(
         adapter,
@@ -89,9 +186,17 @@ bool Duplication::InitDuplication() {
         1,
         D3D11_SDK_VERSION,
         &device,
-        nullptr,
+        &ActualFeatureLevel,
         &context
     );
+
+    if (featureLevel != ActualFeatureLevel) {
+        std::cerr << "The device does not support the required feature level. Required: " 
+                  << featureLevel << ", Actual: " << ActualFeatureLevel << std::endl;
+        adapter->Release();
+        adapter = nullptr;
+        return false;
+    }
 
     adapter->Release();
     adapter = nullptr;
@@ -119,13 +224,16 @@ bool Duplication::InitDuplication() {
     }
 
     UINT support = 0;
-    m_Device->CheckFormatSupport(DXGI_FORMAT_R32_FLOAT, &support);
-    m_Device->CheckFormatSupport(DXGI_FORMAT_R32G32_FLOAT, &support);
+    m_Device->CheckFormatSupport(DXGI_FORMAT_R8_UNORM, &support);
+    m_Device->CheckFormatSupport(DXGI_FORMAT_R8G8_UNORM, &support);
     if (!(support & D3D11_FORMAT_SUPPORT_SHADER_SAMPLE) && !(support & D3D11_FORMAT_SUPPORT_TYPED_UNORDERED_ACCESS_VIEW)) {
         std::cerr << "The device does not support the required format for Desktop Duplication." << std::endl;
         abort();
         return false;
     }
+
+    // Create fence
+    hr = m_Device->CreateFence(0, D3D11_FENCE_FLAG_NONE, IID_PPV_ARGS(m_Fence.GetAddressOf()));
 
     // Create D2D
     D2D1_FACTORY_OPTIONS options = {};
@@ -335,6 +443,10 @@ bool Duplication::SaveFrame(const std::filesystem::path& path) {
 }
 
 int Duplication::GetFrame(ID3D11Texture2D*& frame, unsigned long timeout) {
+    //m_CompositionTexture.Reset(); // Reset to see if it resolves the cursor issue
+    // This makes remote texture flashing. How it's even possible? I guess it's sending incomplete texture.
+    // Again, that's due to the fact that GPU operations are asynchronous.
+
     ComPtr<IDXGIResource> desktopResource;
     DXGI_OUTDUPL_FRAME_INFO frameInfo;
 
@@ -376,6 +488,11 @@ int Duplication::GetFrame(ID3D11Texture2D*& frame, unsigned long timeout) {
     if (!m_LastCleanTexture) {
         D3D11_TEXTURE2D_DESC desc;
         m_AcquiredDesktopImage->GetDesc(&desc);
+
+        desc.Usage = D3D11_USAGE_DEFAULT;
+        desc.BindFlags = 0; // This is the fix!
+        desc.CPUAccessFlags = 0;
+        desc.MiscFlags = 0;
         
         hr = m_Device->CreateTexture2D(&desc, nullptr, m_LastCleanTexture.GetAddressOf());
         if (FAILED(hr)) {
@@ -383,6 +500,7 @@ int Duplication::GetFrame(ID3D11Texture2D*& frame, unsigned long timeout) {
             std::cerr << "Failed to create composition texture. Reason: 0x" << std::hex << hr << std::endl;
             return 1;
         }
+
     }
 
     // This copy is the fix for mouse cursor trail/ghosting.
@@ -392,6 +510,19 @@ int Duplication::GetFrame(ID3D11Texture2D*& frame, unsigned long timeout) {
     // This prevents m_CompositionTexture from cleared with the clean frame, leaving the last cursor in the texture.
     // However, by placing a new texture, m_LastCleanTexture, GPU cannot assure that m_AcquiredDesktopImage or m_CompositionTexture and m_LastCleanTexture are the same, so it performs the copy.
     // This can be mitigated by placing a fence (Begin() -> End() -> GetData()) between the problematic CopyResource call, but it will be costly.
+    // Though I don't know if would work, just LLMs said so and if the explanation is correct, I think it's theoratically correct.
+
+    // The issue is reappearing. Oh, it's only appearing in RX 470 system, but not in RTX 5070 Ti. What is this? Is it a driver issue?
+    // So m_LastCleanTexture was enough for NVIDIA GPUs, or at least for RTX 5070 Ti.
+    // But for RX 470, it seems that it's kinda skipping m_Context->CopyResource(m_CompositionTexture.Get(), m_LastCleanTexture.Get()),
+    // cause when I make m_CompositionTexture an empty texture, the result just becomes a black frame.
+    // But removing D3D11_BIND_SHADER_RESOURCE and D3D11_BIND_RENDER_TARGET from m_LastCleanTexture makes it work.
+    // Still, I cannot remove m_LastCleanTexture, cause m_CompositionTexture should have those BindFlags.
+    
+    // Hmm, if the whole ordeal is caused by the fact that GPU optimizes away CopyResource, how can fence help?
+    // Cause fence is to wait for GPU to finish the operation, not enforcing it to perform the operation.
+    // I doubt that fence will help now, but I'm too bothered to test it.
+    // Just resetting BindFlags is fine for now, and being honest I think that's the best solution, at least what I can think of. 
 
     if (frameInfo.LastPresentTime.QuadPart == 0) {
         m_Context->CopyResource(m_CompositionTexture.Get(), m_LastCleanTexture.Get());
@@ -409,6 +540,7 @@ int Duplication::GetFrame(ID3D11Texture2D*& frame, unsigned long timeout) {
             hr = m_DesktopDupl->GetFramePointerShape(frameInfo.PointerShapeBufferSize, m_CursorShape.data(), &requiredSize, &m_CursorShapeInfo);
             if (FAILED(hr)) {
                 ReleaseFrame();
+                abort();
                 return 1;
             }
         }
@@ -501,11 +633,18 @@ int Duplication::GetFrame(ID3D11Texture2D*& frame, unsigned long timeout) {
         }
     }
 
-    //CompressTexture(m_CompositionTexture.Get());
-
     ReleaseFrame();
 
     frame = m_CompositionTexture.Get();
+
+    if (frameInfo.LastPresentTime.QuadPart == 0) {
+        counter++;
+        if (counter >= 0) {
+            //SaveFrameFromBuf("./", frame);
+            counter = 0;
+        }
+    }
+
     return 0;
 }
 

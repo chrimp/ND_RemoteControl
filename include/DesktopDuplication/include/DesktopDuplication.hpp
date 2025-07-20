@@ -90,6 +90,9 @@ namespace DesktopDuplication {
         ComPtr<ID3D11Buffer> m_ConstantsBuffer; // Buffer for shader constants (e.g., width, height)
 
         ComPtr<ID3D11Texture2D> m_SRTexture;
+        ComPtr<ID3D11Fence> m_Fence;
+
+        unsigned short counter = 0;
     };
 
     class DuplicationThread {

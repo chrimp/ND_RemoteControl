@@ -17,7 +17,7 @@ constexpr char TEST_PORT[] = "54321";
 
 constexpr size_t WIDTH = 1920;
 constexpr size_t HEIGHT = 1080;
-constexpr size_t FPS = 240;
+constexpr size_t FPS = 120;
 
 constexpr size_t Y_PLANE_SIZE = WIDTH * HEIGHT;
 constexpr size_t UV_PLANE_SIZE = WIDTH * (HEIGHT / 2) * 2;
@@ -317,7 +317,9 @@ public:
                     abort();
                 }
             } else if (flag == 3) {
-                m_Renderer->SetSourceSurface(m_FrameTexture.Get());
+                //m_Renderer->SetSourceSurface(m_FrameTexture.Get());
+                // Hmm, why bother to redraw? Just continue.
+                continue;
             }
             auto decompressEnd = std::chrono::steady_clock::now();
             DecompressTotal += std::chrono::duration_cast<std::chrono::microseconds>(decompressEnd - decompressStart);
@@ -631,7 +633,6 @@ public:
             auto WriteEnd = std::chrono::steady_clock::now();
             WriteTotal += std::chrono::duration_cast<std::chrono::microseconds>(WriteEnd - WriteStart);
 
-            /*
             auto now2 = std::chrono::steady_clock::now();
             auto elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(now2 - now).count();
             if (elapsed >= 1000000000) {
@@ -651,7 +652,6 @@ public:
 
                 now = now2;
             }
-            */
         }
 
         Shutdown();

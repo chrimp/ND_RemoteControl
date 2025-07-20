@@ -65,12 +65,15 @@ void D2DWindow::WindowThread(
         throw std::exception();
     }
 
+    RECT rect = { 0, 0, static_cast<LONG>(width), static_cast<LONG>(height) };
+    AdjustWindowRect(&rect, WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX, FALSE);
+
     m_hwnd = CreateWindowEx(
         0,
         m_className.c_str(),
         title,
         WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
-        CW_USEDEFAULT, CW_USEDEFAULT, width, height,
+        CW_USEDEFAULT, CW_USEDEFAULT, rect.right - rect.left, rect.bottom - rect.top,
         NULL, NULL, hInstance, this
     );
 

@@ -383,13 +383,13 @@ void InputNDSessionClient::Loop() {
             abort();
             return;
         }
-
+        /*
         std::cout << "\r                                                                               \r" << std::flush;
         std::cout << "Move: " << received->x << ", " << received->y << " LB: " << std::boolalpha << lb
                                                                     << " RB: " << std::boolalpha << rb 
                                                                     << " MB: " << std::boolalpha<< mb
                                                                     << " Flags: " << std::hex << input.mi.dwFlags << std::flush;
-
+        */
 
         auto now = std::chrono::steady_clock::now();
         /*
