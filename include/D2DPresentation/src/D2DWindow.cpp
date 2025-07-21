@@ -28,10 +28,6 @@
 
 using namespace D2DPresentation;
 
-static bool g_bFocus = true;
-static HHOOK g_hKeyboardHook = nullptr;
-static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam);
-
 D2DWindow::D2DWindow(
     LPCTSTR title,
     UINT width,
@@ -201,18 +197,7 @@ LRESULT CALLBACK D2DWindow::StaticWndProc(HWND hWnd, UINT message, WPARAM wParam
 
 LRESULT CALLBACK D2DWindow::WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) {
     switch (message) {
-        case WM_ACTIVATE:
-            if (wParam) {
-                g_bFocus = true;
-            } else {
-                g_bFocus = false;
-            }
-            return 0;
         case WM_CLOSE:
-            if (g_hKeyboardHook) {
-                UnhookWindowsHookEx(g_hKeyboardHook);
-                g_hKeyboardHook = nullptr;
-            }
             if (m_cursorTrapped) {
                 ClipCursor(nullptr);
                 ShowCursor(true);
@@ -269,8 +254,6 @@ LRESULT CALLBACK D2DWindow::WndProc(HWND hWnd, UINT message, WPARAM wParam, LPAR
                         break;
                 }
 
-                //std::cout << "Key: " << key.VKey << " Down: " << key.Flags << std::endl;
-
                 if (m_escapeArray[0] && m_escapeArray[1] && m_escapeArray[2] && m_escapeArray[3]) {
                     PostMessage(hWnd, WM_KILLFOCUS, 0, 0);
                 }
@@ -291,14 +274,12 @@ LRESULT CALLBACK D2DWindow::WndProc(HWND hWnd, UINT message, WPARAM wParam, LPAR
                 ClientToScreen(hWnd, reinterpret_cast<POINT*>(&rect) + 1);
                 ClipCursor(&rect);
                 m_cursorTrapped = true;
-                g_bFocus = true;
             }
             return 0;
         case WM_KILLFOCUS:
             ClipCursor(nullptr);
             ShowCursor(true);
             m_cursorTrapped = false;
-            g_bFocus = false;
             return 0;
         case WM_SIZING:
         {
@@ -394,29 +375,5 @@ LRESULT CALLBACK D2DWindow::WndProc(HWND hWnd, UINT message, WPARAM wParam, LPAR
         }
         default:
             return DefWindowProc(hWnd, message, wParam, lParam);
-    }
-}
-
-static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
-    if (nCode < 0 || nCode != HC_ACTION) {
-        return CallNextHookEx(g_hKeyboardHook, nCode, wParam, lParam);
-    }
-
-    bool bEatKeyStroke = false;
-    auto p = reinterpret_cast<KBDLLHOOKSTRUCT*>(lParam);
-    switch (wParam) {
-        case WM_KEYDOWN:
-        case WM_KEYUP:
-        case WM_SYSKEYDOWN:
-        case WM_SYSKEYUP: 
-            bEatKeyStroke = ((p->vkCode == VK_LWIN) || (p->vkCode == VK_RWIN) || (p->vkCode == VK_LMENU)) && g_bFocus;
-            break;
-    }
-    if (bEatKeyStroke) {
-        std::cout << "Eaten key: " << p->vkCode << std::endl;
-        return 1; // Eat the key stroke
-    } else {
-        std::cout << "Key: " << p->vkCode << " Action: " << wParam << " g_bFocus: " << std::boolalpha << g_bFocus << std::endl;
-        return CallNextHookEx(g_hKeyboardHook, nCode, wParam, lParam);
     }
 }
