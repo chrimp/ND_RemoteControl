@@ -477,7 +477,7 @@ void InputNDSessionClient::Loop() {
             }
 
             #ifdef _DEBUG
-            if (key.vk != 0 && key.down != 2) {
+            if (key.vk != 0 && key.down == 2) {
                 throw std::runtime_error("Unexpected key state.");
             }
             #endif

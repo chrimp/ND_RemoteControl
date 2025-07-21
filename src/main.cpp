@@ -3,12 +3,15 @@
 #include "D2DRenderer.hpp"
 #include "D2DWindow.hpp"
 #include "InputNDSession.hpp"
+#include "AudioNDSession.hpp"
+
 #include <conio.h>
 #include <iostream>
 #include <thread>
 #include <chrono>
 #include <wincodec.h>
 #include <mutex>
+#include <Functiondiscoverykeys_devpkey.h>
 
 constexpr char TEST_PORT[] = "54321";
 
@@ -369,6 +372,7 @@ public:
 
     void Run(const char* localAddr) {
         inputSession.Start(const_cast<char*>(localAddr));
+        audioSession.Start(const_cast<char*>(localAddr));
         m_Window->RegisterRawInputCallback([this](RAWINPUT rawInput) {
             inputSession.SendEvent(rawInput);
         }, inputSession.GetCallbackEvent());
@@ -392,6 +396,7 @@ public:
     PeerInfo remoteInfo;
 
     InputNDSessionServer inputSession;
+    AudioNDSessionServer audioSession;
 };
 
 // MARK: TestClient
@@ -661,6 +666,7 @@ public:
 
     void Run(const char* localAddr, const char* serverAddr) {
         inputSession.Start(const_cast<char*>(localAddr), serverAddr);
+        audioSession.Start(const_cast<char*>(localAddr), serverAddr);
         OpenConnector(localAddr, serverAddr);
         ExchangePeerInfo();
         Loop();
@@ -674,6 +680,7 @@ public:
     std::mutex m_CoutMutex;
 
     InputNDSessionClient inputSession;
+    AudioNDSessionClient audioSession;
 };
 
 int main(int argc, char* argv[]) {
@@ -697,7 +704,6 @@ int main(int argc, char* argv[]) {
 
     if (!isServer) {
         DesktopDuplication::ChooseOutput();
-
         DesktopDuplication::Duplication& dupl = DesktopDuplication::Singleton<DesktopDuplication::Duplication>::Instance();
         dupl.InitDuplication();
     }
