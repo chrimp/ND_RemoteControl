@@ -60,6 +60,10 @@ namespace D2DPresentation {
             m_hCallbackEvent = hEvent;
         }
 
+        const int GetWindowThreadId() const {
+            return m_windowThreadId;
+        }
+
     private:
         void RegisterRawInput();
         void WindowThread(
@@ -89,11 +93,15 @@ namespace D2DPresentation {
 
         std::atomic<bool> m_show = false;
 
+        std::vector<bool> m_escapeArray = {false, false, false, false};
+
         POINT m_lastMousePos = { 0, 0 };
         Point m_VirtAbsPos = {0, 0};
         std::function<void(RAWINPUT)> m_rawInputCallback;
         bool m_cursorTrapped = false; // Whether the cursor is trapped
         HANDLE m_hCallbackEvent = nullptr; // Event for mouse callback
+
+        int m_windowThreadId = -1;
     };
 }
 

@@ -92,7 +92,7 @@ void InputNDSessionServer::SendEvent(RAWINPUT input) {
             m_Mouse.x.fetch_add(static_cast<short>(input.data.mouse.lLastX));
             m_Mouse.y.fetch_add(static_cast<short>(input.data.mouse.lLastY));
             m_Mouse.wheel.fetch_add(input.data.mouse.usButtonData);
-            m_Mouse.buttonFlags = input.data.mouse.ulButtons; // Let receiver handle
+            m_Mouse.buttonFlags.store(input.data.mouse.ulButtons); // Let receiver handle
             break;
         }
 
@@ -105,6 +105,14 @@ void InputNDSessionServer::SendEvent(RAWINPUT input) {
                     break;
                 case RI_KEY_BREAK:
                     m_Keyboard.down.store(1); // Key up
+                    break;
+                case RI_KEY_E0:
+                case RI_KEY_E1:
+                    m_Keyboard.down.store(0);
+                    break;
+                case RI_KEY_E0 + 1:
+                case RI_KEY_E1 + 1:
+                    m_Keyboard.down.store(1);
                     break;
                 default:
                     m_Keyboard.down.store(2); // No change
@@ -178,10 +186,28 @@ void InputNDSessionServer::Loop() {
         flagWaitTotal += std::chrono::duration_cast<std::chrono::microseconds>(flagWaitEnd - flagWaitStart);
     
         //ND2_SGE sge = { m_Buf, INPUT_EVENT_BUFFER_SIZE, m_pMr->GetLocalToken() };
-        if (FAILED(Send(&sge, 1, ND_OP_FLAG_INLINE, SEND_CTXT))) {
+        if (FAILED(Send(&sge, 1, 0, SEND_CTXT))) {
             std::cerr << "INPUT: " << "Send failed." << std::endl;
             return;
         }
+        // Maybe, maybe it's somehow sending before the completion, making the send stack.
+        // That well could be the case, because it was failing with ND_IO_TIMEOUT.
+        // But I'm calling WaitForCompletionAndCheckContext(), what does it mean that device was not prompt enough to respond to an I/O request?
+        // By docs, ND_IO_TIMEOUT means that the queuepair has failed or the connection has failed.
+        // If queuepair has failed, then it should also raise an error in the peer, so it should not be the case.
+        // If connection has failed... doesn't it throw an exception on the peer side?
+        // What happens if I plug out the cable? I gotta see.
+        // So the program doesn't know a thing even if the cable is unplugged.
+        // But if I plug it back, it would take some time, then sender throws the same ND_IO_TIMEOUT.
+        // But realistically, I've pulled like 20 microseconds per loop for send/recv testing, how a few KHz can break it?
+        // I need to see the error code when Send() without PostReceive().
+        // Yes, it's ND_IO_TIMEOUT, the same one.
+
+        // Flagging the Send with ND_OP_FLAG_INLINE like, definitely causes the issue.
+        // Technically, the size of the packet is 16 bytes, and max inline size is 800 something, and inline operation should always be faster, so it should not be the issue.
+        // But it is. Maybe it's just slow and letting DMA is more faster?
+        // Maybe it's just friggin' hot to do things itself, I don't have fan attached to the card.
+
         flag[0] = 0;
         _mm_clflush(m_Buf);
         _mm_sfence();
@@ -296,10 +322,10 @@ void InputNDSessionClient::Loop() {
     unsigned char sgeCount = 0;
 
     ND2_SGE sge = { m_Buf, sizeof(Packet), m_pMr->GetLocalToken() };
-
     for (int i = 0; i < 20; i++) {
-        if (FAILED(PostReceive(&sge, 1, RECV_CTXT))) {
-            std::cerr << "INPUT: " << "PostReceive failed." << std::endl;
+        HRESULT hr = PostReceive(&sge, 1, RECV_CTXT);
+        if (FAILED(hr)) {
+            std::cerr << "INPUT: " << "PostReceive failed." << std::hex << hr << std::endl;
             return;
         }
     }
@@ -310,11 +336,6 @@ void InputNDSessionClient::Loop() {
     Packet* received = reinterpret_cast<Packet*>(reinterpret_cast<uint8_t*>(m_Buf) + 1); // Buffer for MousePacket
 
     while (m_isRunning) {
-        if (FAILED(PostReceive(&sge, 1, RECV_CTXT))) {
-            std::cerr << "INPUT: " << "PostReceive failed." << std::endl;
-            return;
-        }
-
         if (sgeCount < 10) {
             for (int i = 0; i < 10; i++) {
                 if (FAILED(PostReceive(&sge, 1, RECV_CTXT))) {
@@ -324,6 +345,7 @@ void InputNDSessionClient::Loop() {
             }
             sgeCount += 10;
         }
+
         // Let's see this helps with the sync issue.
         // To be honest, I think it should've worked without this, but it doesn't.
         // Which means that with I/O depth of 1, it's exhausting despite the flagging.
@@ -363,6 +385,7 @@ void InputNDSessionClient::Loop() {
             std::cerr << "INPUT: " << "WaitForCompletion for PostReceive failed." << std::endl;
             return;
         }
+        sgeCount--;
 
         count++;
 
@@ -425,9 +448,9 @@ void InputNDSessionClient::Loop() {
                     input.mi.dwFlags |= MOUSEEVENTF_XUP;
                     input.mi.mouseData = XBUTTON2;
                     break;
-                default: // This cannot happen
+                default: // This cannot happen, or well could happen if isX is false
                     #ifdef _DEBUG
-                    throw std::runtime_error("Unexpected X button state.");
+                    if (isX) throw std::runtime_error("Unexpected X button state.");
                     #endif
                     break;
             }

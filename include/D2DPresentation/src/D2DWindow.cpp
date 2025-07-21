@@ -28,6 +28,10 @@
 
 using namespace D2DPresentation;
 
+static bool g_bFocus = true;
+static HHOOK g_hKeyboardHook = nullptr;
+static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam);
+
 D2DWindow::D2DWindow(
     LPCTSTR title,
     UINT width,
@@ -87,6 +91,11 @@ void D2DWindow::WindowThread(
 
     RegisterRawInput();
 
+    // WH_KEYBOARD_LL hook cannot work with a process that registers raw input devices.
+    // So it should either use RIDEV_NOHOTKEYS | RIDEV_NOLEGACY | RIDEV_APPKEYS or create another process for the hook,
+    // if I want to keep using raw input (or low-level keyboard hook).
+    // So let's just give up alt-tab blocking for now.
+
     BOOL darkMode = TRUE;
     DwmSetWindowAttribute(m_hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, &darkMode, sizeof(darkMode));
     DWM_WINDOW_CORNER_PREFERENCE cornerPreference = DWM_WINDOW_CORNER_PREFERENCE::DWMWCP_DEFAULT;
@@ -96,7 +105,7 @@ void D2DWindow::WindowThread(
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
 
-    ShowWindow(m_hwnd, SW_SHOWNOACTIVATE);
+    ShowWindow(m_hwnd, SW_SHOWDEFAULT);
     UpdateWindow(m_hwnd);
 
     MSG msg;
@@ -106,6 +115,7 @@ void D2DWindow::WindowThread(
             DispatchMessage(&msg);
         }
     }
+
 
     if(SUCCEEDED(hrCoInit)) {
         CoUninitialize();
@@ -123,7 +133,7 @@ void D2DWindow::RegisterRawInput() {
     // Keyboard
     rid[1].usUsagePage = HID_USAGE_PAGE_GENERIC;
     rid[1].usUsage = HID_USAGE_GENERIC_KEYBOARD;
-    rid[1].dwFlags = 0;
+    rid[1].dwFlags = RIDEV_NOLEGACY | RIDEV_NOHOTKEYS | RIDEV_APPKEYS;
     rid[1].hwndTarget = m_hwnd;
 
     if (!RegisterRawInputDevices(rid, 2, sizeof(RAWINPUTDEVICE))) {
@@ -191,7 +201,18 @@ LRESULT CALLBACK D2DWindow::StaticWndProc(HWND hWnd, UINT message, WPARAM wParam
 
 LRESULT CALLBACK D2DWindow::WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) {
     switch (message) {
+        case WM_ACTIVATE:
+            if (wParam) {
+                g_bFocus = true;
+            } else {
+                g_bFocus = false;
+            }
+            return 0;
         case WM_CLOSE:
+            if (g_hKeyboardHook) {
+                UnhookWindowsHookEx(g_hKeyboardHook);
+                g_hKeyboardHook = nullptr;
+            }
             if (m_cursorTrapped) {
                 ClipCursor(nullptr);
                 ShowCursor(true);
@@ -214,11 +235,52 @@ LRESULT CALLBACK D2DWindow::WndProc(HWND hWnd, UINT message, WPARAM wParam, LPAR
             }
             RAWINPUT* rawInput = reinterpret_cast<RAWINPUT*>(lpb.data());
 
+            if (rawInput->header.dwType == RIM_TYPEKEYBOARD) {
+                const RAWKEYBOARD& key = rawInput->data.keyboard;
+                // 0 - LCtrl 1 - LAlt 2 - LShift 3 - Z
+                switch (key.VKey) {
+                    case VK_LCONTROL:
+                        if (key.Flags == RI_KEY_MAKE) {
+                            m_escapeArray[0] = true;
+                        } else if (key.Flags == RI_KEY_BREAK) {
+                            m_escapeArray[0] = false;
+                        }
+                        break;
+                    case VK_LMENU:
+                        if (key.Flags == RI_KEY_MAKE) {
+                            m_escapeArray[1] = true;
+                        } else if (key.Flags == RI_KEY_BREAK) {
+                            m_escapeArray[1] = false;
+                        }
+                        break;
+                    case VK_LSHIFT:
+                        if (key.Flags == RI_KEY_MAKE) {
+                            m_escapeArray[2] = true;
+                        } else if (key.Flags == RI_KEY_BREAK) {
+                            m_escapeArray[2] = false;
+                        }
+                        break;
+                    case 'Z':
+                        if (key.Flags == RI_KEY_MAKE) {
+                            m_escapeArray[3] = true;
+                        } else if (key.Flags == RI_KEY_BREAK) {
+                            m_escapeArray[3] = false;
+                        }
+                        break;
+                }
+
+                //std::cout << "Key: " << key.VKey << " Down: " << key.Flags << std::endl;
+
+                if (m_escapeArray[0] && m_escapeArray[1] && m_escapeArray[2] && m_escapeArray[3]) {
+                    PostMessage(hWnd, WM_KILLFOCUS, 0, 0);
+                }
+            }
+
             if (m_rawInputCallback) {
                 m_rawInputCallback(*rawInput);
                 SetEvent(m_hCallbackEvent);
             } 
-            return 0;
+            return DefWindowProc(hWnd, message, wParam, lParam);
         }
         case WM_SETFOCUS:
             ShowCursor(false);
@@ -229,12 +291,14 @@ LRESULT CALLBACK D2DWindow::WndProc(HWND hWnd, UINT message, WPARAM wParam, LPAR
                 ClientToScreen(hWnd, reinterpret_cast<POINT*>(&rect) + 1);
                 ClipCursor(&rect);
                 m_cursorTrapped = true;
+                g_bFocus = true;
             }
             return 0;
         case WM_KILLFOCUS:
             ClipCursor(nullptr);
             ShowCursor(true);
             m_cursorTrapped = false;
+            g_bFocus = false;
             return 0;
         case WM_SIZING:
         {
@@ -330,5 +394,29 @@ LRESULT CALLBACK D2DWindow::WndProc(HWND hWnd, UINT message, WPARAM wParam, LPAR
         }
         default:
             return DefWindowProc(hWnd, message, wParam, lParam);
+    }
+}
+
+static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
+    if (nCode < 0 || nCode != HC_ACTION) {
+        return CallNextHookEx(g_hKeyboardHook, nCode, wParam, lParam);
+    }
+
+    bool bEatKeyStroke = false;
+    auto p = reinterpret_cast<KBDLLHOOKSTRUCT*>(lParam);
+    switch (wParam) {
+        case WM_KEYDOWN:
+        case WM_KEYUP:
+        case WM_SYSKEYDOWN:
+        case WM_SYSKEYUP: 
+            bEatKeyStroke = ((p->vkCode == VK_LWIN) || (p->vkCode == VK_RWIN) || (p->vkCode == VK_LMENU)) && g_bFocus;
+            break;
+    }
+    if (bEatKeyStroke) {
+        std::cout << "Eaten key: " << p->vkCode << std::endl;
+        return 1; // Eat the key stroke
+    } else {
+        std::cout << "Key: " << p->vkCode << " Action: " << wParam << " g_bFocus: " << std::boolalpha << g_bFocus << std::endl;
+        return CallNextHookEx(g_hKeyboardHook, nCode, wParam, lParam);
     }
 }
