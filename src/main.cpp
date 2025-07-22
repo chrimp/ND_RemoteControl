@@ -18,9 +18,11 @@ constexpr char TEST_PORT[] = "54321";
 #undef max
 #undef min
 
+std::atomic<bool> g_shouldQuit = false;
+
 constexpr size_t WIDTH = 1920;
 constexpr size_t HEIGHT = 1080;
-constexpr size_t FPS = 120;
+constexpr size_t FPS = 360;
 
 constexpr size_t Y_PLANE_SIZE = WIDTH * HEIGHT;
 constexpr size_t UV_PLANE_SIZE = WIDTH * (HEIGHT / 2) * 2;
@@ -365,6 +367,8 @@ public:
         
         Shutdown();
 
+        g_shouldQuit.store(true);
+
         m_Renderer->Cleanup();
         m_Window->Stop();
         CoUninitialize();
@@ -662,6 +666,8 @@ public:
         }
 
         Shutdown();
+
+        g_shouldQuit.store(true);
     }
 
     void Run(const char* localAddr, const char* serverAddr) {

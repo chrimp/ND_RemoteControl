@@ -26,6 +26,8 @@
 * ======================================================================
 */
 
+extern std::atomic<bool> g_shouldQuit;
+
 using namespace D2DPresentation;
 
 D2DWindow::D2DWindow(
@@ -195,21 +197,36 @@ LRESULT CALLBACK D2DWindow::StaticWndProc(HWND hWnd, UINT message, WPARAM wParam
     return DefWindowProc(hWnd, message, wParam, lParam);
 }
 
+static bool bDoNotTrap = false;
+
 LRESULT CALLBACK D2DWindow::WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) {
     switch (message) {
+        case WM_NCLBUTTONDOWN:
+            // Prevent cursor trap
+            bDoNotTrap = true;
+            break;
         case WM_CLOSE:
             if (m_cursorTrapped) {
                 ClipCursor(nullptr);
                 ShowCursor(true);
                 m_cursorTrapped = false;
             }
+            g_shouldQuit.store(true);
             DestroyWindow(hWnd);
+
+            if (m_rawInputCallback) {
+                SetEvent(m_hCallbackEvent);
+            }
             return 0;
         case WM_DESTROY:
             m_isRunning = false;
             PostQuitMessage(0);
             return 0;
         case WM_INPUT: {
+            if (g_shouldQuit.load()) {
+                PostMessage(hWnd, WM_CLOSE, 0, 0);
+                return 0;
+            }
             UINT dwSize = 0;
             GetRawInputData(reinterpret_cast<HRAWINPUT>(lParam), RID_INPUT, nullptr, &dwSize, sizeof(RAWINPUTHEADER));
             std::vector<BYTE> lpb(dwSize);
@@ -220,54 +237,18 @@ LRESULT CALLBACK D2DWindow::WndProc(HWND hWnd, UINT message, WPARAM wParam, LPAR
             }
             RAWINPUT* rawInput = reinterpret_cast<RAWINPUT*>(lpb.data());
 
-            if (rawInput->header.dwType == RIM_TYPEKEYBOARD) {
-                const RAWKEYBOARD& key = rawInput->data.keyboard;
-                // 0 - LCtrl 1 - LAlt 2 - LShift 3 - Z
-                switch (key.VKey) {
-                    case VK_CONTROL:
-                        if (key.Flags == RI_KEY_MAKE) {
-                            m_escapeArray[0] = true;
-                        } else if (key.Flags == RI_KEY_BREAK) {
-                            m_escapeArray[0] = false;
-                        } else {
-                            std::cout << "D2DWindow: " << "Unexpected VK_LCONTROL flags: " << key.Flags << std::endl;
-                        }
-                        break;
-                    case VK_MENU:
-                        if (key.Flags == RI_KEY_MAKE) {
-                            m_escapeArray[1] = true;
-                        } else if (key.Flags == RI_KEY_BREAK) {
-                            m_escapeArray[1] = false;
-                        }
-                        break;
-                    case VK_SHIFT:
-                        if (key.Flags == RI_KEY_MAKE) {
-                            m_escapeArray[2] = true;
-                        } else if (key.Flags == RI_KEY_BREAK) {
-                            m_escapeArray[2] = false;
-                        }
-                        break;
-                    case 'Z':
-                        if (key.Flags == RI_KEY_MAKE) {
-                            m_escapeArray[3] = true;
-                        } else if (key.Flags == RI_KEY_BREAK) {
-                            m_escapeArray[3] = false;
-                        }
-                        break;
-                }
-
-                if (m_escapeArray[0] && m_escapeArray[1] && m_escapeArray[2] && m_escapeArray[3]) {
-                    PostMessage(hWnd, WM_KILLFOCUS, 0, 0);
-                }
-            }
-
             if (m_rawInputCallback) {
                 m_rawInputCallback(*rawInput);
                 SetEvent(m_hCallbackEvent);
             } 
-            return DefWindowProc(hWnd, message, wParam, lParam);
+            return 0;
+            //return DefWindowProc(hWnd, message, wParam, lParam);
         }
         case WM_SETFOCUS:
+            if (bDoNotTrap) {
+                bDoNotTrap = false;
+                return 0;
+            }
             while(ShowCursor(false) >= 0);
             {
                 RECT rect;
@@ -378,4 +359,5 @@ LRESULT CALLBACK D2DWindow::WndProc(HWND hWnd, UINT message, WPARAM wParam, LPAR
         default:
             return DefWindowProc(hWnd, message, wParam, lParam);
     }
+    return DefWindowProc(hWnd, message, wParam, lParam);
 }

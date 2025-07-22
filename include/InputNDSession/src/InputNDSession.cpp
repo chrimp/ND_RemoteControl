@@ -13,6 +13,7 @@
 
 constexpr char TEST_PORT[] = "54322";
 
+extern std::atomic<bool> g_shouldQuit;
 
 bool InputNDSessionServer::Setup(char* localAddr) {
     if (!Initialize(localAddr)) std::terminate();
@@ -90,6 +91,8 @@ static bool isAlt = false;
 static bool isTab = false;
 static bool isLastAlt = false;
 
+static UINT KeyFlags = 0;
+
 void InputNDSessionServer::SendEvent(RAWINPUT input) {
     switch (input.header.dwType) {
         case RIM_TYPEMOUSE: {
@@ -105,26 +108,36 @@ void InputNDSessionServer::SendEvent(RAWINPUT input) {
                 case VK_MENU:
                     if (input.data.keyboard.Flags == RI_KEY_MAKE) {
                         isAlt = true;
-                        isLastAlt = true;
+                        isLastAlt = false;
+                        KeyFlags |= VK_MENU;
                     }
-                    else if (input.data.keyboard.Flags == RI_KEY_BREAK) isAlt = false;
+                    else if (input.data.keyboard.Flags == RI_KEY_BREAK) {
+                        isAlt = false;
+                        KeyFlags &= ~VK_MENU;
+                    }
                     break;
                 case VK_TAB:
                     if (input.data.keyboard.Flags == RI_KEY_MAKE) {
                         isTab = true;
-                        isLastAlt = false;
+                        isLastAlt = true;
+                        KeyFlags |= VK_TAB;
                     }
-                    else if (input.data.keyboard.Flags == RI_KEY_BREAK) isTab = false;
+                    else if (input.data.keyboard.Flags == RI_KEY_BREAK) {
+                        isTab = false;
+                        KeyFlags &= ~VK_TAB;
+                    }
                     break;
             }
 
             if (isAlt && isTab) { // Do not send Alt+Tab
                 if (isLastAlt) { // Send Registered key depress
                     m_Keyboard.vk.store(static_cast<unsigned char>(VK_MENU));
-                    m_Keyboard.down.store(0);
+                    m_Keyboard.down.store(1);
+                    std::cout << "INPUT: Sending lift Alt" << std::endl;
                 } else {
                     m_Keyboard.vk.store(static_cast<unsigned char>(VK_TAB));
-                    m_Keyboard.down.store(0);
+                    m_Keyboard.down.store(1);
+                    std::cout << "INPUT: Sending lift Tab" << std::endl;
                 }
                 isAlt = false;
                 isTab = false;
@@ -182,7 +195,7 @@ void InputNDSessionServer::Loop() {
 
     unsigned int count = 0;
 
-    while (m_isRunning) {
+    while (m_isRunning || !g_shouldQuit.load()) {
         flag[0] = 0; // Reset flag
         _mm_clflush(m_Buf);
         _mm_sfence();
@@ -263,6 +276,7 @@ void InputNDSessionServer::Loop() {
         }
         */
     }
+    g_shouldQuit.store(true);
 }
 
 bool InputNDSessionServer::WaitForCompletionAndCheckContext(void *expectedContext, ULONG notifyFlag) {
@@ -371,7 +385,7 @@ void InputNDSessionClient::Loop() {
     uint8_t* flag = reinterpret_cast<uint8_t*>(m_Buf); // 0 = Cannot accomodate 1 = Good to go
     Packet* received = reinterpret_cast<Packet*>(reinterpret_cast<uint8_t*>(m_Buf) + 1); // Buffer for MousePacket
 
-    while (m_isRunning) {
+    while (m_isRunning || !g_shouldQuit.load()) {
         if (sgeCount < 10) {
             for (int i = 0; i < 10; i++) {
                 if (FAILED(PostReceive(&sge, 1, RECV_CTXT))) {
@@ -381,37 +395,6 @@ void InputNDSessionClient::Loop() {
             }
             sgeCount += 10;
         }
-
-        // Let's see this helps with the sync issue.
-        // To be honest, I think it should've worked without this, but it doesn't.
-        // Which means that with I/O depth of 1, it's exhausting despite the flagging.
-        // So if it happens the same, I think this will also eventually fail.
-        // Yup, it fails. Man, this is so weird.
-        // Okay, it failed without SGE decreasing. This means that Send() is just failing.
-        // But it's failing with ND_IO_TIMEOUT, which I think it means that there's no PostReceive().
-        // Then what's this for now? What's going on?
-
-        // Wait 20 microseconds to see if it helps
-        // It failed at 1KHz on true remote session, so let's try to wait a bit more
-        // One cycle for 8KHz is 125 microseconds, and for 1KHz is 1000 microseconds.
-        // Still fails at 100 microseconds. RTT is at average like 20-30 microseconds, max is 120 microseconds.
-        // So let's try 300 microseconds. Oh god, it still fails.
-        /*
-        auto waitStart = std::chrono::steady_clock::now();
-        while (std::chrono::steady_clock::now() - waitStart < std::chrono::microseconds(300)) {
-            _mm_pause();
-        }
-        */
-        // It does help, indeed fixes the sync issue.
-        // It's like tiny bit of time compared to the max USB 2.0 polling rate.
-        // But still, why PostReceive is not *prompt* enough? Why 20 microseconds?
-        // Does it have to reach the peer? Then should I wait for the whole RTT to be sure going on?
-        // Could use one-sided verb, but spin loop with _mm_pause() fully consumes the core.
-        // Flagging with TCP/IP will work, but that will add latency.
-        // And iterating TCP/IP for like 1K-8K per second is not a good idea, probably even more expensive.
-        // And apparently fencing is not an issue.
-        // I do see that InputNDSessionServer reports its flag observation time earlier than InputNDSessionClient,
-        // but I do think something's up with the PostReceive() itself.
 
         flag[0] = 1;
         _mm_clflush(m_Buf);
@@ -494,7 +477,7 @@ void InputNDSessionClient::Loop() {
             if (SendInput(1, &input, sizeof(INPUT)) == 0) {
                 std::cerr << "INPUT: " << "SendInput failed with error: " << GetLastError() << std::endl;
                 abort();
-                return;
+                break;
             }
         }
         
@@ -521,7 +504,7 @@ void InputNDSessionClient::Loop() {
             if (SendInput(1, &input, sizeof(INPUT)) == 0) {
                 std::cerr << "INPUT: " << "SendInput failed with error: " << GetLastError() << std::endl;
                 abort();
-                return;
+                break;
             }
         }
 
@@ -535,8 +518,8 @@ void InputNDSessionClient::Loop() {
             lastprobe = now;
             count = 0;
         }
-
     }
+    g_shouldQuit.store(true);
 }
 
 bool InputNDSessionClient::WaitForCompletionAndCheckContext(void *expectedContext, ULONG notifyFlag) {

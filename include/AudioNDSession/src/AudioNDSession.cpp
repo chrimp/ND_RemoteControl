@@ -18,27 +18,38 @@
 
 #pragma comment(lib, "synchronization.lib")
 
+extern std::atomic<bool> g_shouldQuit;
+
 constexpr char TEST_PORT[] = "54323";
 
-void SetupAudioRenderer(_Out_ IAudioRenderClient* pRenderClient, _Out_ IAudioClient* pAudioClient, _In_ const HANDLE& hEvent) {
+void SetupAudioRenderer(_Out_ IAudioRenderClient*& pRenderClient, _Out_ IAudioClient*& pAudioClient, _In_ const HANDLE& hEvent) {
+    CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+
     IMMDeviceEnumerator* pEnum = nullptr;
     IMMDevice* pDevice = nullptr;
 
-    CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL, __uuidof(IMMDeviceEnumerator), reinterpret_cast<void**>(&pEnum));
-    pEnum->GetDefaultAudioEndpoint(eRender, eConsole, &pDevice);
-    pDevice->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr, reinterpret_cast<void**>(&pAudioClient));
+    HRESULT hr = CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL, __uuidof(IMMDeviceEnumerator), reinterpret_cast<void**>(&pEnum));
+    if (FAILED(hr)) return;
+    hr = pEnum->GetDefaultAudioEndpoint(eRender, eConsole, &pDevice);
+    if (FAILED(hr)) return;
+    hr = pDevice->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr, reinterpret_cast<void**>(&pAudioClient));
+    if (FAILED(hr)) return;
 
     WAVEFORMATEX* pWaveFormat = nullptr;
     pAudioClient->GetMixFormat(&pWaveFormat);
 
     REFERENCE_TIME duration = 10 * 10000; // 10ms in 100-nanosecond units
-    pAudioClient->Initialize(
+    hr = pAudioClient->Initialize(
         AUDCLNT_SHAREMODE_SHARED,
         AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
         duration, 0, pWaveFormat, nullptr);
-
-    pAudioClient->SetEventHandle(hEvent);
-    pAudioClient->GetService(__uuidof(IAudioRenderClient), reinterpret_cast<void**>(pRenderClient));
+    if (FAILED(hr)) return;
+    hr = pAudioClient->SetEventHandle(hEvent);
+    if (FAILED(hr)) return;
+    hr = pAudioClient->GetService(__uuidof(IAudioRenderClient), reinterpret_cast<void**>(&pRenderClient));
+    if (FAILED(hr)) return;
+    pAudioClient->AddRef();
+    pRenderClient->AddRef();
 }
 
 bool AudioNDSessionServer::Setup(char* localAddr) {
@@ -133,7 +144,6 @@ void AudioNDSessionServer::Loop() {
     IAudioClient* pAudioClient = nullptr;
     HANDLE hEvent = CreateEvent(nullptr, FALSE, FALSE, nullptr);
 
-
     SetupAudioRenderer(pRenderClient, pAudioClient, hEvent);
 
     UINT32 bufferFrameCount;
@@ -144,7 +154,7 @@ void AudioNDSessionServer::Loop() {
     }
     pAudioClient->Start();
     
-    while (m_isRunning) {
+    while (m_isRunning || !g_shouldQuit.load()) {
         WaitForSingleObject(hEvent, INFINITE);
 
         UINT32 padding = 0;
@@ -189,7 +199,7 @@ void AudioNDSessionServer::Loop() {
         }
     }
     pAudioClient->Stop();
-    abort();
+    g_shouldQuit.store(true);
 }
 
 bool AudioNDSessionServer::WaitForCompletionAndCheckContext(void *expectedContext, ULONG notifyFlag) {
@@ -370,7 +380,7 @@ void AudioNDSessionClient::Loop() {
     
     pAudioClient->Start();
 
-    while (m_isRunning) {
+    while (m_isRunning || !g_shouldQuit.load()) {
         DWORD waitResult = WaitForSingleObject(hEvent, INFINITE);
         if (waitResult != WAIT_OBJECT_0) continue;
 
@@ -396,11 +406,11 @@ void AudioNDSessionClient::Loop() {
         while (flag[0] != 1) {
             if (FAILED(Read(&flagSge, 1, remoteInfo.remoteAddr, remoteInfo.remoteToken, 0, READ_CTXT))) {
                 std::cerr << "AUDIO: " << "Read failed." << std::endl;
-                continue;
+                return;
             }
             if (!WaitForCompletionAndCheckContext(READ_CTXT, ND_CQ_NOTIFY_ANY)) {
                 std::cerr << "AUDIO: " << "WaitForCompletion for flag read failed." << std::endl;
-                continue;
+                return;
             }
         }
 
@@ -408,11 +418,11 @@ void AudioNDSessionClient::Loop() {
         memcpy(data, buffer, AUDIO_BUFFER_SIZE);
         if (FAILED(Send(&sge, 1, 0, SEND_CTXT))) {
             std::cerr << "AUDIO: " << "Send failed." << std::endl;
-            continue;
+            return;
         }
         if (!WaitForCompletionAndCheckContext(SEND_CTXT)) {
             std::cerr << "AUDIO: " << "WaitForCompletion for audio send failed." << std::endl;
-            continue;
+            return;
         }
 
         memset(m_Buf, 0, BUFFER_ALLOC_SIZE);
@@ -420,10 +430,11 @@ void AudioNDSessionClient::Loop() {
         hr = m_audioCaptureClient->ReleaseBuffer(frames);
         if (FAILED(hr)) {
             std::cerr << "AUDIO: " << "ReleaseBuffer failed: " << std::hex << hr << std::endl;
-            continue;
+            return;
         }
     }
     pAudioClient->Stop();
+    g_shouldQuit.store(true);
 }
 
 bool AudioNDSessionClient::WaitForCompletionAndCheckContext(void *expectedContext, ULONG notifyFlag) {
