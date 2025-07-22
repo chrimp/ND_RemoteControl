@@ -86,6 +86,10 @@ void InputNDSessionServer::ExchangePeerInfo() {
     memset(m_Buf, 0, INPUT_EVENT_BUFFER_SIZE);
 }
 
+static bool isAlt = false;
+static bool isTab = false;
+static bool isLastAlt = false;
+
 void InputNDSessionServer::SendEvent(RAWINPUT input) {
     switch (input.header.dwType) {
         case RIM_TYPEMOUSE: {
@@ -97,6 +101,38 @@ void InputNDSessionServer::SendEvent(RAWINPUT input) {
         }
 
         case RIM_TYPEKEYBOARD: {
+            switch (input.data.keyboard.VKey) {
+                case VK_MENU:
+                    if (input.data.keyboard.Flags == RI_KEY_MAKE) {
+                        isAlt = true;
+                        isLastAlt = true;
+                    }
+                    else if (input.data.keyboard.Flags == RI_KEY_BREAK) isAlt = false;
+                    break;
+                case VK_TAB:
+                    if (input.data.keyboard.Flags == RI_KEY_MAKE) {
+                        isTab = true;
+                        isLastAlt = false;
+                    }
+                    else if (input.data.keyboard.Flags == RI_KEY_BREAK) isTab = false;
+                    break;
+            }
+
+            if (isAlt && isTab) { // Do not send Alt+Tab
+                if (isLastAlt) { // Send Registered key depress
+                    m_Keyboard.vk.store(static_cast<unsigned char>(VK_MENU));
+                    m_Keyboard.down.store(0);
+                } else {
+                    m_Keyboard.vk.store(static_cast<unsigned char>(VK_TAB));
+                    m_Keyboard.down.store(0);
+                }
+                isAlt = false;
+                isTab = false;
+                isLastAlt = false; // Reset last Alt
+
+                return;
+            }
+
             m_Keyboard.vk.store(static_cast<unsigned char>(input.data.keyboard.VKey));
             
             switch (input.data.keyboard.Flags) {

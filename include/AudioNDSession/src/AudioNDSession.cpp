@@ -20,6 +20,27 @@
 
 constexpr char TEST_PORT[] = "54323";
 
+void SetupAudioRenderer(_Out_ IAudioRenderClient* pRenderClient, _Out_ IAudioClient* pAudioClient, _In_ const HANDLE& hEvent) {
+    IMMDeviceEnumerator* pEnum = nullptr;
+    IMMDevice* pDevice = nullptr;
+
+    CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL, __uuidof(IMMDeviceEnumerator), reinterpret_cast<void**>(&pEnum));
+    pEnum->GetDefaultAudioEndpoint(eRender, eConsole, &pDevice);
+    pDevice->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr, reinterpret_cast<void**>(&pAudioClient));
+
+    WAVEFORMATEX* pWaveFormat = nullptr;
+    pAudioClient->GetMixFormat(&pWaveFormat);
+
+    REFERENCE_TIME duration = 10 * 10000; // 10ms in 100-nanosecond units
+    pAudioClient->Initialize(
+        AUDCLNT_SHAREMODE_SHARED,
+        AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
+        duration, 0, pWaveFormat, nullptr);
+
+    pAudioClient->SetEventHandle(hEvent);
+    pAudioClient->GetService(__uuidof(IAudioRenderClient), reinterpret_cast<void**>(pRenderClient));
+}
+
 bool AudioNDSessionServer::Setup(char* localAddr) {
     if (!Initialize(localAddr)) std::terminate();
 
@@ -93,9 +114,12 @@ void AudioNDSessionServer::ExchangePeerInfo() {
 }
 
 void AudioNDSessionServer::Loop() {
+    uint8_t* flag = reinterpret_cast<uint8_t*>(m_Buf); // 0 = Cannot accomodate 1 = Good to go
+    uint8_t* data = reinterpret_cast<uint8_t*>(m_Buf) + 1; // Audio data starts after the flag
+
     ND2_SGE flagSge = { m_Buf, 1, m_pMr->GetLocalToken() };
-    ND2_SGE sge = { m_Buf, BUFFER_ALLOC_SIZE, m_pMr->GetLocalToken() }; // Do I NEED flag though? It's 10ms interval.
-    volatile uint8_t* flag = reinterpret_cast<uint8_t*>(m_Buf);
+    ND2_SGE sge = { data, AUDIO_BUFFER_SIZE, m_pMr->GetLocalToken() };
+
     flag[0] = 0; // Reset flag
     _mm_clflush(m_Buf);
     _mm_sfence();
@@ -105,29 +129,12 @@ void AudioNDSessionServer::Loop() {
 
     unsigned int count = 0;
 
-    CoInitializeEx(nullptr, COINIT_MULTITHREADED);
-
-    IMMDeviceEnumerator* pEnum = nullptr;
-    IMMDevice* pDevice = nullptr;
-    IAudioClient* pAudioClient = nullptr;
     IAudioRenderClient* pRenderClient = nullptr;
-
-    CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL, __uuidof(IMMDeviceEnumerator), reinterpret_cast<void**>(&pEnum));
-    pEnum->GetDefaultAudioEndpoint(eRender, eConsole, &pDevice);
-    pDevice->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr, reinterpret_cast<void**>(&pAudioClient));
-
-    WAVEFORMATEX* pWaveFormat = nullptr;
-    pAudioClient->GetMixFormat(&pWaveFormat);
-
-    REFERENCE_TIME duration = 10 * 10000; // 10ms in 100-nanosecond units
-    pAudioClient->Initialize(
-        AUDCLNT_SHAREMODE_SHARED,
-        AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
-        duration, 0, pWaveFormat, nullptr);
+    IAudioClient* pAudioClient = nullptr;
     HANDLE hEvent = CreateEvent(nullptr, FALSE, FALSE, nullptr);
 
-    pAudioClient->GetService(__uuidof(IAudioRenderClient), reinterpret_cast<void**>(&pRenderClient));
-    pAudioClient->SetEventHandle(hEvent);
+
+    SetupAudioRenderer(pRenderClient, pAudioClient, hEvent);
 
     UINT32 bufferFrameCount;
 
@@ -167,28 +174,19 @@ void AudioNDSessionServer::Loop() {
             std::cerr << "AUDIO: " << "PostReceive for audio data failed." << std::endl;
             break;
         }
+        flag[0] = 1;
         if (!WaitForCompletionAndCheckContext(RECV_CTXT)) {
             std::cerr << "AUDIO: " << "WaitForCompletion for audio data failed." << std::endl;
             break;
         }
+        flag[0] = 0;
 
-        memcpy(pData, m_Buf, AUDIO_BUFFER_SIZE);
+        memcpy(pData, data, AUDIO_BUFFER_SIZE);
         hr = pRenderClient->ReleaseBuffer(nBufferToWrite, 0);
         if (FAILED(hr)) {
             std::cerr << "AUDIO: " << "ReleaseBuffer failed: " << std::hex << hr << std::endl;
             break;
         }
-
-        /*
-        auto now = std::chrono::steady_clock::now();
-        if (now - lastCheck > std::chrono::seconds(1)) {
-            std::cout << "\r                                                                               \r" << std::flush;
-            std::cout << "AUDIO: " << "Flag wait time: " << flagWaitTotal.count() / static_cast<float>(count) << std::flush;
-            flagWaitTotal = std::chrono::microseconds(0);
-            lastCheck = now;
-            count = 0;
-        }
-        */
     }
     pAudioClient->Stop();
     abort();
@@ -283,9 +281,10 @@ void AudioNDSessionClient::ExchangePeerInfo() {
 }
 
 void AudioNDSessionClient::Loop() {
-    
     uint8_t* flag = reinterpret_cast<uint8_t*>(m_Buf); // 0 = Cannot accomodate 1 = Good to go
-    ND2_SGE sge = { m_Buf, sizeof(BUFFER_ALLOC_SIZE), m_pMr->GetLocalToken() };
+    uint8_t* data = reinterpret_cast<uint8_t*>(m_Buf) + 1; // Audio data starts after the flag
+    ND2_SGE flagSge = { m_Buf, 1, m_pMr->GetLocalToken() };
+    ND2_SGE sge = { data, AUDIO_BUFFER_SIZE, m_pMr->GetLocalToken() };
 
     CoInitializeEx(nullptr, COINIT_MULTITHREADED);
 
@@ -324,7 +323,7 @@ void AudioNDSessionClient::Loop() {
         return;
     }
 
-    _wsetlocale(LC_ALL, L"korean");
+    _wsetlocale(LC_ALL, L"");
     std::wstring name = varName.pwszVal;
     PropVariantClear(&varName);
     std::wcout << L"AUDIO: " << L"Using audio device: " << name << std::endl;
@@ -343,8 +342,8 @@ void AudioNDSessionClient::Loop() {
 
     if (pWaveFormat->nSamplesPerSec != SAMPLE_RATE) {
         std::cerr << "AUDIO: " << "Sample rate mismatch: " << pWaveFormat->nSamplesPerSec << std::endl;
-        CoTaskMemFree(pWaveFormat);
-        abort();
+        std::cerr << "AUDIO: Using software resampling. Recommend using a device with " << SAMPLE_RATE << " Hz." << std::endl;
+        return;
     }
 
     std::cout << "AUDIO: " << "Audio sample rate: " << pWaveFormat->nSamplesPerSec << std::endl;
@@ -393,8 +392,20 @@ void AudioNDSessionClient::Loop() {
             break;
         }
 
+        flag[0] = 0;
+        while (flag[0] != 1) {
+            if (FAILED(Read(&flagSge, 1, remoteInfo.remoteAddr, remoteInfo.remoteToken, 0, READ_CTXT))) {
+                std::cerr << "AUDIO: " << "Read failed." << std::endl;
+                continue;
+            }
+            if (!WaitForCompletionAndCheckContext(READ_CTXT, ND_CQ_NOTIFY_ANY)) {
+                std::cerr << "AUDIO: " << "WaitForCompletion for flag read failed." << std::endl;
+                continue;
+            }
+        }
+
         // Send audio data
-        memcpy(m_Buf, buffer, BUFFER_ALLOC_SIZE);
+        memcpy(data, buffer, AUDIO_BUFFER_SIZE);
         if (FAILED(Send(&sge, 1, 0, SEND_CTXT))) {
             std::cerr << "AUDIO: " << "Send failed." << std::endl;
             continue;

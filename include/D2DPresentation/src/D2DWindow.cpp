@@ -224,21 +224,23 @@ LRESULT CALLBACK D2DWindow::WndProc(HWND hWnd, UINT message, WPARAM wParam, LPAR
                 const RAWKEYBOARD& key = rawInput->data.keyboard;
                 // 0 - LCtrl 1 - LAlt 2 - LShift 3 - Z
                 switch (key.VKey) {
-                    case VK_LCONTROL:
+                    case VK_CONTROL:
                         if (key.Flags == RI_KEY_MAKE) {
                             m_escapeArray[0] = true;
                         } else if (key.Flags == RI_KEY_BREAK) {
                             m_escapeArray[0] = false;
+                        } else {
+                            std::cout << "D2DWindow: " << "Unexpected VK_LCONTROL flags: " << key.Flags << std::endl;
                         }
                         break;
-                    case VK_LMENU:
+                    case VK_MENU:
                         if (key.Flags == RI_KEY_MAKE) {
                             m_escapeArray[1] = true;
                         } else if (key.Flags == RI_KEY_BREAK) {
                             m_escapeArray[1] = false;
                         }
                         break;
-                    case VK_LSHIFT:
+                    case VK_SHIFT:
                         if (key.Flags == RI_KEY_MAKE) {
                             m_escapeArray[2] = true;
                         } else if (key.Flags == RI_KEY_BREAK) {
@@ -266,7 +268,7 @@ LRESULT CALLBACK D2DWindow::WndProc(HWND hWnd, UINT message, WPARAM wParam, LPAR
             return DefWindowProc(hWnd, message, wParam, lParam);
         }
         case WM_SETFOCUS:
-            ShowCursor(false);
+            while(ShowCursor(false) >= 0);
             {
                 RECT rect;
                 GetClientRect(hWnd, &rect);
