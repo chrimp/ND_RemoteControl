@@ -13,8 +13,10 @@
 #include <wincodec.h>
 #include <d3dcompiler.h>
 #include <thread>
+#include <WtsApi32.h>
 
 #pragma comment(lib, "d3dcompiler.lib")
+#pragma comment(lib, "Wtsapi32.lib")
 #pragma comment(lib, "user32.lib")
 
 using namespace DesktopDuplication;
@@ -451,12 +453,45 @@ std::wstring GetDesktopName() {
         return std::wstring(name, needed / sizeof(WCHAR));
     } else {
         CloseDesktop(hDesk);
-        return L"Unknown Desktop";
+        std::cerr << "Failed to get desktop name. Error: " << GetLastError() << std::endl;
+        return L"";
     }
 }
 
 bool Duplication::RecreateOutputDuplication() {
+    int methodTry = 0;
+
+    if (methodTry > 50) {
+        std::cerr << "Failed to recreate output duplication after 50 attempts." << std::endl;
+        return false;
+    }
+
+    Retry:
+    /*
+    DWORD sessionId = WTSGetActiveConsoleSessionId();
+    HANDLE userToken = nullptr;
+
+    if (WTSQueryUserToken(sessionId, &userToken) == FALSE) {
+        std::cerr << "Failed to get user token for session ID: " << sessionId << std::endl;
+        return false;
+    }
+
+    if (!ImpersonateLoggedOnUser(userToken)) {
+        std::cerr << "Failed to impersonate user token for session ID: " << sessionId << std::endl;
+        CloseHandle(userToken);
+        return false;
+    }
+    */
+
+    int dt = 1;
     std::wstring desktopName = GetDesktopName();
+    
+    while (desktopName.empty() && dt < 50) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        desktopName = GetDesktopName();
+        dt++;
+    }
+
     std::wcout << L"Recreating output duplication for desktop: " << desktopName << std::endl;
 
     HDESK hDesk = OpenDesktop(desktopName.c_str(), 0, FALSE, GENERIC_ALL);
@@ -474,7 +509,11 @@ bool Duplication::RecreateOutputDuplication() {
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
         hr = m_DXGIOutput->DuplicateOutput(m_Device.Get(), m_DesktopDupl.GetAddressOf());
         tries++;
-        if (FAILED(hr)) {
+        if (hr == E_ACCESSDENIED) {
+            methodTry++;
+            goto Retry;
+        }
+        else if (FAILED(hr)) {
             std::cerr << "Failed to recreate. Tried: " << std::dec << tries << " Reason: 0x" << std::hex << hr << std::endl;
             continue;
         }
@@ -485,6 +524,9 @@ bool Duplication::RecreateOutputDuplication() {
         return false;
     }
 
+    // Revert after successful recreation
+    //RevertToSelf();
+    //CloseHandle(userToken);
 
     return true;
 }
@@ -499,6 +541,9 @@ int Duplication::GetFrame(ID3D11Texture2D*& frame, unsigned long timeout) {
     } else if (hr == DXGI_ERROR_ACCESS_LOST) {
         RecreateOutputDuplication();
         return GetFrame(frame, timeout);
+    } else if (hr == DXGI_ERROR_INVALID_CALL) {
+        ReleaseFrame();
+        return -1;
     }
 
     if (FAILED(hr)) {
@@ -761,7 +806,9 @@ void Duplication::ReleaseFrame() {
     HRESULT hr = m_DesktopDupl->ReleaseFrame();
     if (FAILED(hr)) {
         if (hr == DXGI_ERROR_INVALID_CALL) {} // Frame was already released
-        else if (hr == DXGI_ERROR_ACCESS_LOST) {} // AcquireFrame will recreate the output duplication
+        else if (hr == DXGI_ERROR_ACCESS_LOST) {
+            RecreateOutputDuplication(); // Recreate output duplication if access was lost
+        }
         else {
             std::cerr << "Failed to release frame. Reason: 0x" << std::hex << hr << std::endl;
             throw new std::exception();

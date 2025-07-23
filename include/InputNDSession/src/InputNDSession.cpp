@@ -481,10 +481,10 @@ void InputNDSessionClient::Loop() {
                     WCHAR name[256];
                     DWORD needed = 0;
 
-                    std::wcout << L"INPUT: " << L"Current desktop name: " << std::endl;
-
                     if (hDesk && GetUserObjectInformationW(hDesk, UOI_NAME, name, sizeof(name), &needed)) {
                         CloseDesktop(hDesk);
+
+                        std::wcout << L"INPUT: " << L"New desktop name: " << std::wstring(name, needed / sizeof(WCHAR)) << std::endl;
 
                         HDESK hNewDesk = OpenDesktopW(name, 0, FALSE, GENERIC_ALL);
                         SetThreadDesktop(hNewDesk);
