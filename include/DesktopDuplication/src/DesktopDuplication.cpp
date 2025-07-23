@@ -12,8 +12,10 @@
 #include <format>
 #include <wincodec.h>
 #include <d3dcompiler.h>
+#include <thread>
 
 #pragma comment(lib, "d3dcompiler.lib")
+#pragma comment(lib, "user32.lib")
 
 using namespace DesktopDuplication;
 
@@ -308,8 +310,7 @@ bool Duplication::InitDuplication() {
     }
 
     // QI for IDXGIOutput1
-    IDXGIOutput1* dxgiOutput1 = nullptr;
-    hr = dxgiOutput->QueryInterface(IID_PPV_ARGS(&dxgiOutput1));
+    hr = dxgiOutput->QueryInterface(IID_PPV_ARGS(m_DXGIOutput.GetAddressOf()));
     dxgiOutput->Release();
     dxgiOutput = nullptr;
     if (FAILED(hr)) {
@@ -318,9 +319,7 @@ bool Duplication::InitDuplication() {
     }
 
     // Create Desktop Duplication
-    hr = dxgiOutput1->DuplicateOutput(m_Device.Get(), m_DesktopDupl.GetAddressOf());
-    dxgiOutput1->Release();
-    dxgiOutput1 = nullptr;
+    hr = m_DXGIOutput->DuplicateOutput(m_Device.Get(), m_DesktopDupl.GetAddressOf());
     if (FAILED(hr)) {
         if (hr == DXGI_ERROR_NOT_CURRENTLY_AVAILABLE) {
             std::cerr << "There are already maximum number of applications using Desktop Duplication API." << std::endl;
@@ -442,17 +441,64 @@ bool Duplication::SaveFrame(const std::filesystem::path& path) {
     return true;
 }
 
-int Duplication::GetFrame(ID3D11Texture2D*& frame, unsigned long timeout) {
-    //m_CompositionTexture.Reset(); // Reset to see if it resolves the cursor issue
-    // This makes remote texture flashing. How it's even possible? I guess it's sending incomplete texture.
-    // Again, that's due to the fact that GPU operations are asynchronous.
+std::wstring GetDesktopName() {
+    HDESK hDesk = OpenInputDesktop(0, FALSE, GENERIC_READ);
+    WCHAR name[256];
+    DWORD needed = 0;
 
+    if (hDesk && GetUserObjectInformationW(hDesk, UOI_NAME, name, sizeof(name), &needed)) {
+        CloseDesktop(hDesk);
+        return std::wstring(name, needed / sizeof(WCHAR));
+    } else {
+        CloseDesktop(hDesk);
+        return L"Unknown Desktop";
+    }
+}
+
+bool Duplication::RecreateOutputDuplication() {
+    std::wstring desktopName = GetDesktopName();
+    std::wcout << L"Recreating output duplication for desktop: " << desktopName << std::endl;
+
+    HDESK hDesk = OpenDesktop(desktopName.c_str(), 0, FALSE, GENERIC_ALL);
+    SetThreadDesktop(hDesk);
+    CloseDesktop(hDesk);
+    if (m_DesktopDupl) {
+        m_DesktopDupl->ReleaseFrame();
+        m_DesktopDupl.Reset();
+    }
+
+    int tries = 1;
+    HRESULT hr;
+
+    while (tries <= 50) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        hr = m_DXGIOutput->DuplicateOutput(m_Device.Get(), m_DesktopDupl.GetAddressOf());
+        tries++;
+        if (FAILED(hr)) {
+            std::cerr << "Failed to recreate. Tried: " << std::dec << tries << " Reason: 0x" << std::hex << hr << std::endl;
+            continue;
+        }
+        else break;
+    }
+    if (FAILED(hr)) {
+        std::cerr << "Failed to recreate output duplication. Reason: 0x" << std::hex << hr << std::endl;
+        return false;
+    }
+
+
+    return true;
+}
+
+int Duplication::GetFrame(ID3D11Texture2D*& frame, unsigned long timeout) {
     ComPtr<IDXGIResource> desktopResource;
     DXGI_OUTDUPL_FRAME_INFO frameInfo;
 
     HRESULT hr = m_DesktopDupl->AcquireNextFrame(timeout, &frameInfo, &desktopResource);
     if (hr == DXGI_ERROR_WAIT_TIMEOUT) {
         return -1;
+    } else if (hr == DXGI_ERROR_ACCESS_LOST) {
+        RecreateOutputDuplication();
+        return GetFrame(frame, timeout);
     }
 
     if (FAILED(hr)) {
@@ -637,14 +683,6 @@ int Duplication::GetFrame(ID3D11Texture2D*& frame, unsigned long timeout) {
 
     frame = m_CompositionTexture.Get();
 
-    if (frameInfo.LastPresentTime.QuadPart == 0) {
-        counter++;
-        if (counter >= 0) {
-            //SaveFrameFromBuf("./", frame);
-            counter = 0;
-        }
-    }
-
     return 0;
 }
 
@@ -723,6 +761,7 @@ void Duplication::ReleaseFrame() {
     HRESULT hr = m_DesktopDupl->ReleaseFrame();
     if (FAILED(hr)) {
         if (hr == DXGI_ERROR_INVALID_CALL) {} // Frame was already released
+        else if (hr == DXGI_ERROR_ACCESS_LOST) {} // AcquireFrame will recreate the output duplication
         else {
             std::cerr << "Failed to release frame. Reason: 0x" << std::hex << hr << std::endl;
             throw new std::exception();

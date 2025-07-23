@@ -474,9 +474,36 @@ void InputNDSessionClient::Loop() {
             }
 
             if (SendInput(1, &input, sizeof(INPUT)) == 0) {
-                std::cerr << "INPUT: " << "SendInput failed with error: " << GetLastError() << std::endl;
-                abort();
-                break;
+                DWORD error = GetLastError();
+                if (error == ERROR_ACCESS_DENIED) {
+                    std::cout << "INPUT: " << "SendInput failed with ERROR_ACCESS_DENIED, trying to change desktop." << std::endl;
+                    HDESK hDesk = OpenInputDesktop(0, FALSE, GENERIC_ALL);
+                    WCHAR name[256];
+                    DWORD needed = 0;
+
+                    std::wcout << L"INPUT: " << L"Current desktop name: " << std::endl;
+
+                    if (hDesk && GetUserObjectInformationW(hDesk, UOI_NAME, name, sizeof(name), &needed)) {
+                        CloseDesktop(hDesk);
+
+                        HDESK hNewDesk = OpenDesktopW(name, 0, FALSE, GENERIC_ALL);
+                        SetThreadDesktop(hNewDesk);
+                        CloseDesktop(hNewDesk);
+
+                        if (SendInput(1, &input, sizeof(INPUT)) == 0) {
+                            std::cerr << "INPUT: " << "SendInput failed after desktop change: " << GetLastError() << std::endl;
+                            abort();
+                            break;
+                        }
+                    } else {
+                        CloseDesktop(hDesk);
+                        std::cerr << "INPUT: " << "Failed to get desktop name. Error: " << GetLastError() << std::endl;
+                    }
+                } else {
+                    std::cerr << "INPUT: " << "SendInput failed with error: " << std::dec << error << std::endl;
+                    abort();
+                    break;
+                }
             }
         }
         
@@ -501,13 +528,40 @@ void InputNDSessionClient::Loop() {
             #endif
 
             if (SendInput(1, &input, sizeof(INPUT)) == 0) {
-                std::cerr << "INPUT: " << "SendInput failed with error: " << GetLastError() << std::endl;
-                abort();
-                break;
+                DWORD error = GetLastError();
+                if (error == ERROR_ACCESS_DENIED) {
+                    std::cout << "INPUT: " << "SendInput failed with ERROR_ACCESS_DENIED, trying to change desktop." << std::endl;
+                    HDESK hDesk = OpenInputDesktop(0, FALSE, GENERIC_ALL);
+                    WCHAR name[256];
+                    DWORD needed = 0;
+
+                    std::wcout << L"INPUT: " << L"Current desktop name: " << std::endl;
+
+                    if (hDesk && GetUserObjectInformationW(hDesk, UOI_NAME, name, sizeof(name), &needed)) {
+                        CloseDesktop(hDesk);
+
+                        HDESK hNewDesk = OpenDesktopW(name, 0, FALSE, GENERIC_ALL);
+                        SetThreadDesktop(hNewDesk);
+                        CloseDesktop(hNewDesk);
+
+                        if (SendInput(1, &input, sizeof(INPUT)) == 0) {
+                            std::cerr << "INPUT: " << "SendInput failed after desktop change: " << GetLastError() << std::endl;
+                            abort();
+                            break;
+                        }
+                    } else {
+                        CloseDesktop(hDesk);
+                        std::cerr << "INPUT: " << "Failed to get desktop name. Error: " << GetLastError() << std::endl;
+                    }
+                } else {
+                    std::cerr << "INPUT: " << "SendInput failed with error: " << std::dec << error << std::endl;
+                    abort();
+                    break;
+                }
             }
         }
 
-
+        /*
         auto now = std::chrono::steady_clock::now();
 
         if (now - lastprobe >= std::chrono::seconds(1)) {
@@ -517,6 +571,7 @@ void InputNDSessionClient::Loop() {
             lastprobe = now;
             count = 0;
         }
+        */
     }
     g_shouldQuit.store(true);
 }

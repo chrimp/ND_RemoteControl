@@ -57,6 +57,7 @@ namespace DesktopDuplication {
 
         private:
         int GetAndCompressTexture(unsigned long timeout);
+        bool RecreateOutputDuplication();
 
         ComPtr<ID3D11Device5> m_Device;
         ComPtr<ID3D11DeviceContext4> m_Context;
@@ -64,6 +65,7 @@ namespace DesktopDuplication {
         ComPtr<ID3D11Texture2D> m_AcquiredDesktopImage;
         ComPtr<ID3D11Texture2D> m_LastCleanTexture;
         ComPtr<ID3D11Texture2D> m_CompositionTexture;
+        ComPtr<IDXGIOutput1> m_DXGIOutput;
 
         UINT m_Output;
         UINT m_AdapterIndex;
