@@ -357,8 +357,6 @@ HRESULT D2DRenderer::createD3DDeviceAndSwapChain(IDXGIAdapter* pAdapter) {
     swapChainDesc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
     swapChainDesc.Flags = 0;
 
-    IDXGISwapChain* swapChain = nullptr;
-
     UINT flags = 0;
     #ifdef _DEBUG
     flags |= D3D11_CREATE_DEVICE_DEBUG;

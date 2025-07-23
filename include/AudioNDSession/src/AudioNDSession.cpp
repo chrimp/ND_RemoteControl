@@ -2,13 +2,7 @@
 
 #include <emmintrin.h>
 #include <windows.h>
-#include <vector>
 #include <Functiondiscoverykeys_devpkey.h>
-
-#undef min
-#undef max
-
-#include <algorithm>
 
 #ifdef _DEBUG
 #undef FAILED
@@ -128,23 +122,22 @@ void AudioNDSessionServer::Loop() {
     uint8_t* flag = reinterpret_cast<uint8_t*>(m_Buf); // 0 = Cannot accomodate 1 = Good to go
     uint8_t* data = reinterpret_cast<uint8_t*>(m_Buf) + 1; // Audio data starts after the flag
 
-    ND2_SGE flagSge = { m_Buf, 1, m_pMr->GetLocalToken() };
     ND2_SGE sge = { data, AUDIO_BUFFER_SIZE, m_pMr->GetLocalToken() };
 
     flag[0] = 0; // Reset flag
     _mm_clflush(m_Buf);
     _mm_sfence();
 
-    auto flagWaitTotal = std::chrono::microseconds(0);
-    auto lastCheck = std::chrono::steady_clock::now();
-
-    unsigned int count = 0;
-
     IAudioRenderClient* pRenderClient = nullptr;
     IAudioClient* pAudioClient = nullptr;
     HANDLE hEvent = CreateEvent(nullptr, FALSE, FALSE, nullptr);
 
     SetupAudioRenderer(pRenderClient, pAudioClient, hEvent);
+
+    if (FAILED(PostReceive(&sge, 1, RECV_CTXT))) {
+        std::cerr << "AUDIO: " << "PostReceive for audio data failed." << std::endl;
+        return;
+    } // Pre-post
 
     UINT32 bufferFrameCount;
 
@@ -154,7 +147,7 @@ void AudioNDSessionServer::Loop() {
     }
     pAudioClient->Start();
     
-    while (m_isRunning || !g_shouldQuit.load()) {
+    while (m_isRunning && !g_shouldQuit.load()) {
         WaitForSingleObject(hEvent, INFINITE);
 
         UINT32 padding = 0;
@@ -380,7 +373,7 @@ void AudioNDSessionClient::Loop() {
     
     pAudioClient->Start();
 
-    while (m_isRunning || !g_shouldQuit.load()) {
+    while (m_isRunning && !g_shouldQuit.load()) {
         DWORD waitResult = WaitForSingleObject(hEvent, INFINITE);
         if (waitResult != WAIT_OBJECT_0) continue;
 

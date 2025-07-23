@@ -845,143 +845,8 @@ void Duplication::SetOutput(UINT adapterIndex, UINT outputIndex) {
     m_AdapterIndex = adapterIndex;
 }
 
-// MARK: DuplicationThread
-DuplicationThread::DuplicationThread() : m_Duplication(nullptr), m_Run(false), m_FrameCount(nullptr) {}
-
-DuplicationThread::~DuplicationThread() {
-    Stop();
-}
-
-bool DuplicationThread::Start() {
-    // Condition checks
-    if (m_Run) return true;
-    if (!m_Duplication) {
-        std::cerr << "DuplicationThread doesn't have Duplication instance." << std::endl;
-        return false;
-    }
-    if (!m_Duplication->IsOutputSet()) {
-        std::cerr << "DuplicationThread's instance doesn't have output." << std::endl;
-        return false;
-    }
-
-    bool start = m_Duplication->InitDuplication();
-    if (!start) return false;
-
-    m_Run = true;
-
-    m_Thread = std::thread(&DuplicationThread::threadFunc, this);
-
-    return true;
-}
-
-void DuplicationThread::Stop() {
-    // Condition checks
-    if (!m_Run) return;
-
-    m_Run = false;
-
-    if (m_Thread.joinable()) {
-        m_Thread.join();
-    }
-
-    return;
-}
-
-void DuplicationThread::threadFunc() {
-	std::chrono::time_point<std::chrono::high_resolution_clock> lastTime = std::chrono::high_resolution_clock::now();
-    while (m_Run) {
-        // Get duplicated surface without staging
-        ID3D11Texture2D* frame = nullptr;
-        int result = m_Duplication->GetFrame(frame);
-
-        switch (result) {
-            case 1:
-                m_Run = false;
-                #ifdef _DEBUG
-                abort();
-                #endif
-                return;
-            case -1:
-                continue; // Should preserve the previous frame; duplication is timed out
-        }
-
-        D3D11_TEXTURE2D_DESC desc;
-        frame->GetDesc(&desc);
-        desc.Usage = D3D11_USAGE_DEFAULT;
-        desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-        desc.CPUAccessFlags = 0;
-        desc.MiscFlags = 0;
-
-        ComPtr<ID3D11Texture2D> copyDest;
-        m_Duplication->GetDevice()->CreateTexture2D(&desc, nullptr, copyDest.GetAddressOf());
-        m_Duplication->GetContext()->CopyResource(copyDest.Get(), frame);
-
-        {
-            std::scoped_lock lock(m_FrameQueueMutex);
-            m_FrameQueue.push_back(std::move(copyDest));
-            if (m_FrameQueue.size() > 0 && m_FrameQueue.size() > m_FrameQueueSize) {
-                m_FrameQueue.pop_front();
-            }
-        }
-
-        m_Duplication->ReleaseFrame();
-		*m_FrameCount = *m_FrameCount + 1;
-    }
-}
-
 // MARK: Utils
-bool DesktopDuplication::ChooseOutput(_Out_ UINT& adapterIndex, _Out_ UINT& outputIndex) {
-    // Currently assuming there is only one adapter
-    IDXGIFactory1* factory = nullptr;
-
-    HRESULT hr = CreateDXGIFactory1(IID_PPV_ARGS(&factory));
-    if (FAILED(hr)) {
-        std::cerr << "Failed to create DXGI Factory. Reason: 0x" << std::hex << hr << std::endl;
-        return false;
-    }
-
-    adapterIndex = 0;
-    IDXGIAdapter* adapter = nullptr;
-
-    hr = factory->EnumAdapters(adapterIndex, &adapter);
-    factory->Release();
-    factory = nullptr;
-    if (FAILED(hr)) {
-        std::cerr << "Failed to enumerate adapters. Reason: 0x" << std::hex << hr << std::endl;
-        return false;
-    }
-
-    UINT lastOutputNum = enumOutputs(adapter);
-    adapter->Release();
-    adapter = nullptr;
-
-    bool validOutput = false;
-    while (!validOutput) {
-        std::cout << std::endl;
-        std::cout << "Choose an output to capture: ";
-        char input = _getch();
-        UINT output = input - '0';
-
-        if (output >= lastOutputNum || output < 0) {
-            std::cout << "Invalid output number. Please choose a valid output." << std::endl;
-            std::cout << "Press any key to continue..." << std::endl;
-            _getch();
-            std::cout << "\033[2A"
-                      << "\033[K"
-                      << "\033[1B"
-                      << "\033[K"
-                      << "\033[1A";
-        } else {
-            validOutput = true;
-            outputIndex = output;
-            system("cls");
-        }
-    }
-
-    return true;
-}
-
-void DesktopDuplication::ChooseOutput() {
+void DesktopDuplication::ChooseOutput(_Out_ unsigned short& width, _Out_ unsigned short& height, _Out_ unsigned short& refreshRate) {
     IDXGIFactory1* factory = nullptr;
     HRESULT hr = CreateDXGIFactory1(IID_PPV_ARGS(&factory));
     if (FAILED(hr)) {
@@ -1022,7 +887,7 @@ void DesktopDuplication::ChooseOutput() {
             std::wcout << desc << std::endl;
         }
         std::cout << std::endl;
-        std::cout << "\nChoose an adapter to use: ";
+        std::cout << "Choose an adapter to use: ";
         char input = _getch();
         UINT choice = input - '0';
 
@@ -1035,15 +900,19 @@ void DesktopDuplication::ChooseOutput() {
         system("cls");
         std::cout << "Selected adapter #" << choice << ".\n" << std::endl;
 
-        selectedOutputIndex = enumOutputs(adapters[choice]);
+        selectedOutputIndex = enumOutputs(adapters[choice], width, height, refreshRate);
 
         if (selectedOutputIndex == -1) {
             std::cout << "\nThis adapter has no outputs. Please choose another one." << std::endl;
+            std::cout << "Press any key to continue..." << std::endl;
+            _getch();
+            continue;
         }
         else if (selectedOutputIndex == -2) continue;
         else {
             selectionComplete = true;
             selectedAdapterIndex = choice;
+            if (width == 0 || height == 0 || refreshRate == 0) abort();
         }
     }
 
@@ -1062,7 +931,7 @@ void DesktopDuplication::ChooseOutput() {
     }
 }
 
-int DesktopDuplication::enumOutputs(IDXGIAdapter* adapter) {
+int DesktopDuplication::enumOutputs(IDXGIAdapter* adapter, unsigned short& width, unsigned short& height, unsigned short& refreshRate) {
     UINT outputIndex = 0;
     IDXGIOutput* output = nullptr;
     std::vector<DXGI_OUTPUT_DESC1> outputDescs;
@@ -1088,6 +957,9 @@ int DesktopDuplication::enumOutputs(IDXGIAdapter* adapter) {
         return -1;
     }
 
+    std::vector<std::tuple<uint16_t, uint16_t, uint16_t>> outputModes;
+    outputModes.resize(outputDescs.size());
+
     // Display the found outputs to the user.
     for (size_t i = 0; i < outputDescs.size(); ++i) {
         std::wstring monitorName = GetMonitorFriendlyName(outputDescs[i]);
@@ -1098,6 +970,7 @@ int DesktopDuplication::enumOutputs(IDXGIAdapter* adapter) {
         if (EnumDisplaySettings(outputDescs[i].DeviceName, ENUM_CURRENT_SETTINGS, &devMode)) {
             std::cout << "  Current Mode: " << devMode.dmPelsWidth << "x" << devMode.dmPelsHeight << "@" << devMode.dmDisplayFrequency << "Hz" << std::endl;
         }
+        outputModes[i] = std::make_tuple(devMode.dmPelsWidth, devMode.dmPelsHeight, devMode.dmDisplayFrequency);
     }
 
     // Get the user's selection.
@@ -1126,6 +999,11 @@ int DesktopDuplication::enumOutputs(IDXGIAdapter* adapter) {
         } else {
             validOutput = true;
             selectedOutput = choice;
+            width = std::get<0>(outputModes[selectedOutput]);
+            height = std::get<1>(outputModes[selectedOutput]);
+            refreshRate = std::get<2>(outputModes[selectedOutput]);
+
+            if (width == 0 || height == 0 || refreshRate == 0) abort();
         }
     }
 

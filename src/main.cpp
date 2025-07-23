@@ -12,14 +12,19 @@
 #include <wincodec.h>
 #include <mutex>
 #include <Functiondiscoverykeys_devpkey.h>
+#include <winsock2.h>
+#include <ws2tcpip.h>
 
-constexpr char TEST_PORT[] = "54321";
+#pragma comment(lib, "ws2_32.lib")
+
+//constexpr char TEST_PORT[] = "54321";
 
 #undef max
 #undef min
 
 std::atomic<bool> g_shouldQuit = false;
 
+/*
 constexpr size_t WIDTH = 1920;
 constexpr size_t HEIGHT = 1080;
 constexpr size_t FPS = 360;
@@ -28,6 +33,7 @@ constexpr size_t Y_PLANE_SIZE = WIDTH * HEIGHT;
 constexpr size_t UV_PLANE_SIZE = WIDTH * (HEIGHT / 2) * 2;
 
 constexpr size_t LENGTH_PER_FRAME = 1 + Y_PLANE_SIZE + UV_PLANE_SIZE;
+*/
 
 bool SaveFrameFromBuffer(const std::filesystem::path& path, ID3D11Texture2D* tex);
 
@@ -36,17 +42,6 @@ enum class InputType : uint8_t {
     MouseMove = 1,
     MouseButton = 2
 };
-
-#pragma pack(push, 1)
-struct InputEvent {
-    InputType type;
-    union {
-        struct { uint16_t vk; bool down; } key;
-        struct { float dx; float dy; } mouseMove;
-        struct { uint8_t button; bool down; } mouseButton;
-    };
-};
-#pragma pack(pop)
 
 static size_t maxSge = -1;
 
@@ -68,11 +63,226 @@ void ShowUsage() {
            "\t-s <local_ip>           - Start as server\n"
            "\t-c <local_ip> <server_ip> - Start as client\n");
 }
-
 // MARK: TestServer
 class TestServer : public NDSessionServerBase {
+private:
+    static void SendMultiCast(std::stop_token stopToken, const char* localAddr, const unsigned short port) {
+        SOCKET mSock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+        if (mSock == INVALID_SOCKET) {
+            std::cerr << "Failed to create multicast socket: " << WSAGetLastError() << std::endl;
+            g_shouldQuit.store(true);
+            return;
+        }
+        in_addr mCastIface = {};
+        inet_pton(AF_INET, localAddr, &mCastIface);
+        if (setsockopt(mSock, IPPROTO_IP, IP_MULTICAST_IF, reinterpret_cast<char*>(&mCastIface), sizeof(mCastIface)) == SOCKET_ERROR) {
+            std::cerr << "Failed to set multicast interface: " << WSAGetLastError() << std::endl;
+            closesocket(mSock);
+            g_shouldQuit.store(true);
+            return;
+        }
+        int ttl = 32;
+        if (setsockopt(mSock, IPPROTO_IP, IP_MULTICAST_TTL, reinterpret_cast<char*>(&ttl), sizeof(ttl)) == SOCKET_ERROR) {
+            std::cerr << "Failed to set multicast TTL: " << WSAGetLastError() << std::endl;
+            closesocket(mSock);
+            g_shouldQuit.store(true);
+            return;
+        }
+
+        sockaddr_in mAddr = {};
+        mAddr.sin_family = AF_INET;
+        inet_pton(AF_INET, "239.255.0.1", &mAddr.sin_addr);
+        mAddr.sin_port = htons(56789);
+
+        std::string message = std::string(localAddr) + ":" + std::to_string(port);
+
+        while (!stopToken.stop_requested() && !g_shouldQuit.load()) {
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+            int res = sendto(mSock, message.c_str(), message.size(), 0, reinterpret_cast<sockaddr*>(&mAddr), sizeof(mAddr));
+            if (res == SOCKET_ERROR) {
+                std::cerr << "Failed to send multicast message: " << WSAGetLastError() << std::endl;
+                g_shouldQuit.store(true);
+                break;
+            }
+        }
+    }
+
+    static bool SetSockets(_In_ const char* localAddr, _Out_ SOCKET& listenSock, _Out_ unsigned short& port) {
+        listenSock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        if (listenSock == INVALID_SOCKET) {
+            std::cerr << "Failed to create listen socket: " << WSAGetLastError() << std::endl;
+            g_shouldQuit.store(true);
+            return false;
+        }
+
+        sockaddr_in localAddrin = {};
+        localAddrin.sin_family = AF_INET;
+        inet_pton(AF_INET, localAddr, &localAddrin.sin_addr);
+        localAddrin.sin_port = htons(0);
+
+        if (bind(listenSock, reinterpret_cast<sockaddr*>(&localAddrin), sizeof(localAddrin)) == SOCKET_ERROR) {
+            std::cerr << "Failed to bind listen socket: " << WSAGetLastError() << std::endl;
+            closesocket(listenSock);
+            g_shouldQuit.store(true);
+            return false;
+        }
+
+        sockaddr_in actual = {};
+        int addrLen = sizeof(actual);
+        if (getsockname(listenSock, reinterpret_cast<sockaddr*>(&actual), &addrLen) == SOCKET_ERROR) {
+            std::cerr << "Failed to get socket name: " << WSAGetLastError() << std::endl;
+            closesocket(listenSock);
+            return false; 
+        }
+        port = ntohs(actual.sin_port);
+
+        return true;
+    }
+
+    bool CreateTexutres() {
+        ComPtr<ID3D11Device> d3dDevice = m_Renderer->GetD3DDevice();
+
+        D3D11_TEXTURE2D_DESC yPlaneDesc = {};
+        yPlaneDesc.Width = m_Width;
+        yPlaneDesc.Height = m_Height;
+        yPlaneDesc.MipLevels = 1;
+        yPlaneDesc.ArraySize = 1;
+        yPlaneDesc.Format = DXGI_FORMAT_R8_UNORM;
+        yPlaneDesc.SampleDesc.Count = 1;
+        yPlaneDesc.SampleDesc.Quality = 0;
+        yPlaneDesc.Usage = D3D11_USAGE_DEFAULT;
+        yPlaneDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        yPlaneDesc.CPUAccessFlags = 0;
+        yPlaneDesc.MiscFlags = 0;
+
+        HRESULT hr = d3dDevice->CreateTexture2D(&yPlaneDesc, nullptr, m_YPlaneTexture.GetAddressOf());
+        if (FAILED(hr)) {
+            std::cerr << "Failed to create Y plane texture: " << std::hex << hr << std::endl;
+            return false;
+        }
+
+        D3D11_TEXTURE2D_DESC uvPlaneDesc = {};
+        uvPlaneDesc.Width = m_Width;
+        uvPlaneDesc.Height = m_Height / 2;
+        uvPlaneDesc.MipLevels = 1;
+        uvPlaneDesc.ArraySize = 1;
+        uvPlaneDesc.Format = DXGI_FORMAT_R8G8_UNORM;
+        uvPlaneDesc.SampleDesc.Count = 1;
+        uvPlaneDesc.SampleDesc.Quality = 0;
+        uvPlaneDesc.Usage = D3D11_USAGE_DEFAULT;
+        uvPlaneDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        uvPlaneDesc.CPUAccessFlags = 0;
+        uvPlaneDesc.MiscFlags = 0;
+
+        hr = d3dDevice->CreateTexture2D(&uvPlaneDesc, nullptr, m_UVPlaneTexture.GetAddressOf());
+        if (FAILED(hr)) {
+            std::cerr << "Failed to create UV plane texture: " << std::hex << hr << std::endl;
+            return false;
+        }
+
+        D3D11_TEXTURE2D_DESC outputDesc = {};
+        outputDesc.Width = m_Width;
+        outputDesc.Height = m_Height;
+        outputDesc.MipLevels = 1;
+        outputDesc.ArraySize = 1;
+        outputDesc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+        outputDesc.SampleDesc.Count = 1;
+        outputDesc.SampleDesc.Quality = 0;
+        outputDesc.Usage = D3D11_USAGE_DEFAULT;
+        outputDesc.BindFlags = D3D11_BIND_UNORDERED_ACCESS | D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
+        outputDesc.CPUAccessFlags = 0;
+        outputDesc.MiscFlags = 0;
+
+        hr = d3dDevice->CreateTexture2D(&outputDesc, nullptr, m_FrameTexture.GetAddressOf());
+        if (FAILED(hr)) {
+            std::cerr << "Failed to create output texture: " << std::hex << hr << std::endl;
+            return false;
+        }
+
+        return true;
+    }
+
+
 public:
+    bool Announce(char* localAddr) { // Multicast IP and Port
+        WSADATA wsaData;
+        if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
+            std::cerr << "WSAStartup failed: " << WSAGetLastError() << std::endl;
+            return false;
+        }
+
+        std::cout << "Starting Announce with localAddr: " << localAddr << std::endl;
+
+        SOCKET listenSock, clientSock;
+        unsigned short assignedPort = 0;
+
+        if (!SetSockets(localAddr, listenSock, assignedPort)) {
+            WSACleanup();
+            return false;
+        }
+
+        m_listenPort = assignedPort;
+        std::jthread multicastThread(SendMultiCast, localAddr, assignedPort);
+
+        if (listen(listenSock, SOMAXCONN) == SOCKET_ERROR) {
+            std::cerr << "Failed to listen on socket: " << WSAGetLastError() << std::endl;
+            multicastThread.request_stop();
+            closesocket(listenSock);
+            return false; 
+        }
+
+        sockaddr_in clientAddr = {};
+        int clientAddrLen = sizeof(clientAddr);
+
+        clientSock = accept(listenSock, reinterpret_cast<sockaddr*>(&clientAddr), &clientAddrLen);
+        if (clientSock == INVALID_SOCKET) {
+            std::cerr << "Failed to accept connection: " << WSAGetLastError() << std::endl;
+            multicastThread.request_stop();
+            closesocket(listenSock);
+            return false;
+        }
+
+        multicastThread.request_stop();
+
+        char clientIp[INET_ADDRSTRLEN];
+        inet_ntop(AF_INET, &clientAddr.sin_addr, clientIp, sizeof(clientIp));
+        std::cout << "Client connected: " << clientIp << ":" << ntohs(clientAddr.sin_port) << std::endl;
+
+        uint16_t buffer[3];
+        int bytesReceived = recv(clientSock, reinterpret_cast<char*>(buffer), sizeof(buffer), 0);
+        if (bytesReceived == SOCKET_ERROR) {
+            std::cerr << "Failed to receive data: " << WSAGetLastError() << std::endl;
+            closesocket(clientSock);
+            closesocket(listenSock);
+            return false;
+        } else if (bytesReceived == 0) {
+            std::cerr << "Connection closed by client." << std::endl;
+            closesocket(clientSock);
+            closesocket(listenSock);
+            return false;
+        }
+
+        uint16_t width = buffer[0];
+        uint16_t height = buffer[1];
+        uint16_t refreshRate = buffer[2];
+
+        std::cout << "Received resolution: " << width << "x" << height << " @ " << refreshRate << "Hz" << std::endl;
+
+        m_Width = width;
+        m_Height = height;
+        m_RefreshRate = refreshRate;
+
+        closesocket(clientSock);
+        closesocket(listenSock);
+        return true;
+    }
+
     bool Setup(char* localAddr) {
+        m_YPlaneSize = m_Width * m_Height;
+        m_UVPlaneSize = m_Width * (m_Height / 2) * 2;
+        m_LengthPerFrame = m_YPlaneSize + m_UVPlaneSize;
+        m_BufferSize = 1 + m_LengthPerFrame;
+
         if (!Initialize(localAddr)) return false;
 
         ND2_ADAPTER_INFO info = GetAdapterInfo();
@@ -89,12 +299,13 @@ public:
         if (FAILED(CreateQP(info.MaxReceiveQueueDepth, info.MaxInitiatorQueueDepth, info.MaxReceiveSge, info.MaxInitiatorSge))) return false;
         if (FAILED(CreateMR())) return false;
 
+
         ULONG flags = ND_MR_FLAG_ALLOW_LOCAL_WRITE | ND_MR_FLAG_ALLOW_REMOTE_WRITE;
-        if (FAILED(RegisterDataBuffer(LENGTH_PER_FRAME, flags))) return false;
+        if (FAILED(RegisterDataBuffer(m_BufferSize, flags))) return false;
 
         ND2_SGE sge = { 0 };
         sge.Buffer = m_Buf;
-        sge.BufferLength = LENGTH_PER_FRAME;
+        sge.BufferLength = m_BufferSize;
         sge.MemoryRegionToken = m_pMr->GetLocalToken();
 
         if (FAILED(CreateListener())) return false;
@@ -107,7 +318,7 @@ public:
         }
 
         m_Renderer = std::make_unique<D2DPresentation::D2DRenderer>();
-        m_Window = std::make_unique<D2DPresentation::D2DWindow>("RDMA Texture Preview", WIDTH, HEIGHT);
+        m_Window = std::make_unique<D2DPresentation::D2DWindow>("RDMA Texture Preview", m_Width, m_Height);
 
         m_Window->Start();
 
@@ -115,7 +326,7 @@ public:
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
         }
 
-        HRESULT hr = m_Renderer->Initialize(nullptr, m_hWnd, WIDTH, HEIGHT, nullptr);
+        HRESULT hr = m_Renderer->Initialize(nullptr, m_hWnd, m_Width, m_Height, nullptr);
         if (FAILED(hr)) {
             std::cerr << "D2DRenderer initialization failed: " << std::hex << hr << std::endl;
             CoUninitialize();
@@ -123,70 +334,10 @@ public:
         }
 
         m_Window->DisplayWindow();
-        //PostMessage(m_hWnd, WM_SYSCOMMAND, SC_MINIMIZE, 0);
 
-        ComPtr<ID3D11Device> d3dDevice = m_Renderer->GetD3DDevice();
-        ComPtr<ID3D11DeviceContext> d3dContext = m_Renderer->GetD3DContext();
-
-        D3D11_TEXTURE2D_DESC yPlaneDesc = {};
-        yPlaneDesc.Width = WIDTH;
-        yPlaneDesc.Height = HEIGHT;
-        yPlaneDesc.MipLevels = 1;
-        yPlaneDesc.ArraySize = 1;
-        yPlaneDesc.Format = DXGI_FORMAT_R8_UNORM; // Single channel for Y
-        yPlaneDesc.SampleDesc.Count = 1;
-        yPlaneDesc.SampleDesc.Quality = 0;
-        yPlaneDesc.Usage = D3D11_USAGE_DEFAULT;
-        yPlaneDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-        yPlaneDesc.CPUAccessFlags = 0;
-        yPlaneDesc.MiscFlags = 0;
-
-        hr = d3dDevice->CreateTexture2D(&yPlaneDesc, nullptr, m_YPlaneTexture.GetAddressOf());
-        if (FAILED(hr)) {
-            std::cerr << "Failed to create Y plane texture: " << std::hex << hr << std::endl;
-            return false;
-        }
-
-        D3D11_TEXTURE2D_DESC uvPlaneDesc = {};
-        uvPlaneDesc.Width = WIDTH;
-        uvPlaneDesc.Height = HEIGHT / 2; // 4:4:0 subsampling
-        uvPlaneDesc.MipLevels = 1;
-        uvPlaneDesc.ArraySize = 1;
-        uvPlaneDesc.Format = DXGI_FORMAT_R8G8_UNORM; // Two channels for UV
-        uvPlaneDesc.SampleDesc.Count = 1;
-        uvPlaneDesc.SampleDesc.Quality = 0;
-        uvPlaneDesc.Usage = D3D11_USAGE_DEFAULT;
-        uvPlaneDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-        uvPlaneDesc.CPUAccessFlags = 0;
-        uvPlaneDesc.MiscFlags = 0;
-
-        hr = d3dDevice->CreateTexture2D(&uvPlaneDesc, nullptr, m_UVPlaneTexture.GetAddressOf());
-        if (FAILED(hr)) {
-            std::cerr << "Failed to create UV plane texture: " << std::hex << hr << std::endl;
-            return false;
-        }
-
-        D3D11_TEXTURE2D_DESC yDesc;
-        m_YPlaneTexture->GetDesc(&yDesc);
-        D3D11_TEXTURE2D_DESC uvDesc;
-        m_UVPlaneTexture->GetDesc(&uvDesc);
-
-        D3D11_TEXTURE2D_DESC frameDesc = {};
-        frameDesc.Width = WIDTH;
-        frameDesc.Height = HEIGHT;
-        frameDesc.MipLevels = 1;
-        frameDesc.ArraySize = 1;
-        frameDesc.Format = DXGI_FORMAT_B8G8R8A8_UNORM; // BGRA format
-        frameDesc.SampleDesc.Count = 1;
-        frameDesc.SampleDesc.Quality = 0;
-        frameDesc.Usage = D3D11_USAGE_DEFAULT;
-        frameDesc.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS;
-        frameDesc.CPUAccessFlags = 0; // No CPU access for optimal GPU performance
-        frameDesc.MiscFlags = 0;
-
-        hr = d3dDevice->CreateTexture2D(&frameDesc, nullptr, m_FrameTexture.GetAddressOf());
-        if (FAILED(hr)) {
-            std::cerr << "Failed to create frame texture: " << std::hex << hr << std::endl;
+        if (!CreateTexutres()) {
+            std::cerr << "Failed to create textures." << std::endl;
+            CoUninitialize();
             return false;
         }
 
@@ -195,7 +346,7 @@ public:
 
     void OpenListener(const char* localAddr) {
         char fullAddress[INET_ADDRSTRLEN + 6];
-        sprintf_s(fullAddress, "%s:%s", localAddr, TEST_PORT);
+        sprintf_s(fullAddress, "%s:%d", localAddr, m_listenPort);
         std::cout << "Listening on " << fullAddress << "..." << std::endl;
         if (FAILED(Listen(fullAddress))) return;
 
@@ -209,7 +360,7 @@ public:
         if (FAILED(Accept(1, 1, nullptr, 0))) return;
         
         CreateMW();
-        Bind(m_Buf, LENGTH_PER_FRAME, ND_OP_FLAG_ALLOW_WRITE | ND_OP_FLAG_ALLOW_READ);
+        Bind(m_Buf, m_BufferSize, ND_OP_FLAG_ALLOW_WRITE | ND_OP_FLAG_ALLOW_READ);
     }
 
     void ExchangePeerInfo() {
@@ -239,7 +390,7 @@ public:
         remoteInfo.remoteAddr = receivedInfo->remoteAddr;
         remoteInfo.remoteToken = receivedInfo->remoteToken;
 
-        memset(m_Buf, 0, LENGTH_PER_FRAME);
+        memset(m_Buf, 0, m_BufferSize);
         
         PeerInfo* myInfo = reinterpret_cast<PeerInfo*>(m_Buf);
         myInfo->remoteAddr = reinterpret_cast<UINT64>(m_Buf);
@@ -258,17 +409,13 @@ public:
             return;
         }
 
-        memset(m_Buf, 0, LENGTH_PER_FRAME);
+        memset(m_Buf, 0, m_BufferSize);
     }
 
     void Loop() {
         ComPtr<ID3D11Device> d3dDevice = m_Renderer->GetD3DDevice();
         ComPtr<ID3D11DeviceContext> d3dContext = m_Renderer->GetD3DContext();
 
-        std::cout << "Waiting for the frame..." << std::endl;
-
-        int frames = 0;
-        auto now = std::chrono::steady_clock::now();
         auto lastDraw = std::chrono::steady_clock::time_point::max();
         ND2_SGE sge = { 0 };
 
@@ -308,8 +455,8 @@ public:
 
                 uint8_t* frameData = reinterpret_cast<uint8_t*>(m_Buf) + 1;
 
-                d3dContext->UpdateSubresource(m_YPlaneTexture.Get(), 0, nullptr, frameData, WIDTH, 0);
-                d3dContext->UpdateSubresource(m_UVPlaneTexture.Get(), 0, nullptr, frameData + Y_PLANE_SIZE, WIDTH * 2, 0);
+                d3dContext->UpdateSubresource(m_YPlaneTexture.Get(), 0, nullptr, frameData, m_Width, 0);
+                d3dContext->UpdateSubresource(m_UVPlaneTexture.Get(), 0, nullptr, frameData + m_YPlaneSize, m_Width * 2, 0);
 
                 m_Renderer->DecompressTexture(m_YPlaneTexture.Get(), m_UVPlaneTexture.Get(), m_FrameTexture.Get());
 
@@ -322,8 +469,6 @@ public:
                     abort();
                 }
             } else if (flag == 3) {
-                //m_Renderer->SetSourceSurface(m_FrameTexture.Get());
-                // Hmm, why bother to redraw? Just continue.
                 continue;
             }
             auto decompressEnd = std::chrono::steady_clock::now();
@@ -343,26 +488,6 @@ public:
                     break;
                 }
             }
-            /*
-            auto now2 = std::chrono::steady_clock::now();
-            auto elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(now2 - now).count();
-            if (elapsed >= 1000000000) {
-                auto flagWaitAvg = FlagWaitTotal.count() / 1000.0f /  frames;
-                auto decompressAvg = DecompressTotal.count() / 1000.0f / frames;
-                auto drawAvg = DrawTotal.count() / 1000.0f / frames;
-
-                std::cout << "\r                                                                               \r" << std::flush;
-                std::cout << "FPS: " << frames << " Flag: " << flagWaitAvg << " Decompress: " << decompressAvg << " Draw: " << drawAvg << std::flush;
-                frames = 0;
-                now = now2;
-
-                FlagWaitTotal = std::chrono::microseconds(0);
-                DecompressTotal = std::chrono::microseconds(0);
-                DrawTotal = std::chrono::microseconds(0);
-            }
-            */
-
-            frames++;
         }
         
         Shutdown();
@@ -375,8 +500,11 @@ public:
     }
 
     void Run(const char* localAddr) {
+        bool a = Announce(const_cast<char*>(localAddr));
+        if (!a) return;
         inputSession.Start(const_cast<char*>(localAddr));
         audioSession.Start(const_cast<char*>(localAddr));
+        Setup(const_cast<char*>(localAddr));
         m_Window->RegisterRawInputCallback([this](RAWINPUT rawInput) {
             inputSession.SendEvent(rawInput);
         }, inputSession.GetCallbackEvent());
@@ -384,6 +512,7 @@ public:
         ExchangePeerInfo();
         Loop();
         inputSession.Stop();
+        audioSession.Stop();
     }
 
     private:
@@ -401,14 +530,151 @@ public:
 
     InputNDSessionServer inputSession;
     AudioNDSessionServer audioSession;
+
+    unsigned short m_Width = 0;
+    unsigned short m_Height = 0;
+    unsigned short m_RefreshRate = 0;
+
+    unsigned short m_listenPort = 0;
+
+    unsigned long m_LengthPerFrame = 0;
+    unsigned long m_BufferSize = 0;
+
+    unsigned long m_YPlaneSize = 0;
+    unsigned long m_UVPlaneSize = 0;
 };
 
 // MARK: TestClient
 class TestClient : public NDSessionClientBase {
+private:
+    bool LookForServer(char* localAddr, _Out_ std::string& serverAddr, _Out_ unsigned short& port) {
+        std::cout << "Looking for server on multicast address" << std::endl;
+
+        SOCKET mSock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+        if (mSock == INVALID_SOCKET) {
+            std::cerr << "Failed to create socket: " << WSAGetLastError() << std::endl;
+            return false;
+        }
+
+        sockaddr_in mAddr = {};
+        mAddr.sin_family = AF_INET;
+        inet_pton(AF_INET, localAddr, &mAddr.sin_addr);
+        mAddr.sin_port = htons(56789);
+
+        if (bind(mSock, reinterpret_cast<sockaddr*>(&mAddr), sizeof(mAddr)) == SOCKET_ERROR) {
+            std::cerr << "Faield to bind socket: " << WSAGetLastError() << std::endl;
+            closesocket(mSock);
+            return false;
+        }
+
+        ip_mreq mreq = {};
+        inet_pton(AF_INET, "239.255.0.1", &mreq.imr_multiaddr);
+        inet_pton(AF_INET, localAddr, &mreq.imr_interface);
+
+        if (setsockopt(mSock, IPPROTO_IP, IP_ADD_MEMBERSHIP, reinterpret_cast<char*>(&mreq), sizeof(mreq)) == SOCKET_ERROR) {
+            std::cerr << "Failed to join multicast group: " << WSAGetLastError() << std::endl;
+            closesocket(mSock);
+            return false;
+        }
+
+        char buffer[128];
+        sockaddr_in senderAddr = {};
+        int senderAddrLen = sizeof(senderAddr);
+
+        int bytesReceived = recvfrom(mSock, buffer, sizeof(buffer) - 1, 0, reinterpret_cast<sockaddr*>(&senderAddr), &senderAddrLen);
+        if (bytesReceived == SOCKET_ERROR) {
+            std::cerr << "Failed to receive data: " << WSAGetLastError() << std::endl;
+            closesocket(mSock);
+            return false;
+        }
+
+        buffer[bytesReceived] = '\0';
+        std::string message(buffer);
+        size_t colonPos = message.find_last_of(':');
+        if (colonPos == std::string::npos) {
+            std::cerr << "Invalid message format: " << message << std::endl;
+            closesocket(mSock);
+            return false;
+        }
+
+        std::string ip = message.substr(0, colonPos);
+        std::string portStr = message.substr(colonPos + 1);
+        port = static_cast<unsigned short>(std::stoi(portStr));
+        serverAddr = ip;
+
+        closesocket(mSock);
+        return true;
+    }
+
 public:
     TestClient() : m_CoutMutex(), inputSession(m_CoutMutex) {}
 
+    bool FindAndSendMode(char* localAddr) {
+        WSADATA wsaData;
+        if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
+            std::cerr << "WSAStartup failed: " << WSAGetLastError() << std::endl;
+            return false;
+        }
+
+        DesktopDuplication::ChooseOutput(m_Width, m_Height, m_RefreshRate);
+        if (m_Width == 0 || m_Height == 0 || m_RefreshRate == 0) {
+            throw std::runtime_error("Invalid output resolution or refresh rate.");
+        }
+        DesktopDuplication::Duplication& dupl = DesktopDuplication::Singleton<DesktopDuplication::Duplication>::Instance();
+        if (!dupl.InitDuplication()) return false;
+
+        std::string ip;
+        unsigned short port;
+
+        if (!LookForServer(localAddr, ip, port)) {
+            std::cerr << "LookForServer failed." << std::endl;
+            return false;
+        }
+
+        m_ServerPort = port;
+        m_ServerAddress = ip;
+
+        std::cout << "Found server at " << ip << ":" << port << std::endl;
+
+        SOCKET tcpSock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        if (tcpSock == INVALID_SOCKET) {
+            std::cerr << "Failed to create TCP socket: " << WSAGetLastError() << std::endl;
+            return false;
+        }
+
+        sockaddr_in serverAddr = {};
+        serverAddr.sin_family = AF_INET;
+        inet_pton(AF_INET, ip.c_str(), &serverAddr.sin_addr);
+        serverAddr.sin_port = htons(port);
+
+        int connectResult = connect(tcpSock, reinterpret_cast<sockaddr*>(&serverAddr), sizeof(serverAddr));
+        if (connectResult == SOCKET_ERROR) {
+            int error = WSAGetLastError();
+            std::cerr << "Connect failed: " << error << std::endl;
+            closesocket(tcpSock);
+            return false;
+        }
+
+        uint16_t mode[3] = { m_Width, m_Height, m_RefreshRate };
+        int bytesSent = send(tcpSock, reinterpret_cast<const char*>(mode), sizeof(mode), 0);
+        if (bytesSent == SOCKET_ERROR) {
+            std::cerr << "Failed to send mode: " << WSAGetLastError() << std::endl;
+            closesocket(tcpSock);
+            return false;
+        }
+
+        std::cout << "Sent mode: " << m_Width << "x" << m_Height << " @ " << m_RefreshRate << "Hz" << std::endl;
+
+        closesocket(tcpSock);
+        return true;
+    }
+
     bool Setup(char* localAddr) {
+        m_YPlaneSize = m_Width * m_Height;
+        m_UVPlaneSize = m_Width * (m_Height / 2) * 2;
+        m_LengthPerFrame = m_YPlaneSize + m_UVPlaneSize;
+        m_BufferSize = 1 + m_LengthPerFrame;
+
         if (!Initialize(localAddr)) return false;
 
         ND2_ADAPTER_INFO info = GetAdapterInfo();
@@ -419,49 +685,51 @@ public:
         if (FAILED(CreateMR())) return false;
 
         ULONG flags = ND_MR_FLAG_ALLOW_LOCAL_WRITE | ND_MR_FLAG_ALLOW_REMOTE_WRITE;
-        if (FAILED(RegisterDataBuffer(LENGTH_PER_FRAME, flags))) return false;
+        if (FAILED(RegisterDataBuffer(m_BufferSize, flags))) return false;
         if (FAILED(CreateConnector())) return false;
 
         return true;
     }
 
-    void OpenConnector(const char* localAddr, const char* serverAddr) {
+    bool OpenConnector(const char* localAddr) {
+        const char* serverAddr = m_ServerAddress.c_str();
+
         ND2_SGE sge = { 0 };
         sge.Buffer = m_Buf;
-        sge.BufferLength = LENGTH_PER_FRAME;
+        sge.BufferLength = m_BufferSize;
         sge.MemoryRegionToken = m_pMr->GetLocalToken();
         if (FAILED(PostReceive(&sge, 1, RECV_CTXT))) {
             std::cerr << "PostReceive failed." << std::endl;
-            return;
+            return false;
         }
 
         char fullServerAddress[INET_ADDRSTRLEN + 6];
-        sprintf_s(fullServerAddress, "%s:%s", serverAddr, TEST_PORT);
+        sprintf_s(fullServerAddress, "%s:%d", serverAddr, m_ServerPort);
 
         std::cout << "Connecting from " << localAddr << " to " << fullServerAddress << "..." << std::endl;
         std::this_thread::sleep_for(std::chrono::seconds(1));
 
         if (FAILED(Connect(localAddr, fullServerAddress, 1, 1, nullptr, 0))) {
-             std::cerr << "Connect failed." << std::endl;
-             return;
+            std::cerr << "Connect failed." << std::endl;
+            return false;
         }
 
         if (FAILED(CompleteConnect())) {
             std::cerr << "CompleteConnect failed." << std::endl;
-            return;
+            return false;
         }
         std::cout << "Connection established." << std::endl;
 
         CreateMW();
-        Bind(m_Buf, LENGTH_PER_FRAME, ND_OP_FLAG_ALLOW_WRITE | ND_OP_FLAG_ALLOW_READ);
+        Bind(m_Buf, m_BufferSize, ND_OP_FLAG_ALLOW_WRITE | ND_OP_FLAG_ALLOW_READ);
+
+        return true;
     }
 
-    void ExchangePeerInfo() {
+    bool ExchangePeerInfo() {
         PeerInfo* myInfo = reinterpret_cast<PeerInfo*>(m_Buf);
         myInfo->remoteAddr = reinterpret_cast<UINT64>(m_Buf);
         myInfo->remoteToken = m_pMw->GetRemoteToken();
-
-        std::cout << "My address: " << myInfo->remoteAddr << ", token: " << myInfo->remoteToken << std::endl;
 
         std::this_thread::sleep_for(std::chrono::seconds(1));
         
@@ -473,45 +741,39 @@ public:
         sge = { m_Buf, sizeof(PeerInfo), m_pMr->GetLocalToken() };
         if (FAILED(Send(&sge, 1, 0, SEND_CTXT))) {
             std::cerr << "Send failed." << std::endl;
-            return;
+            return false;
         }
         if (!WaitForCompletionAndCheckContext(SEND_CTXT)) {
             std::cerr << "WaitForCompletion for send failed." << std::endl;
-            return;
+            return false;
         }
 
         std::cout << "Peer information sent. Waiting for server's PeerInfo..." << std::endl;
 
-        memset(m_Buf, 0, LENGTH_PER_FRAME);
+        memset(m_Buf, 0, m_BufferSize);
 
         sge = { m_Buf, sizeof(PeerInfo), m_pMr->GetLocalToken() };
 
         if (FAILED(PostReceive(&sge, 1, RECV_CTXT))) {
             std::cerr << "PostReceive for server's PeerInfo failed." << std::endl;
-            return;
+            return false;
         }
         if (!WaitForCompletionAndCheckContext(RECV_CTXT)) {
             std::cerr << "WaitForCompletion for server's PeerInfo failed." << std::endl;
-            return;
+            return false;
         }
-
-        std::cout << "Received PeerInfo from server: remoteAddr = " 
-                  << reinterpret_cast<PeerInfo*>(m_Buf)->remoteAddr
-                  << ", remoteToken = " << reinterpret_cast<PeerInfo*>(m_Buf)->remoteToken << std::endl;
 
         remoteInfo.remoteAddr = reinterpret_cast<PeerInfo*>(m_Buf)->remoteAddr;
         remoteInfo.remoteToken = reinterpret_cast<PeerInfo*>(m_Buf)->remoteToken;
 
-        memset(m_Buf, 0, LENGTH_PER_FRAME);
+        memset(m_Buf, 0, m_BufferSize);
+
+        return true;
     }
 
     void Loop() {
         std::cout << "Sending frames to the server." << std::endl;
         DesktopDuplication::Duplication& dupl = DesktopDuplication::Singleton<DesktopDuplication::Duplication>::Instance();
-
-        auto now = std::chrono::steady_clock::now();
-
-        int frames = 0;
         ND2_SGE sge = { 0 };
 
         auto GetAndCompressTotal = std::chrono::microseconds::zero();
@@ -548,10 +810,9 @@ public:
             auto GetAndCompressStart = std::chrono::steady_clock::now();
             ID3D11Texture2D* yPlane = nullptr;
             ID3D11Texture2D* uvPlane = nullptr;
-            memset(m_Buf, 0, LENGTH_PER_FRAME);
+            memset(m_Buf, 0, m_BufferSize);
 
-            //bool success = dupl.GetStagedTexture(frame, 1000 / FPS);
-            bool success = dupl.GetStagedTexture(yPlane, uvPlane, 1000 / FPS);
+            bool success = dupl.GetStagedTexture(yPlane, uvPlane, 1000 / m_RefreshRate);
 
             sge.Buffer = m_Buf;
             sge.BufferLength = 1;
@@ -582,9 +843,9 @@ public:
             uint8_t* yDst = frameData + 1;
             uint8_t* ySrc = reinterpret_cast<uint8_t*>(mappedResource.pData);
 
-            for (unsigned int i = 0; i < HEIGHT; i++) {
-                memcpy(yDst, ySrc, WIDTH);
-                yDst += WIDTH;
+            for (unsigned int i = 0; i < m_Height; i++) {
+                memcpy(yDst, ySrc, m_Width);
+                yDst += m_Width;
                 ySrc += mappedResource.RowPitch;
             }
 
@@ -593,12 +854,12 @@ public:
             yPlane = nullptr;
 
             dupl.GetContext()->Map(uvPlane, 0, D3D11_MAP_READ, 0, &mappedResource);
-            uint8_t* uvDst = frameData + 1 + Y_PLANE_SIZE;
+            uint8_t* uvDst = frameData + 1 + m_YPlaneSize;
             uint8_t* uvSrc = reinterpret_cast<uint8_t*>(mappedResource.pData);
 
-            for (unsigned int i = 0; i < HEIGHT / 2; i++) {
-                memcpy(uvDst, uvSrc, WIDTH * 2);
-                uvDst += WIDTH * 2;
+            for (unsigned int i = 0; i < m_Height / 2; i++) {
+                memcpy(uvDst, uvSrc, m_Width * 2);
+                uvDst += m_Width * 2;
                 uvSrc += mappedResource.RowPitch;
             }
             dupl.GetContext()->Unmap(uvPlane, 0);
@@ -610,7 +871,7 @@ public:
             auto WriteStart = std::chrono::steady_clock::now();
             // Send the frame data
             sge.Buffer = m_Buf;
-            sge.BufferLength = LENGTH_PER_FRAME;
+            sge.BufferLength = m_BufferSize;
             sge.MemoryRegionToken = m_pMr->GetLocalToken();
 
             if (FAILED(Write(&sge, 1, remoteInfo.remoteAddr, remoteInfo.remoteToken, 0, WRITE_CTXT))) {
@@ -621,8 +882,6 @@ public:
                 std::cerr << "WaitForCompletion for frame data write failed." << std::endl;
                 return;
             }
-
-            frames++;
 
             *reinterpret_cast<uint8_t*>(m_Buf) = 0; // Reset the flag
 
@@ -641,28 +900,6 @@ public:
             }
             auto WriteEnd = std::chrono::steady_clock::now();
             WriteTotal += std::chrono::duration_cast<std::chrono::microseconds>(WriteEnd - WriteStart);
-
-            /*
-            auto now2 = std::chrono::steady_clock::now();
-            auto elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(now2 - now).count();
-            if (elapsed >= 1000000000) {
-                auto GetAndFlagAvg = GetAndCompressTotal.count() / 1000.0f / frames;
-                auto MapAvg = MapTotal.count() / 1000.0f / frames;
-                auto WriteAvg = WriteTotal.count() / 1000.0f / frames;
-                auto FlagWaitAvg = FlagWaitTotal.count() / 1000.0f / frames;
-
-                std::scoped_lock<std::mutex> lock(m_CoutMutex);
-                std::cout << "\r                                                                         \r" << std::flush;
-                std::cout << "FPS: " << frames << "| Comp: " << GetAndFlagAvg << " Map: " << MapAvg << " Write: " << WriteAvg << " Flag: " << FlagWaitAvg << std::flush;
-                frames = 0;
-                GetAndCompressTotal = std::chrono::microseconds::zero();
-                MapTotal = std::chrono::microseconds::zero();
-                WriteTotal = std::chrono::microseconds::zero();
-                FlagWaitTotal = std::chrono::microseconds::zero();
-
-                now = now2;
-            }
-            */
         }
 
         Shutdown();
@@ -671,22 +908,37 @@ public:
     }
 
     void Run(const char* localAddr, const char* serverAddr) {
+        FindAndSendMode(const_cast<char*>(localAddr));
         inputSession.Start(const_cast<char*>(localAddr), serverAddr);
         audioSession.Start(const_cast<char*>(localAddr), serverAddr);
-        OpenConnector(localAddr, serverAddr);
+        Setup(const_cast<char*>(localAddr));
+        OpenConnector(localAddr);
         ExchangePeerInfo();
         Loop();
         inputSession.Stop();
+        audioSession.Stop();
     }
 
     private:
     PeerInfo remoteInfo;
+    std::string m_ServerAddress = "";
+    unsigned short m_ServerPort = 0;
 
     std::atomic<bool> m_isRunning = true;
     std::mutex m_CoutMutex;
 
     InputNDSessionClient inputSession;
     AudioNDSessionClient audioSession;
+
+    unsigned short m_Width = 0;
+    unsigned short m_Height = 0;
+    unsigned short m_RefreshRate = 0;
+
+    unsigned long m_LengthPerFrame = 0;
+    unsigned long m_BufferSize = 0;
+
+    unsigned long m_YPlaneSize = 0;
+    unsigned long m_UVPlaneSize = 0;
 };
 
 int main(int argc, char* argv[]) {
@@ -694,7 +946,6 @@ int main(int argc, char* argv[]) {
         ShowUsage();
         return 1;
     }
-
 
     bool isServer = false;
     if (strcmp(argv[1], "-s") == 0) {
@@ -706,12 +957,6 @@ int main(int argc, char* argv[]) {
     } else {
         ShowUsage();
         return 1;
-    }
-
-    if (!isServer) {
-        DesktopDuplication::ChooseOutput();
-        DesktopDuplication::Duplication& dupl = DesktopDuplication::Singleton<DesktopDuplication::Duplication>::Instance();
-        dupl.InitDuplication();
     }
 
     WSADATA wsaData;
@@ -728,28 +973,17 @@ int main(int argc, char* argv[]) {
 
     if (isServer) {
         TestServer server;
-        if (server.Setup(argv[2])) {
-            server.Run(argv[2]);
-        } else {
-            std::cerr << "Server setup failed." << std::endl;
-        }
+        server.Run(argv[2]);
+
     } else { // Client
         TestClient client;
-        // Use the specific local IP for setup, and pass both to Run
-        if (client.Setup(argv[2])) {
-            client.Run(argv[2], argv[3]);
-        } else {
-            std::cerr << "Client setup failed." << std::endl;
-        }
+        client.Run(argv[2], argv[3]);
     }
 
     NdCleanup();
     WSACleanup();
     return 0;
 }
-
-
-
 
 bool SaveFrameFromBuffer(const std::filesystem::path& path, ID3D11Texture2D* tex) {
     IWICImagingFactory* factory = nullptr;

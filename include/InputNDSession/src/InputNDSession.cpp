@@ -40,6 +40,7 @@ void InputNDSessionServer::OpenListener(const char* localAddr) {
     char fullAddress[INET_ADDRSTRLEN + 6];
     sprintf_s(fullAddress, "%s:%s", localAddr, TEST_PORT);
     
+    std::cout << "INPUT: Listening on " << fullAddress << "..." << std::endl;
     if (FAILED(Listen(fullAddress))) std::terminate();
 
     if (FAILED(GetConnectionRequest())) {
@@ -191,11 +192,8 @@ void InputNDSessionServer::Loop() {
     // m_Mouse now accumulates mouse deltas, so no need to calculate delta. Just reset it.
 
     auto flagWaitTotal = std::chrono::microseconds(0);
-    auto lastCheck = std::chrono::steady_clock::now();
 
-    unsigned int count = 0;
-
-    while (m_isRunning || !g_shouldQuit.load()) {
+    while (m_isRunning && !g_shouldQuit.load()) {
         flag[0] = 0; // Reset flag
         _mm_clflush(m_Buf);
         _mm_sfence();
@@ -216,7 +214,6 @@ void InputNDSessionServer::Loop() {
         };
 
         auto flagWaitStart = std::chrono::steady_clock::now();
-        count++;
         while (flag[0] != 1) {
             if (FAILED(Read(&flagSge, 1, remoteInfo.remoteAddr, remoteInfo.remoteToken, 0, READ_CTXT))) {
                 std::cerr << "INPUT: " << "Read failed." << std::endl;
@@ -318,6 +315,8 @@ bool InputNDSessionClient::Setup(const char* localAddr) {
 void InputNDSessionClient::OpenConnector(const char* localAddr, const char* serverAddr) {
     char fullServerAddress[INET_ADDRSTRLEN + 6];
     sprintf_s(fullServerAddress, "%s:%s", serverAddr, TEST_PORT);
+    std::this_thread::sleep_for(std::chrono::seconds(1));
+    std::cout << "INPUT: Connecting to " << fullServerAddress << "..." << std::endl;
 
     if (FAILED(Connect(localAddr, fullServerAddress, 1, 1, nullptr, 0))) {
         std::cerr << "INPUT: " << "Connect failed." << std::endl;
@@ -385,7 +384,7 @@ void InputNDSessionClient::Loop() {
     uint8_t* flag = reinterpret_cast<uint8_t*>(m_Buf); // 0 = Cannot accomodate 1 = Good to go
     Packet* received = reinterpret_cast<Packet*>(reinterpret_cast<uint8_t*>(m_Buf) + 1); // Buffer for MousePacket
 
-    while (m_isRunning || !g_shouldQuit.load()) {
+    while (m_isRunning && !g_shouldQuit.load()) {
         if (sgeCount < 10) {
             for (int i = 0; i < 10; i++) {
                 if (FAILED(PostReceive(&sge, 1, RECV_CTXT))) {

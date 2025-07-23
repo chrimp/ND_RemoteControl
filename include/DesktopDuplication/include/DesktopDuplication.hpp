@@ -5,11 +5,7 @@
 #include <string>
 #include <SetupAPI.h>
 #include <devguid.h>
-#include <thread>
-#include <atomic>
-#include <mutex>
 #include <filesystem>
-#include <deque>
 #include <d2d1_3.h>
 
 #pragma comment(lib, "dxgi.lib")
@@ -95,48 +91,8 @@ namespace DesktopDuplication {
         unsigned short counter = 0;
     };
 
-    class DuplicationThread {
-        public:
-        DuplicationThread();
-        ~DuplicationThread();
-
-        void SetDuplication(Duplication* duplication) { m_Duplication = duplication; }
-
-        bool Start();
-        void Stop();
-
-        void RegisterTelemetry(int* frameCount) {
-            m_FrameCount = frameCount;
-            *m_FrameCount = 0;
-        }
-
-        const std::deque<ComPtr<ID3D11Texture2D>>& GetFrameQueue() {
-            std::scoped_lock lock(m_FrameQueueMutex);
-            return m_FrameQueue;
-        }
-
-        private:
-        void threadFunc();
-        void threadFuncPreview();
-
-        Duplication* m_Duplication;
-        std::atomic<bool> m_Run;
-        std::atomic<bool> m_ShowPreview;
-        std::thread m_Thread;
-        int* m_FrameCount;
-        void* m_pthreadFunc;
-
-        std::deque<ComPtr<ID3D11Texture2D>> m_FrameQueue;
-        std::mutex m_FrameQueueMutex;
-        size_t m_FrameQueueSize = 0;
-    };
-
-    void ChooseOutput();
-    bool ChooseOutput(_Out_ UINT& adapterIndex, _Out_ UINT& outputIndex);
-    int enumOutputs(IDXGIAdapter* adapter);
+    void ChooseOutput(_Out_ unsigned short& width, _Out_ unsigned short& height, _Out_ unsigned short& refreshRate);
+    int enumOutputs(IDXGIAdapter* adapter, unsigned short& width, unsigned short& height, unsigned short& refreshRate);
     std::wstring GetMonitorFriendlyName(const DXGI_OUTPUT_DESC1& desc);
     std::wstring GetMonitorNameFromEDID(const std::wstring& deviceName);
-
-    LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam);
-    HWND CreateWindowInstance(HINSTANCE hInstance, int nCmdShow);
 }
