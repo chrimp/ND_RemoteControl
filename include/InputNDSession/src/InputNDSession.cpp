@@ -279,6 +279,12 @@ void InputNDSessionServer::Loop() {
 bool InputNDSessionServer::WaitForCompletionAndCheckContext(void *expectedContext, ULONG notifyFlag) {
     ND2_RESULT ndRes = WaitForCompletion(notifyFlag, true);
 
+    if (ndRes.Status == ND_CANCELED) {
+        std::cerr << "INPUT: Remote has closed the connection." << std::endl;
+        g_shouldQuit.store(true);
+        return false;
+    }
+
     if (ND_SUCCESS != ndRes.Status) {
         std::cerr << "INPUT: " << "Operation failed with status: " << std::hex << ndRes.Status << std::endl;
         #ifdef _DEBUG

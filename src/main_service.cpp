@@ -46,7 +46,6 @@ void ShowUsage() {
            "\t-c <local_ip> <server_ip> - Start as client\n");
 }
 
-
 bool SyncThreadDesktop() {
     HDESK hDesk = OpenInputDesktop(DF_ALLOWOTHERACCOUNTHOOK, FALSE, GENERIC_ALL);
     if (hDesk == nullptr) {
@@ -414,9 +413,6 @@ public:
     }
 
     void Loop() {
-        unsigned int frames = 0;
-        auto lastTime = std::chrono::steady_clock::now();
-
         ComPtr<ID3D11Device> d3dDevice = m_Renderer->GetD3DDevice();
         ComPtr<ID3D11DeviceContext> d3dContext = m_Renderer->GetD3DContext();
 
@@ -450,7 +446,6 @@ public:
             auto flagWaitEnd = std::chrono::steady_clock::now();
             FlagWaitTotal += std::chrono::duration_cast<std::chrono::microseconds>(flagWaitEnd - flagWaitStart);
 
-
             auto decompressStart = std::chrono::steady_clock::now();
             uint8_t flag = *static_cast<unsigned char*>(m_Buf);
 
@@ -480,20 +475,6 @@ public:
             m_Renderer->Render();
             auto drawEnd = std::chrono::steady_clock::now();
             DrawTotal += std::chrono::duration_cast<std::chrono::microseconds>(drawEnd - drawStart);
-
-            frames++;
-            auto now = std::chrono::steady_clock::now();
-            if (std::chrono::duration_cast<std::chrono::seconds>(now - lastTime).count() >= 1) {
-                std::cout << "\r                                                                                                       \r";
-                std::cout << "FPS: " << frames << "| FlagWait: " << FlagWaitTotal.count() / frames
-                          << "us | Decompress: " << DecompressTotal.count() / frames
-                          << "us | Draw: " << DrawTotal.count() / frames << "us" << std::flush;
-                frames = 0;
-                FlagWaitTotal = std::chrono::microseconds(0);
-                DecompressTotal = std::chrono::microseconds(0);
-                DrawTotal = std::chrono::microseconds(0);
-                lastTime = now;
-            }
 
             if (_kbhit()) {
                 char c = _getch();

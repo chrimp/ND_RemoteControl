@@ -973,9 +973,14 @@ void DesktopDuplication::ChooseOutput(_Out_ unsigned short& width, _Out_ unsigne
             std::wcout << desc << std::endl;
         }
         std::cout << std::endl;
-        std::cout << "Choose an adapter to use: ";
+        std::cout << "Choose an adapter to use: " << std::endl;
+        #ifdef NDR_SERVICE
+        char input = '0';
+        UINT choice = input - '0';
+        #else
         char input = _getch();
         UINT choice = input - '0';
+        #endif
 
         if (choice >= adapters.size()) {
             std::cout << "Invalid adapter number. Press any key to continue..." << std::endl;
@@ -994,11 +999,19 @@ void DesktopDuplication::ChooseOutput(_Out_ unsigned short& width, _Out_ unsigne
             _getch();
             continue;
         }
-        else if (selectedOutputIndex == -2) continue;
+        else if (selectedOutputIndex == -2) {
+            std::cout << "\nReturning to adapter selection." << std::endl;
+            std::cout << "Press any key to continue..." << std::endl;
+            _getch();
+            continue;
+        }
         else {
             selectionComplete = true;
             selectedAdapterIndex = choice;
-            if (width == 0 || height == 0 || refreshRate == 0) abort();
+            if (width == 0 || height == 0 || refreshRate == 0) {
+                std::cerr << "Invalid output dimensions or refresh rate. Aborting selection." << std::endl;
+                abort();
+            }
         }
     }
 
@@ -1022,8 +1035,10 @@ int DesktopDuplication::enumOutputs(IDXGIAdapter* adapter, unsigned short& width
     IDXGIOutput* output = nullptr;
     std::vector<DXGI_OUTPUT_DESC1> outputDescs;
 
+    HRESULT enumHr;
+
     // First, enumerate and store all available outputs for the adapter.
-    while (adapter->EnumOutputs(outputIndex, &output) != DXGI_ERROR_NOT_FOUND) {
+    while ((enumHr = adapter->EnumOutputs(outputIndex, &output)) != DXGI_ERROR_NOT_FOUND) {
         IDXGIOutput6* output6 = nullptr;
         HRESULT hr = output->QueryInterface(IID_PPV_ARGS(&output6));
         if (SUCCEEDED(hr)) {
@@ -1036,6 +1051,12 @@ int DesktopDuplication::enumOutputs(IDXGIAdapter* adapter, unsigned short& width
         output->Release();
         output = nullptr;
         outputIndex++;
+    }
+
+    if (enumHr != DXGI_ERROR_NOT_FOUND && FAILED(enumHr)) {
+        std::cerr << "Failed to enumerate outputs. Reason: 0x" << std::hex << enumHr << std::endl;
+        throw std::exception();
+        return -1;
     }
 
     // If no outputs were found, return -1 to signal failure.
@@ -1064,8 +1085,13 @@ int DesktopDuplication::enumOutputs(IDXGIAdapter* adapter, unsigned short& width
     int selectedOutput = -1;
     while (!validOutput) {
         std::cout << std::endl;
-        std::cout << "Choose an output to capture (Press q to return): ";
+        std::cout << "Choose an output to capture (Press q to return): " << std::endl;
+
+        #ifdef NDR_SERVICE
+        char input = '0';
+        #else
         char input = _getch();
+        #endif
 
         if (input == 'q') {
             return -2;
@@ -1089,7 +1115,10 @@ int DesktopDuplication::enumOutputs(IDXGIAdapter* adapter, unsigned short& width
             height = std::get<1>(outputModes[selectedOutput]);
             refreshRate = std::get<2>(outputModes[selectedOutput]);
 
-            if (width == 0 || height == 0 || refreshRate == 0) abort();
+            if (width == 0 || height == 0 || refreshRate == 0) {
+                std::cerr << "Invalid output dimensions or refresh rate. Please choose another output." << std::endl;
+                abort();
+            }
         }
     }
 
