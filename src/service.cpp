@@ -5,6 +5,7 @@
 #include <tchar.h>
 #include <WtsApi32.h>
 #include <string>
+#include <TlHelp32.h>
 
 #pragma comment(lib, "Wtsapi32.lib")
 
@@ -17,6 +18,8 @@ void RunServiceLogic();
 bool IsProcessRunning(const wchar_t* processName);
 bool StartProcessAsUser(const wchar_t* processPath, const wchar_t* arguments);
 void LogMessage(const char* message);
+
+const wchar_t* processName = L"main_service.exe";
 
 int main() {
     SERVICE_TABLE_ENTRY ServiceTable[] = {
@@ -61,10 +64,31 @@ void ControlHandler(DWORD request) {
     switch (request) {
     case SERVICE_CONTROL_STOP:
     case SERVICE_CONTROL_SHUTDOWN:
+    {
+        // kill main_service.exe
+        HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        PROCESSENTRY32W pEntry;
+        pEntry.dwSize = sizeof(pEntry);
+        BOOL hRes = Process32FirstW(hSnapshot, &pEntry);
+
+        while (hRes) {
+            if (_wcsicmp(pEntry.szExeFile, processName) == 0) {
+                HANDLE hProcess = OpenProcess(PROCESS_TERMINATE, FALSE, pEntry.th32ProcessID);
+                if (hProcess) {
+                    TerminateProcess(hProcess, 0);
+                    CloseHandle(hProcess);
+                }
+                break;
+            }
+            hRes = Process32NextW(hSnapshot, &pEntry);
+        }
+
+        CloseHandle(hSnapshot);
         ServiceStatus.dwCurrentState = SERVICE_STOPPED;
         SetServiceStatus(hStatus, &ServiceStatus);
         LogMessage("Service stopped.");
         return;
+    }
     default:
         break;
     }
@@ -73,14 +97,14 @@ void ControlHandler(DWORD request) {
 }
 
 void RunServiceLogic() {
-    const wchar_t* processName = L"main_service.exe";
-    const wchar_t* processPath = L"C:\\NDR\\main_service.exe";
-    const wchar_t* arguments = L"-c 192.168.10.1 192.168.10.20"; // Put your actual arguments here
+    std::wstring processPath = L"C:\\NDR\\" + std::wstring(processName);
+    //const wchar_t* processPath = L"C:\\NDR\\main_service.exe"
+    const wchar_t* arguments = L"-c 192.168.10.1 192.168.10.20 R"; // Put your actual arguments here
 
     while (ServiceStatus.dwCurrentState == SERVICE_RUNNING) {
         if (!IsProcessRunning(processName)) {
             LogMessage("main_service.exe is not running. Attempting to restart...");
-            if (!StartProcessAsUser(processPath, arguments)) {
+            if (!StartProcessAsUser(processPath.c_str(), arguments)) {
                 LogMessage("Failed to start main_service.exe.");
             } else {
                 LogMessage("Successfully started main_service.exe.");

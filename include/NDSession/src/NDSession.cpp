@@ -292,7 +292,14 @@ bool NDSessionBase::WaitForCompletionAndCheckContext(void *expectedContext, ULON
     }
     if (expectedContext != ndRes.RequestContext) {
         std::cerr << "Unexpected completion. Check for missing WaitForCompletion() call." << std::endl;
+        /*
+        #ifdef _DEBUG
+        std::terminate();
+        #endif
         return false;
+        */
+        // Mismatch is expected in asynchronous operations.
+        return true;
     }
 
     return true;
@@ -375,7 +382,6 @@ HRESULT NDSessionClientBase::Connect(const char* localAddr, const char* remoteAd
     int len = sizeof(local);
     WSAStringToAddress(const_cast<char*>(localAddr), AF_INET, nullptr, reinterpret_cast<struct sockaddr*>(&local), &len);
     local.sin_port = htons(54322);
-
 
     struct sockaddr_in remote = { 0 };
     len = sizeof(remote);

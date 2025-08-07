@@ -321,7 +321,7 @@ bool InputNDSessionClient::Setup(const char* localAddr) {
 void InputNDSessionClient::OpenConnector(const char* localAddr, const char* serverAddr) {
     char fullServerAddress[INET_ADDRSTRLEN + 6];
     sprintf_s(fullServerAddress, "%s:%s", serverAddr, TEST_PORT);
-    std::this_thread::sleep_for(std::chrono::seconds(1));
+    std::this_thread::sleep_for(std::chrono::seconds(2));
     std::cout << "INPUT: Connecting to " << fullServerAddress << "..." << std::endl;
 
     if (FAILED(Connect(localAddr, fullServerAddress, 1, 1, nullptr, 0))) {

@@ -240,15 +240,16 @@ LRESULT CALLBACK D2DWindow::WndProc(HWND hWnd, UINT message, WPARAM wParam, LPAR
             if (m_rawInputCallback) {
                 m_rawInputCallback(*rawInput);
                 SetEvent(m_hCallbackEvent);
-            } 
-            return 0;
-            //return DefWindowProc(hWnd, message, wParam, lParam);
-        }
-        case WM_SETFOCUS:
-            if (bDoNotTrap) {
-                bDoNotTrap = false;
-                return 0;
+            } else {
+                bDoNotTrap = true;
             }
+            break;
+        }
+        case WM_LBUTTONDOWN:
+            bDoNotTrap = false;
+            // fallthrough        
+        case WM_SETFOCUS:
+            if (bDoNotTrap) return 0;
             while(ShowCursor(false) >= 0);
             {
                 RECT rect;

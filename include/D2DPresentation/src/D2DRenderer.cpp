@@ -1,4 +1,5 @@
 #include "../include/D2DRenderer.hpp"
+#include <dxgi1_2.h>
 #include <exception>
 
 #undef min
@@ -244,6 +245,8 @@ bool D2DRenderer::DecompressTexture(ID3D11Texture2D* yPlane, ID3D11Texture2D* uv
 void D2DRenderer::Render() {
     if (!m_isRunning) return;
 
+    WaitForSingleObjectEx(m_frameWaitableObject, 100, true);
+
     m_d2dContext->BeginDraw();
     m_d2dContext->SetTarget(m_d2dTargetBitmap.Get());
     m_d2dContext->Clear(D2D1::ColorF(D2D1::ColorF::Black));
@@ -286,13 +289,6 @@ void D2DRenderer::Render() {
         m_d2dContext->DrawBitmap(m_d2dSourceBitmap.Get(), destRect, 1.0f, interpolationMode);
     }
 
-    /*
-    if (m_d2dSourceBitmap) {
-        D2D1_RECT_F destRect = D2D1::RectF(0.0f, 0.0f, static_cast<float>(m_width), static_cast<float>(m_height));
-        m_d2dContext->DrawBitmap(m_d2dSourceBitmap.Get(), destRect, 1.0f, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
-    }
-    */
-
     HRESULT hr = m_d2dContext->EndDraw();
     if (FAILED(hr)) {
         if (hr == D2DERR_RECREATE_TARGET) {
@@ -302,7 +298,7 @@ void D2DRenderer::Render() {
         }
     }
 
-    hr = m_swapChain->Present(1, 0); // Vsync (1/n vertical sync)
+    hr = m_swapChain->Present(0, 0);
     if (FAILED(hr)) {
         throw std::exception();
     }
@@ -344,18 +340,18 @@ void D2DRenderer::Cleanup() {
 
 HRESULT D2DRenderer::createD3DDeviceAndSwapChain(IDXGIAdapter* pAdapter) {
 
-    DXGI_SWAP_CHAIN_DESC swapChainDesc = {};
+    DXGI_SWAP_CHAIN_DESC1 swapChainDesc = {};
     swapChainDesc.BufferCount = 2;
-    swapChainDesc.BufferDesc.Width = m_width;
-    swapChainDesc.BufferDesc.Height = m_height;
-    swapChainDesc.BufferDesc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    swapChainDesc.Width = m_width;
+    swapChainDesc.Height = m_height;
+    swapChainDesc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
     swapChainDesc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
-    swapChainDesc.OutputWindow = m_hwnd;
     swapChainDesc.SampleDesc.Count = 1;
     swapChainDesc.SampleDesc.Quality = 0;
-    swapChainDesc.Windowed = TRUE;
+    //swapChainDesc.Scaling = DXGI_SCALING_ASPECT_RATIO_STRETCH;
+    swapChainDesc.BufferCount = 2;
     swapChainDesc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
-    swapChainDesc.Flags = 0;
+    swapChainDesc.Flags = DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
 
     UINT flags = 0;
     #ifdef _DEBUG
@@ -369,6 +365,7 @@ HRESULT D2DRenderer::createD3DDeviceAndSwapChain(IDXGIAdapter* pAdapter) {
     ID3D11Device* d3dDevice = nullptr;
     ID3D11DeviceContext* d3dContext = nullptr;
 
+    /*
     HRESULT hr = D3D11CreateDeviceAndSwapChain(
         nullptr,
         D3D_DRIVER_TYPE_HARDWARE,
@@ -383,8 +380,25 @@ HRESULT D2DRenderer::createD3DDeviceAndSwapChain(IDXGIAdapter* pAdapter) {
         nullptr,
         &d3dContext
     );
+    */
+
+    HRESULT hr = D3D11CreateDevice(
+        nullptr,
+        D3D_DRIVER_TYPE_HARDWARE,
+        nullptr,
+        flags,
+        featureLevels,
+        1,
+        D3D11_SDK_VERSION,
+        &d3dDevice,
+        nullptr,
+        &d3dContext
+    );
 
     if (FAILED(hr)) {
+        #ifdef _DEBUG
+        abort();
+        #endif
         return hr;
     }
 
@@ -393,6 +407,35 @@ HRESULT D2DRenderer::createD3DDeviceAndSwapChain(IDXGIAdapter* pAdapter) {
 
     d3dDevice->Release();
     d3dContext->Release();
+
+    IDXGISwapChain1* swapChain = nullptr;
+
+    hr = m_dxgiFactory->CreateSwapChainForHwnd(m_d3dDevice.Get(), m_hwnd, &swapChainDesc, nullptr, nullptr, &swapChain);
+    if (FAILED(hr)) {
+        #ifdef _DEBUG
+        abort();
+        #endif
+        return hr;
+    }
+
+    hr = swapChain->QueryInterface(IID_PPV_ARGS(m_swapChain.GetAddressOf()));
+    swapChain->Release();
+    if (FAILED(hr)) {
+        #ifdef _DEBUG
+        abort();
+        #endif
+        return hr;
+    }
+
+    hr = m_swapChain->SetMaximumFrameLatency(1);
+    if (FAILED(hr)) {
+        #ifdef _DEBUG
+        abort();
+        #endif
+        return hr;
+    }
+
+    m_frameWaitableObject = m_swapChain->GetFrameLatencyWaitableObject();
 
     return S_OK;
 }

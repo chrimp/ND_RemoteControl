@@ -72,7 +72,7 @@ namespace D2DPresentation {
         ComPtr<ID3D11DeviceContext4> m_d3dContext;
 
         ComPtr<IDXGIFactory5> m_dxgiFactory;
-        ComPtr<IDXGISwapChain> m_swapChain;
+        ComPtr<IDXGISwapChain2> m_swapChain;
 
         ComPtr<ID2D1Device2> m_d2dDevice;
         ComPtr<ID2D1Factory3> m_d2dFactory;
@@ -87,6 +87,8 @@ namespace D2DPresentation {
         ComPtr<ID3D11ShaderResourceView> m_YPlaneSRV;
         ComPtr<ID3D11ShaderResourceView> m_UVPlaneSRV;
         ComPtr<ID3D11UnorderedAccessView> m_outputUAV;
+
+        HANDLE m_frameWaitableObject = nullptr;
     };
 }
 

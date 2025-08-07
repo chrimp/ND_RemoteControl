@@ -90,6 +90,10 @@ namespace DesktopDuplication {
         ComPtr<ID3D11Texture2D> m_SRTexture;
         ComPtr<ID3D11Fence> m_Fence;
 
+        ComPtr<ID3D11ShaderResourceView> inputSRV;
+        ComPtr<ID3D11UnorderedAccessView> yPlaneUAV;
+        ComPtr<ID3D11UnorderedAccessView> uvPlaneUAV;
+
         unsigned short counter = 0;
     };
 

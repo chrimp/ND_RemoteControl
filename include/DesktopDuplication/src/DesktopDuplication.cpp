@@ -732,11 +732,15 @@ int Duplication::GetFrame(ID3D11Texture2D*& frame, unsigned long timeout) {
 }
 
 void Duplication::CompressTexture(ID3D11Texture2D* inputTexture) {
+    HRESULT hr;
+    
+    /*
     D3D11_QUERY_DESC queryDesc = {};
     queryDesc.Query = D3D11_QUERY_EVENT;
     ComPtr<ID3D11Query> query;
     HRESULT hr = m_Device->CreateQuery(&queryDesc, query.GetAddressOf());
     if (FAILED(hr)) throw std::exception();
+    */
 
     // Create Y and UV textures if not already created
     if (!m_YPlaneTexture || !m_UVPlaneTexture) {
@@ -752,30 +756,14 @@ void Duplication::CompressTexture(ID3D11Texture2D* inputTexture) {
         desc.Height = desc.Height / 2;
         desc.Format = DXGI_FORMAT_R8G8_UNORM;
         m_Device->CreateTexture2D(&desc, nullptr, m_UVPlaneTexture.GetAddressOf());
-    }
-
-    if (!m_SRTexture) {
-        D3D11_TEXTURE2D_DESC desc;
-        inputTexture->GetDesc(&desc);
-        
-        desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-        desc.MiscFlags = D3D11_RESOURCE_MISC_SHARED;
-        desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM; // Ensure format is compatible with SRV
-        hr = m_Device->CreateTexture2D(&desc, nullptr, m_SRTexture.GetAddressOf());
+    
+        hr = m_Device->CreateShaderResourceView(inputTexture, nullptr, inputSRV.GetAddressOf());
+        if (FAILED(hr)) throw std::exception();
+        hr = m_Device->CreateUnorderedAccessView(m_YPlaneTexture.Get(), nullptr, yPlaneUAV.GetAddressOf());
+        if (FAILED(hr)) throw std::exception();
+        hr = m_Device->CreateUnorderedAccessView(m_UVPlaneTexture.Get(), nullptr, uvPlaneUAV.GetAddressOf());
         if (FAILED(hr)) throw std::exception();
     }
-
-    // Create views fresh each time
-    ComPtr<ID3D11ShaderResourceView> inputSRV;
-    ComPtr<ID3D11UnorderedAccessView> yPlaneUAV;
-    ComPtr<ID3D11UnorderedAccessView> uvPlaneUAV;
-
-    hr = m_Device->CreateShaderResourceView(inputTexture, nullptr, inputSRV.GetAddressOf());
-    if (FAILED(hr)) throw std::exception();
-    hr = m_Device->CreateUnorderedAccessView(m_YPlaneTexture.Get(), nullptr, yPlaneUAV.GetAddressOf());
-    if (FAILED(hr)) throw std::exception();
-    hr = m_Device->CreateUnorderedAccessView(m_UVPlaneTexture.Get(), nullptr, uvPlaneUAV.GetAddressOf());
-    if (FAILED(hr)) throw std::exception();
 
     // Set compute shader and bind resources
     m_Context->CSSetShader(m_CompressShader.Get(), nullptr, 0);
@@ -787,19 +775,23 @@ void Duplication::CompressTexture(ID3D11Texture2D* inputTexture) {
     // Dispatch compute shader
     D3D11_TEXTURE2D_DESC inputDesc;
     inputTexture->GetDesc(&inputDesc);
-    m_Context->Dispatch((inputDesc.Width + 15) / 16, (inputDesc.Height + 15) / 16, 1);
+    UINT dispatchHeight = (inputDesc.Height + 15) / 16;
+    m_Context->Dispatch((inputDesc.Width + 15) / 16, dispatchHeight, 1);
     
-    m_Context->End(query.Get());
+    //m_Context->End(query.Get());
 
     // Cleanup
     ID3D11UnorderedAccessView* nullUAV[] = { nullptr, nullptr };
     m_Context->CSSetUnorderedAccessViews(0, 2, nullUAV, nullptr);
     ID3D11ShaderResourceView* nullSRV = nullptr;
     m_Context->CSSetShaderResources(0, 1, &nullSRV);
+    m_Context->CSSetShader(nullptr, nullptr, 0);
 
+    /*
     while (m_Context->GetData(query.Get(), nullptr, 0, 0) == S_FALSE) {
         _mm_pause();
     }
+    */
 }
 
 void Duplication::ReleaseFrame() {
@@ -866,6 +858,7 @@ bool Duplication::GetStagedTexture(_Out_ ID3D11Texture2D*& dst, _In_ unsigned lo
             return false;
     }
 
+    /*
     D3D11_TEXTURE2D_DESC desc;
     frame->GetDesc(&desc);
 
@@ -876,11 +869,10 @@ bool Duplication::GetStagedTexture(_Out_ ID3D11Texture2D*& dst, _In_ unsigned lo
     desc.MiscFlags = 0;
 
     m_Device->CreateTexture2D(&desc, nullptr, &dst);
+    */
+    
     m_Context->CopyResource(dst, frame);
     ReleaseFrame();
-
-    dst->GetDesc(&desc);
-    if (desc.Format != DXGI_FORMAT_B8G8R8A8_UNORM) abort();
 
     return true;
 }
@@ -901,6 +893,7 @@ bool Duplication::GetStagedTexture(_Out_ ID3D11Texture2D*& YPlane, _Out_ ID3D11T
 
     CompressTexture(frame);
 
+    /*
     D3D11_TEXTURE2D_DESC yDesc;
     m_YPlaneTexture->GetDesc(&yDesc);
     D3D11_TEXTURE2D_DESC uvDesc;
@@ -918,6 +911,7 @@ bool Duplication::GetStagedTexture(_Out_ ID3D11Texture2D*& YPlane, _Out_ ID3D11T
 
     m_Device->CreateTexture2D(&yDesc, nullptr, &YPlane);
     m_Device->CreateTexture2D(&uvDesc, nullptr, &UVPlane);
+    */
 
     m_Context->CopyResource(YPlane, m_YPlaneTexture.Get());
     m_Context->CopyResource(UVPlane, m_UVPlaneTexture.Get());

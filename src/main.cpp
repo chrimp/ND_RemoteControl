@@ -7,6 +7,7 @@
 
 #include <WtsApi32.h>
 #include <conio.h>
+#include <d3d11.h>
 #include <iostream>
 #include <thread>
 #include <chrono>
@@ -15,11 +16,15 @@
 #include <Functiondiscoverykeys_devpkey.h>
 #include <winsock2.h>
 #include <ws2tcpip.h>
+#include <future>
 
 #pragma comment(lib, "ws2_32.lib")
 
 #undef max
 #undef min
+
+#define NOCONTROL
+#define NOAUDIO
 
 std::atomic<bool> g_shouldQuit = false;
 
@@ -203,7 +208,6 @@ private:
         return true;
     }
 
-
 public:
     bool Announce(char* localAddr) { // Multicast IP and Port
         WSADATA wsaData;
@@ -211,8 +215,6 @@ public:
             std::cerr << "WSAStartup failed: " << WSAGetLastError() << std::endl;
             return false;
         }
-
-        std::cout << "Starting Announce with localAddr: " << localAddr << std::endl;
 
         SOCKET listenSock, clientSock;
         unsigned short assignedPort = 0;
@@ -224,6 +226,8 @@ public:
 
         m_listenPort = assignedPort;
         std::jthread multicastThread(SendMultiCast, localAddr, assignedPort);
+
+        std::cout << "Starting Announce with localAddr: " << localAddr << ":" << assignedPort << std::endl;
 
         if (listen(listenSock, SOMAXCONN) == SOCKET_ERROR) {
             std::cerr << "Failed to listen on socket: " << WSAGetLastError() << std::endl;
@@ -249,7 +253,7 @@ public:
         inet_ntop(AF_INET, &clientAddr.sin_addr, clientIp, sizeof(clientIp));
         std::cout << "Client connected: " << clientIp << ":" << ntohs(clientAddr.sin_port) << std::endl;
 
-        uint16_t buffer[3];
+        uint16_t buffer[4];
         int bytesReceived = recv(clientSock, reinterpret_cast<char*>(buffer), sizeof(buffer), 0);
         if (bytesReceived == SOCKET_ERROR) {
             std::cerr << "Failed to receive data: " << WSAGetLastError() << std::endl;
@@ -266,8 +270,9 @@ public:
         uint16_t width = buffer[0];
         uint16_t height = buffer[1];
         uint16_t refreshRate = buffer[2];
+        m_Compress = static_cast<bool>(buffer[3]);
 
-        std::cout << "Received resolution: " << width << "x" << height << " @ " << refreshRate << "Hz" << std::endl;
+        std::cout << "Received resolution: " << width << "x" << height << " @ " << refreshRate << "Hz" << " " << (m_Compress ? "Compressed" : "Raw") << std::endl;
 
         m_Width = width;
         m_Height = height;
@@ -281,7 +286,12 @@ public:
     bool Setup(char* localAddr) {
         m_YPlaneSize = m_Width * m_Height;
         m_UVPlaneSize = m_Width * (m_Height / 2) * 2;
-        m_LengthPerFrame = m_YPlaneSize + m_UVPlaneSize;
+
+        if (m_Compress) {
+            m_LengthPerFrame = m_YPlaneSize + m_UVPlaneSize;
+        } else {
+            m_LengthPerFrame = m_Width * m_Height * 4;
+        }
         m_BufferSize = 1 + m_LengthPerFrame;
 
         if (!Initialize(localAddr)) return false;
@@ -413,7 +423,7 @@ public:
         memset(m_Buf, 0, m_BufferSize);
     }
 
-    void Loop() {
+    void CompressLoop() {
         unsigned int frames = 0;
         auto lastTime = std::chrono::steady_clock::now();
 
@@ -485,7 +495,111 @@ public:
             auto now = std::chrono::steady_clock::now();
             if (std::chrono::duration_cast<std::chrono::seconds>(now - lastTime).count() >= 1) {
                 std::cout << "\r                                                                                                       \r";
-                std::cout << "FPS: " << frames << "| FlagWait: " << FlagWaitTotal.count() / frames
+                std::cout << "FPS: " << frames << " | FlagWait: " << FlagWaitTotal.count() / frames
+                          << "us | Decompress: " << DecompressTotal.count() / frames
+                          << "us | Draw: " << DrawTotal.count() / frames << "us" << std::flush;
+                frames = 0;
+                FlagWaitTotal = std::chrono::microseconds(0);
+                DecompressTotal = std::chrono::microseconds(0);
+                DrawTotal = std::chrono::microseconds(0);
+                lastTime = now;
+            }
+
+            if (_kbhit()) {
+                char c = _getch();
+                if (c == 'q' || c == 'Q') {
+                    std::cout << "Exiting..." << std::endl;
+                    break;
+                }
+            }
+        }
+        
+        Shutdown();
+
+        g_shouldQuit.store(true);
+
+        m_Renderer->Cleanup();
+        m_Window->Stop();
+        CoUninitialize();
+    }
+
+    void Loop() {
+        unsigned int frames = 0;
+        auto lastTime = std::chrono::steady_clock::now();
+
+        ComPtr<ID3D11Device> d3dDevice = m_Renderer->GetD3DDevice();
+        ComPtr<ID3D11DeviceContext> d3dContext = m_Renderer->GetD3DContext();
+
+        auto lastDraw = std::chrono::steady_clock::time_point::max();
+        ND2_SGE sge = { 0 };
+
+        auto FlagWaitTotal = std::chrono::microseconds(0);
+        auto DecompressTotal = std::chrono::microseconds(0);
+        auto DrawTotal = std::chrono::microseconds(0);
+
+        bool isWindowOpen = true;
+
+        sge.Buffer = m_Buf;
+        sge.BufferLength = 1;
+        sge.MemoryRegionToken = m_pMr->GetLocalToken();
+        if (FAILED(PostReceive(&sge, 1, RECV_CTXT))) {
+            std::cerr << "PostReceive for frame data failed." << std::endl;
+            return;
+        }
+
+        while (isWindowOpen) {
+            isWindowOpen = m_Window->isRunning();
+            auto flagWaitStart = std::chrono::steady_clock::now();
+            sge.Buffer = m_Buf;
+            sge.BufferLength = 1;
+            sge.MemoryRegionToken = m_pMr->GetLocalToken();
+            if (FAILED(PostReceive(&sge, 1, RECV_CTXT))) {
+                std::cerr << "PostReceive for frame data failed." << std::endl;
+                break;
+            }
+
+            *reinterpret_cast<uint8_t*>(m_Buf) = 2;
+
+            if (!WaitForCompletionAndCheckContext(RECV_CTXT)) {
+                std::cerr << "WaitForCompletion for frame data failed." << std::endl;
+                break;
+            }
+
+            auto flagWaitEnd = std::chrono::steady_clock::now();
+            FlagWaitTotal += std::chrono::duration_cast<std::chrono::microseconds>(flagWaitEnd - flagWaitStart);
+
+
+            auto decompressStart = std::chrono::steady_clock::now();
+            uint8_t flag = *static_cast<unsigned char*>(m_Buf);
+
+            if (flag == 1) {
+                std::atomic_thread_fence(std::memory_order_acquire);
+
+                uint8_t* frameData = reinterpret_cast<uint8_t*>(m_Buf) + 1;
+                d3dContext->UpdateSubresource(m_FrameTexture.Get(), 0, nullptr, frameData, m_Width * 4, 0);
+
+                m_Renderer->SetSourceSurface(m_FrameTexture.Get());
+
+                D3D11_TEXTURE2D_DESC desc;
+                m_FrameTexture->GetDesc(&desc);
+            } else {
+                throw std::exception();
+            }
+            auto decompressEnd = std::chrono::steady_clock::now();
+            DecompressTotal += std::chrono::duration_cast<std::chrono::microseconds>(decompressEnd - decompressStart);
+
+            lastDraw = std::chrono::steady_clock::now();
+            
+            auto drawStart = std::chrono::steady_clock::now();
+            m_Renderer->Render();
+            auto drawEnd = std::chrono::steady_clock::now();
+            DrawTotal += std::chrono::duration_cast<std::chrono::microseconds>(drawEnd - drawStart);
+
+            frames++;
+            auto now = std::chrono::steady_clock::now();
+            if (std::chrono::duration_cast<std::chrono::seconds>(now - lastTime).count() >= 1) {
+                std::cout << "\r                                                                                                       \r";
+                std::cout << "FPS: " << frames << " | FlagWait: " << FlagWaitTotal.count() / frames
                           << "us | Decompress: " << DecompressTotal.count() / frames
                           << "us | Draw: " << DrawTotal.count() / frames << "us" << std::flush;
                 frames = 0;
@@ -516,15 +630,22 @@ public:
     void Run(const char* localAddr) {
         bool a = Announce(const_cast<char*>(localAddr));
         if (!a) return;
+        #ifndef NOCONTROL
         inputSession.Start(const_cast<char*>(localAddr));
+        #endif
+
+        #ifndef NOAUDIO
         audioSession.Start(const_cast<char*>(localAddr));
+        #endif
+        
         Setup(const_cast<char*>(localAddr));
         m_Window->RegisterRawInputCallback([this](RAWINPUT rawInput) {
             inputSession.SendEvent(rawInput);
         }, inputSession.GetCallbackEvent());
         OpenListener(localAddr);
         ExchangePeerInfo();
-        Loop();
+        if (m_Compress) CompressLoop();
+        else Loop();
         inputSession.Stop();
         audioSession.Stop();
     }
@@ -548,6 +669,7 @@ public:
     unsigned short m_Width = 0;
     unsigned short m_Height = 0;
     unsigned short m_RefreshRate = 0;
+    bool m_Compress = false;
 
     unsigned short m_listenPort = 0;
 
@@ -576,7 +698,7 @@ private:
         mAddr.sin_port = htons(56789);
 
         if (bind(mSock, reinterpret_cast<sockaddr*>(&mAddr), sizeof(mAddr)) == SOCKET_ERROR) {
-            std::cerr << "Faield to bind socket: " << WSAGetLastError() << std::endl;
+            std::cerr << "Failed to bind socket: " << WSAGetLastError() << std::endl;
             closesocket(mSock);
             return false;
         }
@@ -620,10 +742,119 @@ private:
         return true;
     }
 
+    bool AsyncWrite(uint8_t* data) {
+        ND2_SGE sge = { 0 };
+        uint8_t flag = 0;
+
+        sge.Buffer = data;
+        sge.BufferLength = 1;
+        sge.MemoryRegionToken = m_pMr->GetLocalToken();
+
+        while (flag != 2) {
+            if (FAILED(Read(&sge, 1, remoteInfo.remoteAddr, remoteInfo.remoteToken, 0, READ_CTXT))) {
+                std::cerr << "Read failed." << std::endl;
+                return false;
+            }
+            if (!WaitForCompletionAndCheckContext(READ_CTXT)) {
+                std::cerr << "WaitForCompletion for read failed." << std::endl;
+                return false;
+            }
+
+            flag = data[0];
+            _mm_pause();
+        }
+        sge.Buffer = data;
+        sge.BufferLength = m_LengthPerFrame;
+        sge.MemoryRegionToken = m_pMr->GetLocalToken();
+
+        if (FAILED(Write(&sge, 1, remoteInfo.remoteAddr, remoteInfo.remoteToken, 0, WRITE_CTXT))) {
+            std::cerr << "Write of frame data failed." << std::endl;
+            return false;
+        }
+        if (!WaitForCompletionAndCheckContext(WRITE_CTXT)) {
+            std::cerr << "WaitForCompletion for frame data write failed." << std::endl;
+            return false;
+        }
+
+        data[0] = 1;
+        sge.Buffer = data;
+        sge.BufferLength = 1;
+        sge.MemoryRegionToken = m_pMr->GetLocalToken();
+
+        if (FAILED(Send(&sge, 1, 0, SEND_CTXT))) {
+            std::cerr << "Send of frame data failed." << std::endl;
+            return false;
+        }
+        if (!WaitForCompletionAndCheckContext(SEND_CTXT)) {
+            std::cerr << "WaitForCompletion for frame data send failed." << std::endl;
+            return false;
+        }
+
+        return true;
+    }
+
+    void CreateTextures() {
+        DesktopDuplication::Duplication& dupl = DesktopDuplication::Singleton<DesktopDuplication::Duplication>::Instance();
+
+        D3D11_TEXTURE2D_DESC yPlaneDesc = {};
+        yPlaneDesc.Width = m_Width;
+        yPlaneDesc.Height = m_Height;
+        yPlaneDesc.MipLevels = 1;
+        yPlaneDesc.ArraySize = 1;
+        yPlaneDesc.Format = DXGI_FORMAT_R8_UNORM;
+        yPlaneDesc.SampleDesc.Count = 1;
+        yPlaneDesc.SampleDesc.Quality = 0;
+        yPlaneDesc.Usage = D3D11_USAGE_STAGING;
+        yPlaneDesc.BindFlags = 0;
+        yPlaneDesc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+        yPlaneDesc.MiscFlags = 0;
+
+        D3D11_TEXTURE2D_DESC uvPlaneDesc = {};
+        uvPlaneDesc.Width = m_Width;
+        uvPlaneDesc.Height = m_Height / 2;
+        uvPlaneDesc.MipLevels = 1;
+        uvPlaneDesc.ArraySize = 1;
+        uvPlaneDesc.Format = DXGI_FORMAT_R8G8_UNORM;
+        uvPlaneDesc.SampleDesc.Count = 1;
+        uvPlaneDesc.SampleDesc.Quality = 0;
+        uvPlaneDesc.Usage = D3D11_USAGE_STAGING;
+        uvPlaneDesc.BindFlags = 0;
+        uvPlaneDesc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+        uvPlaneDesc.MiscFlags = 0;
+
+        D3D11_TEXTURE2D_DESC frameDesc = {};
+        frameDesc.Width = m_Width;
+        frameDesc.Height = m_Height;
+        frameDesc.MipLevels = 1;
+        frameDesc.ArraySize = 1;
+        frameDesc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+        frameDesc.SampleDesc.Count = 1;
+        frameDesc.SampleDesc.Quality = 0;
+        frameDesc.Usage = D3D11_USAGE_STAGING;
+        frameDesc.BindFlags = 0;
+        frameDesc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+        frameDesc.MiscFlags = 0;
+
+        ComPtr<ID3D11Device> d3dDevice = dupl.GetDevice();
+        std::array<HRESULT, 3> HResults;
+        HResults[0] = d3dDevice->CreateTexture2D(&yPlaneDesc, nullptr, m_YPlaneTexture.GetAddressOf());
+        HResults[1] = d3dDevice->CreateTexture2D(&uvPlaneDesc, nullptr, m_UVPlaneTexture.GetAddressOf());
+        HResults[2] = d3dDevice->CreateTexture2D(&frameDesc, nullptr, m_FrameTexture.GetAddressOf());
+
+        for (const auto& hr : HResults) {
+            if (FAILED(hr)) {
+                std::cerr << "Failed to create texture: " << std::hex << hr << std::endl;
+                throw std::runtime_error("Texture creation failed.");
+            }
+        }
+
+        return;
+    }
+
 public:
     TestClient() : m_CoutMutex(), inputSession(m_CoutMutex) {}
 
-    bool FindAndSendMode(char* localAddr) {
+    bool FindAndSendMode(char* localAddr, bool compress) {
         WSADATA wsaData;
         if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
             std::cerr << "WSAStartup failed: " << WSAGetLastError() << std::endl;
@@ -670,7 +901,7 @@ public:
             return false;
         }
 
-        uint16_t mode[3] = { m_Width, m_Height, m_RefreshRate };
+        uint16_t mode[4] = { m_Width, m_Height, m_RefreshRate, static_cast<uint16_t>(compress) };
         int bytesSent = send(tcpSock, reinterpret_cast<const char*>(mode), sizeof(mode), 0);
         if (bytesSent == SOCKET_ERROR) {
             std::cerr << "Failed to send mode: " << WSAGetLastError() << std::endl;
@@ -678,17 +909,25 @@ public:
             return false;
         }
 
-        std::cout << "Sent mode: " << m_Width << "x" << m_Height << " @ " << m_RefreshRate << "Hz" << std::endl;
+        std::cout << "Sent mode: " << m_Width << "x" << m_Height << " @ " << m_RefreshRate << "Hz" << " " << (compress ? "Compressed" : "Uncompressed") << std::endl;
 
         closesocket(tcpSock);
         return true;
     }
 
-    bool Setup(char* localAddr) {
+    bool Setup(char* localAddr, bool compress) {
         m_YPlaneSize = m_Width * m_Height;
         m_UVPlaneSize = m_Width * (m_Height / 2) * 2;
-        m_LengthPerFrame = m_YPlaneSize + m_UVPlaneSize;
+
+        if (compress) {
+            m_LengthPerFrame = m_YPlaneSize + m_UVPlaneSize;
+        } else {
+            m_LengthPerFrame = m_Width * m_Height * 4;
+        }
         m_BufferSize = 1 + m_LengthPerFrame;
+        m_BufferSize = m_BufferSize * 2;
+
+        CreateTextures();
 
         if (!Initialize(localAddr)) return false;
 
@@ -722,7 +961,7 @@ public:
         sprintf_s(fullServerAddress, "%s:%d", serverAddr, m_ServerPort);
 
         std::cout << "Connecting from " << localAddr << " to " << fullServerAddress << "..." << std::endl;
-        std::this_thread::sleep_for(std::chrono::seconds(1));
+        std::this_thread::sleep_for(std::chrono::seconds(2));
 
         if (FAILED(Connect(localAddr, fullServerAddress, 1, 1, nullptr, 0))) {
             std::cerr << "Connect failed." << std::endl;
@@ -786,135 +1025,159 @@ public:
         return true;
     }
 
-    void Loop() {
+    void CompressLoop() {
         std::cout << "Sending frames to the server." << std::endl;
         DesktopDuplication::Duplication& dupl = DesktopDuplication::Singleton<DesktopDuplication::Duplication>::Instance();
         ND2_SGE sge = { 0 };
 
+        auto lastProbe = std::chrono::system_clock::now();
         auto GetAndCompressTotal = std::chrono::microseconds::zero();
         auto MapTotal = std::chrono::microseconds::zero();
         auto WriteTotal = std::chrono::microseconds::zero();
         auto FlagWaitTotal = std::chrono::microseconds::zero();
+        int frames = 0;
+
+        auto YMapTotal = std::chrono::microseconds::zero();
+        auto YMemCpyTotal = std::chrono::microseconds::zero();
+        auto UVMapTotal = std::chrono::microseconds::zero();
+        auto UVMemCpyTotal = std::chrono::microseconds::zero();
+
+        bool index = 0;
+        uint8_t* buffers[] = { reinterpret_cast<uint8_t*>(m_Buf), reinterpret_cast<uint8_t*>(m_Buf) + (m_LengthPerFrame + 1) };
+
+        std::future<bool> WriteFuture;
+
+        ID3D11Texture2D* yPlane = m_YPlaneTexture.Get();
+        ID3D11Texture2D* uvPlane = m_UVPlaneTexture.Get();
 
         while (true) {
-            auto flagWaitStart = std::chrono::steady_clock::now();
-
-            uint8_t flag = 0;
-            // Wait for server to acknowledge the frame
-            sge.Buffer = m_Buf;
-            sge.BufferLength = 1;
-            sge.MemoryRegionToken = m_pMr->GetLocalToken();
-
-            while (flag != 2) {
-                if (FAILED(Read(&sge, 1, remoteInfo.remoteAddr, remoteInfo.remoteToken, 0, READ_CTXT))) {
-                    std::cerr << "Read failed." << std::endl;
-                    return;
-                }
-                if (!WaitForCompletionAndCheckContext(READ_CTXT)) {
-                    std::cerr << "WaitForCompletion for read failed." << std::endl;
-                    return;
-                }
-
-                flag = *reinterpret_cast<uint8_t*>(m_Buf);
-                _mm_pause();
-            }
-            auto flagWaitEnd = std::chrono::steady_clock::now();
-            FlagWaitTotal += std::chrono::duration_cast<std::chrono::microseconds>(flagWaitEnd - flagWaitStart);
-
+            index = !index;
+            uint8_t* thisBuffer = buffers[index];
 
             auto GetAndCompressStart = std::chrono::steady_clock::now();
-            ID3D11Texture2D* yPlane = nullptr;
-            ID3D11Texture2D* uvPlane = nullptr;
-            memset(m_Buf, 0, m_BufferSize);
 
             bool success = dupl.GetStagedTexture(yPlane, uvPlane, 1000 / m_RefreshRate);
 
-            sge.Buffer = m_Buf;
+            sge.Buffer = thisBuffer;
             sge.BufferLength = 1;
             sge.MemoryRegionToken = m_pMr->GetLocalToken();
 
-            if (!success) {
-                *reinterpret_cast<uint8_t*>(m_Buf) = 3;
-                if (FAILED(Send(&sge, 1, 0, SEND_CTXT))) {
-                    std::cerr << "Send of no frame failed." << std::endl;
-                    return;
-                }
-                if (!WaitForCompletionAndCheckContext(SEND_CTXT)) {
-                    std::cerr << "WaitForCompletion for no frame send failed." << std::endl;
-                }
-                continue;
-            }
+            if (!success) continue;
+
             auto GetAndCompressEnd = std::chrono::steady_clock::now();
             GetAndCompressTotal += std::chrono::duration_cast<std::chrono::microseconds>(GetAndCompressEnd - GetAndCompressStart);
-            
 
             auto MapStart = std::chrono::steady_clock::now();
-            uint8_t* frameData = reinterpret_cast<uint8_t*>(m_Buf);
 
-            frameData[0] = 2;
+            thisBuffer[0] = 2;
 
-            D3D11_MAPPED_SUBRESOURCE mappedResource;
-            dupl.GetContext()->Map(yPlane, 0, D3D11_MAP_READ, 0 , &mappedResource);
-            uint8_t* yDst = frameData + 1;
-            uint8_t* ySrc = reinterpret_cast<uint8_t*>(mappedResource.pData);
+            auto YMapStart = std::chrono::steady_clock::now();
+            D3D11_MAPPED_SUBRESOURCE yMappedResource;
+            D3D11_MAPPED_SUBRESOURCE uvMappedResource;
+            dupl.GetContext()->Map(yPlane, 0, D3D11_MAP_READ, 0 , &yMappedResource);
+            uint8_t* yDst = thisBuffer + 1;
+            uint8_t* ySrc = reinterpret_cast<uint8_t*>(yMappedResource.pData);
+            auto YMapEnd = std::chrono::steady_clock::now();
+            YMapTotal += std::chrono::duration_cast<std::chrono::microseconds>(YMapEnd - YMapStart);
 
+            auto YMemCpyStart = std::chrono::steady_clock::now();
+
+            auto y_copy_future = std::async(std::launch::async, [=, this]() {
+                const size_t yRowSize = static_cast<size_t>(m_Width);
+                for (unsigned int i = 0; i < m_Height; i++) {
+                    memcpy(yDst + i * yRowSize, ySrc + i * yMappedResource.RowPitch, yRowSize);
+                }
+            });
+            /*
             for (unsigned int i = 0; i < m_Height; i++) {
                 memcpy(yDst, ySrc, m_Width);
                 yDst += m_Width;
                 ySrc += mappedResource.RowPitch;
             }
+            */
+
+            //auto YMemCpyEnd = std::chrono::steady_clock::now();
+            //YMemCpyTotal += std::chrono::duration_cast<std::chrono::microseconds>(YMemCpyEnd - YMemCpyStart);
+
+            auto UVMapStart = std::chrono::steady_clock::now();
+            dupl.GetContext()->Map(uvPlane, 0, D3D11_MAP_READ, 0, &uvMappedResource);
+            uint8_t* uvDst = thisBuffer + 1 + m_YPlaneSize;
+            uint8_t* uvSrc = reinterpret_cast<uint8_t*>(uvMappedResource.pData);
+            auto UVMapEnd = std::chrono::steady_clock::now();
+            UVMapTotal += std::chrono::duration_cast<std::chrono::microseconds>(UVMapEnd - UVMapStart);
+
+            auto uv_copy_future = std::async(std::launch::async, [=, this]() {
+                const size_t uvRowSize = static_cast<size_t>(m_Width * 2);
+                for (unsigned int i = 0; i < m_Height / 2; i++) {
+                    memcpy(uvDst + i * uvRowSize, uvSrc + i * uvMappedResource.RowPitch, uvRowSize);
+                }
+            });
+
+            y_copy_future.get();
+            uv_copy_future.get();
+            auto YMemCpyEnd = std::chrono::steady_clock::now();
+            YMemCpyTotal += std::chrono::duration_cast<std::chrono::microseconds>(YMemCpyEnd - YMemCpyStart);
+            //auto UVMemCpyEnd = std::chrono::steady_clock::now();
+            //UVMemCpyTotal += std::chrono::duration_cast<std::chrono::microseconds>(UVMemCpyEnd - UVMemCpyStart);
 
             dupl.GetContext()->Unmap(yPlane, 0);
-            yPlane->Release();
-            yPlane = nullptr;
-
-            dupl.GetContext()->Map(uvPlane, 0, D3D11_MAP_READ, 0, &mappedResource);
-            uint8_t* uvDst = frameData + 1 + m_YPlaneSize;
-            uint8_t* uvSrc = reinterpret_cast<uint8_t*>(mappedResource.pData);
-
+            //yPlane->Release();
+            //yPlane = nullptr;
+            
+            /*
             for (unsigned int i = 0; i < m_Height / 2; i++) {
                 memcpy(uvDst, uvSrc, m_Width * 2);
                 uvDst += m_Width * 2;
                 uvSrc += mappedResource.RowPitch;
             }
+            */
             dupl.GetContext()->Unmap(uvPlane, 0);
-            uvPlane->Release();
-            uvPlane = nullptr;
+            //uvPlane->Release();
+            //uvPlane = nullptr;
             auto MapEnd = std::chrono::steady_clock::now();
             MapTotal += std::chrono::duration_cast<std::chrono::microseconds>(MapEnd - MapStart);
 
+            //UVMemCpyTotal += std::chrono::duration_cast<std::chrono::microseconds>(MapEnd - UVMemCpyStart);
+
             auto WriteStart = std::chrono::steady_clock::now();
-            // Send the frame data
-            sge.Buffer = m_Buf;
-            sge.BufferLength = m_BufferSize;
-            sge.MemoryRegionToken = m_pMr->GetLocalToken();
 
-            if (FAILED(Write(&sge, 1, remoteInfo.remoteAddr, remoteInfo.remoteToken, 0, WRITE_CTXT))) {
-                std::cerr << "Write of frame data failed." << std::endl;
-                return;
-            }
-            if (!WaitForCompletionAndCheckContext(WRITE_CTXT)) {
-                std::cerr << "WaitForCompletion for frame data write failed." << std::endl;
-                return;
+            if (WriteFuture.valid()) {
+                if (!WriteFuture.get()) {
+                    std::cerr << "AsyncWrite failed." << std::endl;
+                    return;
+                }
             }
 
-            *reinterpret_cast<uint8_t*>(m_Buf) = 0; // Reset the flag
-
-            sge.Buffer = m_Buf;
-            sge.BufferLength = 1;
-            sge.MemoryRegionToken = m_pMr->GetLocalToken();
-
-            *reinterpret_cast<uint8_t*>(m_Buf) = 1;
-            if (FAILED(Send(&sge, 1, 0, SEND_CTXT))) {
-                std::cerr << "Send of frame data failed." << std::endl;
-                return;
-            }
-            if (!WaitForCompletionAndCheckContext(SEND_CTXT)) {
-                std::cerr << "WaitForCompletion for frame data send failed." << std::endl;
-                return;
-            }
+            WriteFuture = std::async(std::launch::async, &TestClient::AsyncWrite, this, thisBuffer);
             auto WriteEnd = std::chrono::steady_clock::now();
             WriteTotal += std::chrono::duration_cast<std::chrono::microseconds>(WriteEnd - WriteStart);
+
+            frames++;
+
+            auto now = std::chrono::system_clock::now();
+            if (std::chrono::duration_cast<std::chrono::seconds>(now - lastProbe).count() >= 1) {
+                std::cout << "\r                                                                                                       \r";
+                std::cout << "FPS: " << frames
+                          << " | Get: " << GetAndCompressTotal.count() / frames
+                          << "us | Map: " << MapTotal.count() / frames << "us"
+                          << " | YMap: " << YMapTotal.count() / frames << "us"
+                          << " | YMemCpy: " << YMemCpyTotal.count() / frames << "us"
+                          << " | UVMap: " << UVMapTotal.count() / frames << "us"
+                          << " | UVMemCpy: " << UVMemCpyTotal.count() / frames << "us"
+                          << " | Write: " << WriteTotal.count() / frames << "us"
+                          << std::flush;
+                frames = 0;
+                FlagWaitTotal = std::chrono::microseconds(0);
+                GetAndCompressTotal = std::chrono::microseconds(0);
+                MapTotal = std::chrono::microseconds(0);
+                WriteTotal = std::chrono::microseconds(0);
+                YMapTotal = std::chrono::microseconds(0);
+                YMemCpyTotal = std::chrono::microseconds(0);
+                UVMapTotal = std::chrono::microseconds(0);
+                UVMemCpyTotal = std::chrono::microseconds(0);
+
+                lastProbe = now;
+            }            
         }
 
         Shutdown();
@@ -922,14 +1185,145 @@ public:
         g_shouldQuit.store(true);
     }
 
-    void Run(const char* localAddr, const char* serverAddr) {
-        FindAndSendMode(const_cast<char*>(localAddr));
+    void Loop() {
+        std::cout << "Sending frames to the server." << std::endl;
+        DesktopDuplication::Duplication& dupl = DesktopDuplication::Singleton<DesktopDuplication::Duplication>::Instance();
+        ND2_SGE sge = { 0 };
+
+        auto lastProbe = std::chrono::system_clock::now();
+        auto GetAndCompressTotal = std::chrono::microseconds::zero();
+        auto MapTotal = std::chrono::microseconds::zero();
+        auto WriteTotal = std::chrono::microseconds::zero();
+        auto FlagWaitTotal = std::chrono::microseconds::zero();
+
+        auto DevMapTotal = std::chrono::microseconds::zero();
+        auto MemCpyTotal = std::chrono::microseconds::zero();
+        int frames = 0;
+
+        bool index = 0;
+        uint8_t* buffers[] = { reinterpret_cast<uint8_t*>(m_Buf), reinterpret_cast<uint8_t*>(m_Buf) + (m_LengthPerFrame + 1) };
+
+        std::future<bool> WriteFuture;
+
+        ID3D11Texture2D* frameTexture = m_FrameTexture.Get();
+
+        while (true) {
+            index = !index;
+            uint8_t* thisBuffer = buffers[index];
+
+            auto GetAndCompressStart = std::chrono::steady_clock::now();
+
+            bool success = dupl.GetStagedTexture(frameTexture, 1000 / m_RefreshRate);
+
+            sge.Buffer = thisBuffer;
+            sge.BufferLength = 1;
+            sge.MemoryRegionToken = m_pMr->GetLocalToken();
+            
+            if (!success) continue; // no need to notify
+
+            auto GetAndCompressEnd = std::chrono::steady_clock::now();
+            GetAndCompressTotal += std::chrono::duration_cast<std::chrono::microseconds>(GetAndCompressEnd - GetAndCompressStart);
+            
+            auto MapStart = std::chrono::steady_clock::now();
+
+            thisBuffer[0] = 2;
+
+            auto DevMapStart = std::chrono::steady_clock::now();
+            D3D11_MAPPED_SUBRESOURCE mappedResource;
+            dupl.GetContext()->Map(frameTexture, 0, D3D11_MAP_READ, 0 , &mappedResource);
+            uint8_t* dst = thisBuffer + 1;
+            uint8_t* src = reinterpret_cast<uint8_t*>(mappedResource.pData);
+            auto DevMapEnd = std::chrono::steady_clock::now();
+            DevMapTotal += std::chrono::duration_cast<std::chrono::microseconds>(DevMapEnd - DevMapStart);
+
+            auto MemCpyStart = std::chrono::steady_clock::now();
+            const size_t rowSize = static_cast<size_t>(m_Width * 4);
+
+            const size_t avx_width = rowSize / 32;
+            const size_t remainder_width = rowSize % 32;
+
+            for (unsigned int i = 0; i < m_Height; ++i) {
+                uint8_t* p_dst_row = dst + i * rowSize;
+                uint8_t* p_src_row = src + i * mappedResource.RowPitch;
+                
+                // Process the bulk of the row in 32-byte chunks
+                for (size_t j = 0; j < avx_width; ++j) {
+                    // Load 32 bytes from the source row
+                    __m256i chunk = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(p_src_row));
+                    // Store 32 bytes to the destination row
+                    _mm256_storeu_si256(reinterpret_cast<__m256i*>(p_dst_row), chunk);
+                    p_src_row += 32;
+                    p_dst_row += 32;
+                }
+                
+                // Handle any remaining bytes that are not a multiple of 32
+                if (remainder_width > 0) {
+                    memcpy(p_dst_row, p_src_row, remainder_width);
+                }
+            }
+
+            dupl.GetContext()->Unmap(frameTexture, 0);
+            //frameTexture->Release();
+
+            auto MapEnd = std::chrono::steady_clock::now();
+            MapTotal += std::chrono::duration_cast<std::chrono::microseconds>(MapEnd - MapStart);
+            MemCpyTotal += std::chrono::duration_cast<std::chrono::microseconds>(MapEnd - MemCpyStart);
+
+            auto WriteStart = std::chrono::steady_clock::now();
+            // Start AsyncWrite()
+            if (WriteFuture.valid()) {
+                if (!WriteFuture.get()) {
+                    std::cerr << "AsyncWrite failed." << std::endl;
+                    return;
+                }
+            }
+            WriteFuture = std::async(std::launch::async, &TestClient::AsyncWrite, this, thisBuffer);
+            auto WriteEnd = std::chrono::steady_clock::now();
+            WriteTotal += std::chrono::duration_cast<std::chrono::microseconds>(WriteEnd - WriteStart);
+
+            frames++;
+
+            auto now = std::chrono::system_clock::now();
+            if (std::chrono::duration_cast<std::chrono::seconds>(now - lastProbe).count() >= 1) {
+                std::cout << "\r                                                                                                       \r";
+                std::cout << "FPS: " << frames
+                          << " | Get: " << GetAndCompressTotal.count() / frames
+                          << "us | Map: " << MapTotal.count() / frames << "us"
+                          << " | DevMap: " << DevMapTotal.count() / frames << "us"
+                          << " | MemCpy: " << MemCpyTotal.count() / frames << "us"
+                          << " | Write: " << WriteTotal.count() / frames << "us"
+                          << std::flush;
+                frames = 0;
+                FlagWaitTotal = std::chrono::microseconds(0);
+                GetAndCompressTotal = std::chrono::microseconds(0);
+                MapTotal = std::chrono::microseconds(0);
+                WriteTotal = std::chrono::microseconds(0);
+
+                DevMapTotal = std::chrono::microseconds(0);
+                MemCpyTotal = std::chrono::microseconds(0);
+
+                lastProbe = now;
+            }
+        }
+
+        Shutdown();
+
+        g_shouldQuit.store(true);
+    }
+
+    void Run(const char* localAddr, const char* serverAddr, bool compress) {
+        FindAndSendMode(const_cast<char*>(localAddr), compress);
+        #ifndef NOCONTROL
         inputSession.Start(const_cast<char*>(localAddr), serverAddr);
+        #endif
+        #ifndef NOAUDIO
         audioSession.Start(const_cast<char*>(localAddr), serverAddr);
-        Setup(const_cast<char*>(localAddr));
+        #endif
+        Setup(const_cast<char*>(localAddr), compress);
         OpenConnector(localAddr);
         ExchangePeerInfo();
-        Loop();
+        if (compress) CompressLoop();
+        else Loop();
         inputSession.Stop();
         audioSession.Stop();
     }
@@ -944,6 +1338,10 @@ public:
 
     InputNDSessionClient inputSession;
     AudioNDSessionClient audioSession;
+
+    ComPtr<ID3D11Texture2D> m_YPlaneTexture;
+    ComPtr<ID3D11Texture2D> m_UVPlaneTexture;
+    ComPtr<ID3D11Texture2D> m_FrameTexture;
 
     unsigned short m_Width = 0;
     unsigned short m_Height = 0;
@@ -1066,6 +1464,7 @@ bool SpawnProcessInActiveSession(const wchar_t* processPath, int argc, char* arg
 
     return true;
 }
+
 int main(int argc, char* argv[]) {
     #ifdef _DEBUG
     while (!IsDebuggerPresent()) {
@@ -1082,7 +1481,7 @@ int main(int argc, char* argv[]) {
         if (argc != 3) { ShowUsage(); return 1; }
         isServer = true;
     } else if (strcmp(argv[1], "-c") == 0) {
-        if (argc != 4) { ShowUsage(); return 1; }
+        if (argc != 5) { ShowUsage(); return 1; }
         isServer = false;
     } else {
         ShowUsage();
@@ -1104,42 +1503,20 @@ int main(int argc, char* argv[]) {
     if (isServer) {
         TestServer server;
         server.Run(argv[2]);
-
-    } else { // Client
-        /*
-        // Hardcoded path to the executable
-        const wchar_t* processPath = L"C:\\Shares\\Inspur_ws\\main.exe";
-
-        // Get the current process's username
-        std::wstring currentUsername;
-        if (!GetCurrentProcessUsername(currentUsername)) {
-            return 1;
-        }
-
-        // Get the active user's username
-        std::wstring activeUsername;
-        if (!GetActiveUserUsername(activeUsername)) {
-            return 1;
-        }
-
-        // Compare the usernames
-        if (currentUsername != activeUsername) {
-            std::wcout << L"Current user (" << currentUsername << L") does not match active user (" << activeUsername << L")." << std::endl;
-            std::wcout << L"Spawning process in active user's session..." << std::endl;
-
-            if (SpawnProcessInActiveSession(processPath, argc, argv)) {
-                std::wcout << L"Process spawned successfully. Exiting current instance." << std::endl;
-                return 0; // Exit the current instance
-            } else {
-                std::cerr << "Failed to spawn process in active user's session." << std::endl;
-                return 1;
-            }
-        }
-
-        std::wcout << L"Current user matches active user. Continuing execution..." << std::endl;
-        */
+    } else {
         TestClient client;
-        client.Run(argv[2], argv[3]);
+        bool compress = false;
+
+        if (_stricmp(argv[4], "r") == 0) {
+            compress = false;
+        } else if (_stricmp(argv[4], "c") == 0) {
+            compress = true;
+        } else {
+            std::cerr << "Invalid compression flag. Use 'r' for raw or 'c' for compressed." << std::endl;
+            return 1;
+        }
+
+        client.Run(argv[2], argv[3], compress);
     }
 
     NdCleanup();
