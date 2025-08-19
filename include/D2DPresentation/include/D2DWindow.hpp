@@ -56,6 +56,8 @@ namespace D2DPresentation {
         HWND GetHwnd() const { return m_hwnd; }
 
         void RegisterRawInputCallback(std::function<void(RAWINPUT)> callback, HANDLE hEvent) {
+            if (!callback || !hEvent) return;
+
             m_rawInputCallback = callback;
             m_hCallbackEvent = hEvent;
         }

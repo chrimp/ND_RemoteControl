@@ -129,6 +129,7 @@ HRESULT NDSessionBase::CreateQP(DWORD receiveQueueDepth, DWORD initiatorQueueDep
 
 bool NDSessionBase::Initialize(char* localAddr) {
     struct sockaddr_in addr = { 0 };
+    addr.sin_family = AF_INET;
     int len = sizeof(addr);
     WSAStringToAddress(localAddr, AF_INET, nullptr, reinterpret_cast<struct sockaddr*>(&addr), &len);
 

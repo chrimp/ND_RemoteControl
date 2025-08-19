@@ -23,9 +23,6 @@
 #undef max
 #undef min
 
-#define NOCONTROL
-#define NOAUDIO
-
 std::atomic<bool> g_shouldQuit = false;
 
 bool SaveFrameFromBuffer(const std::filesystem::path& path, ID3D11Texture2D* tex);
@@ -638,7 +635,7 @@ public:
         audioSession.Start(const_cast<char*>(localAddr));
         #endif
         
-        Setup(const_cast<char*>(localAddr));
+        if (!Setup(const_cast<char*>(localAddr))) return;
         m_Window->RegisterRawInputCallback([this](RAWINPUT rawInput) {
             inputSession.SendEvent(rawInput);
         }, inputSession.GetCallbackEvent());
