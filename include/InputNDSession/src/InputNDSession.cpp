@@ -109,7 +109,7 @@ void InputNDSessionServer::SendEvent(RAWINPUT input) {
             m_Mouse.y.fetch_add(static_cast<short>(input.data.mouse.lLastY));
             #endif
             m_Mouse.wheel.fetch_add(input.data.mouse.usButtonData);
-            m_Mouse.buttonFlags.store(input.data.mouse.ulButtons); // Let receiver handle
+            m_Mouse.buttonFlags.fetch_or(input.data.mouse.ulButtons); // Let receiver handle
             m_Mouse.absolute.store(input.data.mouse.usFlags & MOUSE_MOVE_ABSOLUTE);
 
             break;
@@ -188,7 +188,6 @@ void InputNDSessionServer::SendEvent(RAWINPUT input) {
             }
 
             m_Keyboard.scanCode.store(input.data.keyboard.MakeCode);
-            m_Keyboard.down.store(input.data.keyboard.Flags & RI_KEY_BREAK ? 1 : 0); // Key up if RI_KEY_BREAK, down otherwise
             
             switch (input.data.keyboard.Flags) {
                 case RI_KEY_MAKE:
@@ -247,7 +246,7 @@ void InputNDSessionServer::Loop() {
             m_Mouse.y.exchange(0),
             m_Mouse.wheel.exchange(0),
             m_Mouse.absolute.exchange(false),
-            m_Mouse.buttonFlags.load()
+            m_Mouse.buttonFlags.exchange(0)
         };
 
         packet->key = {
