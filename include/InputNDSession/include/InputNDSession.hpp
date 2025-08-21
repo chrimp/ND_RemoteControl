@@ -18,24 +18,28 @@ class InputNDSessionServer : private NDSessionServerBase {
         std::atomic<short> x;
         std::atomic<short> y;
         std::atomic<short> wheel;
+        std::atomic<bool> absolute;
         std::atomic<ULONG> buttonFlags;
     };
 
-    struct AtmoicKeyboard {
-        std::atomic<unsigned char> vk;
+    struct AtomicKeyboard {
+        std::atomic<unsigned short> scanCode;
         std::atomic<unsigned char> down; // 0 - down, 1 - up, 2 - nothing
+        std::atomic<bool> isE0;
     };
 
     struct MousePacket {
         short x;
         short y;
         short wheel;
+        bool absolute;
         ULONG buttonFlags;
     };
 
     struct KeyPacket {
-        unsigned char vk; // 1-254
+        unsigned short scanCode;
         unsigned char down; // 0 - down, 1 - up, 2 - nothing
+        bool isE0;
     };
 
     struct Packet {
@@ -90,7 +94,7 @@ class InputNDSessionServer : private NDSessionServerBase {
 
     std::atomic<bool> m_working = false;
     AtomicMouse m_Mouse = {0, 0, 0, 0};
-    AtmoicKeyboard m_Keyboard = {0, 2}; // 2 - nothing
+    AtomicKeyboard m_Keyboard = {0, 2}; // 2 - nothing
 
     HANDLE m_hCallbackEvent = nullptr;
 
@@ -101,12 +105,14 @@ class InputNDSessionClient : private NDSessionClientBase {
     struct MousePacket {
         short x;
         short y;
-        char wheel;
+        short wheel;
+        bool absolute;
         ULONG buttonFlags;
     };
     struct KeyPacket {
-        unsigned char vk; // 1-254
+        unsigned short scanCode;
         unsigned char down; // 0 - down, 1 - up, 2 - nothing
+        bool isE0;
     };
 
     struct Packet {

@@ -1,4 +1,5 @@
 #include "../include/D2DWindow.hpp"
+#include <minwindef.h>
 #include <objbase.h>
 #include <windowsx.h>
 #include <hidusage.h>
@@ -197,13 +198,16 @@ LRESULT CALLBACK D2DWindow::StaticWndProc(HWND hWnd, UINT message, WPARAM wParam
     return DefWindowProc(hWnd, message, wParam, lParam);
 }
 
-static bool bDoNotTrap = false;
+static bool bDoNotTrap = true;
 
 LRESULT CALLBACK D2DWindow::WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) {
     switch (message) {
         case WM_NCLBUTTONDOWN:
+            #ifdef ABSCURSOR
             // Prevent cursor trap
             bDoNotTrap = true;
+            ShowCursor(true);
+            #endif
             break;
         case WM_CLOSE:
             if (m_cursorTrapped) {
@@ -228,7 +232,12 @@ LRESULT CALLBACK D2DWindow::WndProc(HWND hWnd, UINT message, WPARAM wParam, LPAR
                 return 0;
             }
             UINT dwSize = 0;
-            GetRawInputData(reinterpret_cast<HRAWINPUT>(lParam), RID_INPUT, nullptr, &dwSize, sizeof(RAWINPUTHEADER));
+            UINT res = GetRawInputData(reinterpret_cast<HRAWINPUT>(lParam), RID_INPUT, nullptr, &dwSize, sizeof(RAWINPUTHEADER));
+            if (res == -1) {
+                volatile LONG error = GetLastError();
+                throw std::exception();
+            }
+
             std::vector<BYTE> lpb(dwSize);
 
             if (GetRawInputData(reinterpret_cast<HRAWINPUT>(lParam), RID_INPUT, lpb.data(), &dwSize, sizeof(RAWINPUTHEADER)) != dwSize) {
@@ -236,6 +245,28 @@ LRESULT CALLBACK D2DWindow::WndProc(HWND hWnd, UINT message, WPARAM wParam, LPAR
                 throw std::exception();
             }
             RAWINPUT* rawInput = reinterpret_cast<RAWINPUT*>(lpb.data());
+
+            #ifdef ABSCURSOR
+            if (rawInput->header.dwType == RIM_TYPEMOUSE) {
+                POINT pos;
+                bool success = GetCursorPos(&pos);
+
+                if (!success) {
+                    volatile LONG error = GetLastError();
+                    throw std::exception();
+                }
+
+                success = ScreenToClient(hWnd, &pos);
+                if (!success) {
+                    volatile LONG error = GetLastError();
+                    throw std::exception();
+                }
+
+                rawInput->data.mouse.lLastX = pos.x;
+                rawInput->data.mouse.lLastY = pos.y;
+                rawInput->data.mouse.usFlags |= MOUSE_MOVE_ABSOLUTE;
+            }
+            #endif
 
             if (m_rawInputCallback) {
                 m_rawInputCallback(*rawInput);
@@ -246,7 +277,10 @@ LRESULT CALLBACK D2DWindow::WndProc(HWND hWnd, UINT message, WPARAM wParam, LPAR
             break;
         }
         case WM_LBUTTONDOWN:
+            #ifndef ABSCURSOR
             bDoNotTrap = false;
+            #endif
+            while(ShowCursor(false) >= 0);
             // fallthrough        
         case WM_SETFOCUS:
             if (bDoNotTrap) return 0;

@@ -577,6 +577,7 @@ public:
 
                 m_Renderer->SetSourceSurface(m_FrameTexture.Get());
 
+
                 D3D11_TEXTURE2D_DESC desc;
                 m_FrameTexture->GetDesc(&desc);
             } else {
@@ -594,6 +595,7 @@ public:
 
             frames++;
             auto now = std::chrono::steady_clock::now();
+            /*
             if (std::chrono::duration_cast<std::chrono::seconds>(now - lastTime).count() >= 1) {
                 std::cout << "\r                                                                                                       \r";
                 std::cout << "FPS: " << frames << " | FlagWait: " << FlagWaitTotal.count() / frames
@@ -605,6 +607,7 @@ public:
                 DrawTotal = std::chrono::microseconds(0);
                 lastTime = now;
             }
+            */
 
             if (_kbhit()) {
                 char c = _getch();
@@ -1281,6 +1284,7 @@ public:
             frames++;
 
             auto now = std::chrono::system_clock::now();
+            /*
             if (std::chrono::duration_cast<std::chrono::seconds>(now - lastProbe).count() >= 1) {
                 std::cout << "\r                                                                                                       \r";
                 std::cout << "FPS: " << frames
@@ -1301,6 +1305,7 @@ public:
 
                 lastProbe = now;
             }
+            */
         }
 
         Shutdown();

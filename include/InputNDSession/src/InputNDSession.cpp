@@ -1,7 +1,11 @@
 #include "InputNDSession.hpp"
 
 #include <emmintrin.h>
+#include <exception>
+#include <ios>
 #include <windows.h>
+#include <winnt.h>
+#include <winuser.h>
 
 #ifdef _DEBUG
 #undef FAILED
@@ -97,57 +101,94 @@ static UINT KeyFlags = 0;
 void InputNDSessionServer::SendEvent(RAWINPUT input) {
     switch (input.header.dwType) {
         case RIM_TYPEMOUSE: {
+            #ifdef ABSCURSOR
+            m_Mouse.x.store(static_cast<short>(input.data.mouse.lLastX));
+            m_Mouse.y.store(static_cast<short>(input.data.mouse.lLastY));
+            #else
             m_Mouse.x.fetch_add(static_cast<short>(input.data.mouse.lLastX));
             m_Mouse.y.fetch_add(static_cast<short>(input.data.mouse.lLastY));
+            #endif
             m_Mouse.wheel.fetch_add(input.data.mouse.usButtonData);
             m_Mouse.buttonFlags.store(input.data.mouse.ulButtons); // Let receiver handle
+            m_Mouse.absolute.store(input.data.mouse.usFlags & MOUSE_MOVE_ABSOLUTE);
+
             break;
         }
 
         case RIM_TYPEKEYBOARD: {
-            switch (input.data.keyboard.VKey) {
-                case VK_MENU:
-                    if (input.data.keyboard.Flags == RI_KEY_MAKE) {
-                        isAlt = true;
-                        isLastAlt = false;
-                        KeyFlags |= VK_MENU;
-                    }
-                    else if (input.data.keyboard.Flags == RI_KEY_BREAK) {
-                        isAlt = false;
-                        KeyFlags &= ~VK_MENU;
+            switch (input.data.keyboard.MakeCode) {
+                case 0x38: // Alt key
+                    if (input.data.keyboard.Flags & RI_KEY_BREAK) {
+                        KeyFlags &= ~0x38;
+                    } else {
+                        KeyFlags |= 0x38;
                     }
                     break;
-                case VK_TAB:
-                    if (input.data.keyboard.Flags == RI_KEY_MAKE) {
-                        isTab = true;
-                        isLastAlt = true;
-                        KeyFlags |= VK_TAB;
+                case 0x0F: // Tab key
+                    if (input.data.keyboard.Flags & RI_KEY_BREAK) {
+                        KeyFlags &= ~0x0F;
+                    } else {
+                        KeyFlags |= 0x0F;
                     }
-                    else if (input.data.keyboard.Flags == RI_KEY_BREAK) {
-                        isTab = false;
-                        KeyFlags &= ~VK_TAB;
+                    break;
+                case 0x1D: // Ctrl key
+                    if (input.data.keyboard.Flags & RI_KEY_BREAK) {
+                        KeyFlags &= ~0x1D;
+                    } else {
+                        KeyFlags |= 0x1D;
+                    }
+                    break;
+                case 0x2A: // Left Shift key
+                case 0x36: // Right Shift key
+                    if (input.data.keyboard.Flags & RI_KEY_BREAK) {
+                        KeyFlags &= ~(0x2A | 0x36); // Clear both shift flags
+                    } else {
+                        KeyFlags |= (input.data.keyboard.MakeCode == 0x2A ? 0x2A : 0x36);
+                    }
+                    break;
+                case 0x2D: // X key
+                    if (input.data.keyboard.Flags & RI_KEY_BREAK) {
+                        KeyFlags &= ~0x2D;
+                    } else {
+                        KeyFlags |= 0x2D;
                     }
                     break;
             }
 
-            if (isAlt && isTab) { // Do not send Alt+Tab
-                if (isLastAlt) { // Send Registered key depress
-                    m_Keyboard.vk.store(static_cast<unsigned char>(VK_MENU));
-                    m_Keyboard.down.store(1);
-                    std::cout << "INPUT: Sending lift Alt" << std::endl;
-                } else {
-                    m_Keyboard.vk.store(static_cast<unsigned char>(VK_TAB));
-                    m_Keyboard.down.store(1);
-                    std::cout << "INPUT: Sending lift Tab" << std::endl;
-                }
-                isAlt = false;
-                isTab = false;
-                isLastAlt = false; // Reset last Alt
-
+            // Check for Alt+Tab
+            if ((KeyFlags & 0x38) && (KeyFlags & 0x0F) && input.data.keyboard.MakeCode == 0x0F && 
+                !(input.data.keyboard.Flags & RI_KEY_BREAK)) {
+                
+                std::cout << "INPUT: Alt+Tab detected, blocking" << std::endl;
+                
+                m_Keyboard.scanCode.store(input.data.keyboard.MakeCode);
+                m_Keyboard.down.store(3); // Special value to indicate blocked combination
+                m_Keyboard.isE0.store((input.data.keyboard.Flags & RI_KEY_E0) != 0);
+                
+                // Unclip & show cursor
+                ClipCursor(nullptr);
+                while (ShowCursor(true) < 0);
                 return;
             }
 
-            m_Keyboard.vk.store(static_cast<unsigned char>(input.data.keyboard.VKey));
+            // Check for Ctrl+Alt+Shift+X
+            if ((KeyFlags & 0x1D) && (KeyFlags & 0x38) && (KeyFlags & (0x2A | 0x36)) && (KeyFlags & 0x2D) &&
+                input.data.keyboard.MakeCode == 0x2D && !(input.data.keyboard.Flags & RI_KEY_BREAK)) {
+                
+                std::cout << "INPUT: Ctrl+Alt+Shift+X detected, blocking" << std::endl;
+                
+                m_Keyboard.scanCode.store(input.data.keyboard.MakeCode);
+                m_Keyboard.down.store(3); // Special value to indicate blocked combination
+                m_Keyboard.isE0.store((input.data.keyboard.Flags & RI_KEY_E0) != 0);
+
+                ClipCursor(nullptr);
+                while (ShowCursor(true) < 0);
+                
+                return;
+            }
+
+            m_Keyboard.scanCode.store(input.data.keyboard.MakeCode);
+            m_Keyboard.down.store(input.data.keyboard.Flags & RI_KEY_BREAK ? 1 : 0); // Key up if RI_KEY_BREAK, down otherwise
             
             switch (input.data.keyboard.Flags) {
                 case RI_KEY_MAKE:
@@ -205,12 +246,13 @@ void InputNDSessionServer::Loop() {
             m_Mouse.x.exchange(0),
             m_Mouse.y.exchange(0),
             m_Mouse.wheel.exchange(0),
+            m_Mouse.absolute.exchange(false),
             m_Mouse.buttonFlags.load()
         };
 
         packet->key = {
-            m_Keyboard.vk.load(),
-            m_Keyboard.down.load()
+            m_Keyboard.scanCode.exchange(0),
+            m_Keyboard.down.exchange(2)
         };
 
         auto flagWaitStart = std::chrono::steady_clock::now();
@@ -230,6 +272,9 @@ void InputNDSessionServer::Loop() {
 
         auto flagWaitEnd = std::chrono::steady_clock::now();
         flagWaitTotal += std::chrono::duration_cast<std::chrono::microseconds>(flagWaitEnd - flagWaitStart);
+
+        std::cout << "\r                                                                                                       \r";
+        std::cout << "Mouse position: " << packet->mouse.x << ", " << packet->mouse.y << std::flush;
     
         //ND2_SGE sge = { m_Buf, INPUT_EVENT_BUFFER_SIZE, m_pMr->GetLocalToken() };
         if (FAILED(Send(&sge, 1, 0, SEND_CTXT))) {
@@ -371,6 +416,19 @@ void InputNDSessionClient::ExchangePeerInfo() {
     memset(m_Buf, 0, INPUT_EVENT_BUFFER_SIZE);
 }
 
+void LiftAllKeys() {
+    INPUT input = {0};
+    input.type = INPUT_KEYBOARD;
+    input.ki.dwFlags = KEYEVENTF_KEYUP;
+
+    for (int i = 0; i < 2555; ++i) {
+        if (GetAsyncKeyState(i) & 0x8000) {
+            input.ki.wVk = i;
+            SendInput(1, &input, sizeof(INPUT));
+        }
+    }
+}
+
 void InputNDSessionClient::Loop() {
     auto lastprobe = std::chrono::steady_clock::now();
     unsigned int count = 0;
@@ -421,7 +479,7 @@ void InputNDSessionClient::Loop() {
         KeyPacket key = received->key;
 
         bool shouldMouse = (mouse.x != 0 || mouse.y != 0 || mouse.wheel != 0 || mouse.buttonFlags != 0);
-        bool shouldKey = (key.vk != 0 && key.down != 2);
+        bool shouldKey = (key.scanCode != 0 && key.down != 2);
 
         if (!shouldMouse && !shouldKey) {
             continue; // Nothing to do
@@ -479,36 +537,70 @@ void InputNDSessionClient::Loop() {
                     break;
             }
 
+            std::cout << "\r                                                                              \r";
+            std::cout << "INPUT: x: " << mouse.x << ", y: " << mouse.y << " abs: " << std::boolalpha << mouse.absolute << std::flush;
+
+            if (mouse.absolute) {
+                input.mi.dwFlags |= MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_MOVE;
+                input.mi.dx = (mouse.x * 65536) / GetSystemMetrics(SM_CXSCREEN);
+                input.mi.dy = (mouse.y * 65536) / GetSystemMetrics(SM_CYSCREEN);
+            } else {
+                input.mi.dwFlags |= MOUSEEVENTF_MOVE;
+            }
+
+            SetLastError(0);
             if (SendInput(1, &input, sizeof(INPUT)) == 0) {
                 DWORD error = GetLastError();
-                if (error == ERROR_ACCESS_DENIED) {
-                    std::cout << "INPUT: " << "SendInput failed with ERROR_ACCESS_DENIED, trying to change desktop." << std::endl;
-                    HDESK hDesk = OpenInputDesktop(0, FALSE, GENERIC_ALL);
+                if (error == ERROR_ACCESS_DENIED || error == 0) {
+                    std::cout << "INPUT: SendInput ACCESS_DENIED, attempting desktop change." << std::endl;
+
                     WCHAR name[256];
                     DWORD needed = 0;
+                    HDESK hDesk = nullptr;
 
-                    if (hDesk && GetUserObjectInformationW(hDesk, UOI_NAME, name, sizeof(name), &needed)) {
-                        CloseDesktop(hDesk);
-
-                        std::wcout << L"INPUT: " << L"New desktop name: " << std::wstring(name, needed / sizeof(WCHAR)) << std::endl;
-
-                        HDESK hNewDesk = OpenDesktopW(name, 0, FALSE, GENERIC_ALL);
-                        SetThreadDesktop(hNewDesk);
-                        CloseDesktop(hNewDesk);
-
-                        if (SendInput(1, &input, sizeof(INPUT)) == 0) {
-                            std::cerr << "INPUT: " << "SendInput failed after desktop change: " << GetLastError() << std::endl;
-                            abort();
+                    // Retry open/query loop if OpenInputDesktop fails or GetUserObjectInformationW fails with ERROR_INVALID_HANDLE (6)
+                    for (;;) {
+                        hDesk = OpenInputDesktop(0, FALSE, GENERIC_ALL);
+                        if (!hDesk) {
+                            DWORD ge = GetLastError();
+                            if (ge == ERROR_INVALID_HANDLE) { Sleep(50); continue; }
+                            std::cerr << "INPUT: OpenInputDesktop failed. Error: " << ge << std::endl;
                             break;
                         }
-                    } else {
+                        if (!GetUserObjectInformationW(hDesk, UOI_NAME, name, sizeof(name), &needed)) {
+                            DWORD ge = GetLastError();
+                            CloseDesktop(hDesk);
+                            hDesk = nullptr;
+                            if (ge == ERROR_INVALID_HANDLE) { Sleep(50); continue; }
+                            std::cerr << "INPUT: GetUserObjectInformationW failed. Error: " << ge << std::endl;
+                            break;
+                        }
+                        break;
+                    }
+
+                    if (hDesk) {
                         CloseDesktop(hDesk);
-                        std::cerr << "INPUT: " << "Failed to get desktop name. Error: " << GetLastError() << std::endl;
+                        HDESK hNewDesk = OpenDesktopW(name, 0, FALSE, GENERIC_ALL);
+                        if (hNewDesk) {
+                            if (!SetThreadDesktop(hNewDesk)) {
+                                DWORD ge = GetLastError();
+                                CloseDesktop(hNewDesk);
+                                std::cerr << "INPUT: SetThreadDesktop failed. Error: " << ge << std::endl;
+                            } else {
+                                CloseDesktop(hNewDesk);
+                                SetLastError(0);
+                                if (SendInput(1, &input, sizeof(INPUT)) == 0) {
+                                    std::cerr << "INPUT: SendInput failed after desktop change: " << GetLastError() << std::endl;
+                                    abort();
+                                }
+                            }
+                        } else {
+                            std::cerr << "INPUT: OpenDesktopW failed. Error: " << GetLastError() << std::endl;
+                        }
                     }
                 } else {
-                    std::cerr << "INPUT: " << "SendInput failed with error: " << std::dec << error << std::endl;
+                    std::cerr << "INPUT: SendInput failed. Error: " << error << std::endl;
                     abort();
-                    break;
                 }
             }
         }
@@ -517,21 +609,21 @@ void InputNDSessionClient::Loop() {
         if (shouldKey) {
             INPUT input = {0};
             input.type = INPUT_KEYBOARD;
-            input.ki.wVk = key.vk;
+            input.ki.wScan = key.scanCode;
 
             if (key.down == 0) { // Key down
-                input.ki.dwFlags = 0; // Key down
+                input.ki.dwFlags = KEYEVENTF_SCANCODE; // Key down
             } else if (key.down == 1) { // Key up
-                input.ki.dwFlags = KEYEVENTF_KEYUP; // Key up
+                input.ki.dwFlags = KEYEVENTF_SCANCODE | KEYEVENTF_KEYUP; // Key up
+            } else if (key.down == 3) {
+                LiftAllKeys();
             } else {
                 continue; // No change, skip
             }
 
-            #ifdef _DEBUG
-            if (key.vk != 0 && key.down == 2) {
-                throw std::runtime_error("Unexpected key state.");
-            }
-            #endif
+            if (key.isE0) {
+                input.ki.dwFlags |= KEYEVENTF_EXTENDEDKEY;
+            } // E0
 
             if (SendInput(1, &input, sizeof(INPUT)) == 0) {
                 DWORD error = GetLastError();
