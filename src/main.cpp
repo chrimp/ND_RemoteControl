@@ -475,8 +475,8 @@ public:
 
                 D3D11_TEXTURE2D_DESC desc;
                 m_FrameTexture->GetDesc(&desc);
-            } else if (flag == 3) {
-                continue;
+            } else {
+                throw std::exception();
             }
             auto decompressEnd = std::chrono::steady_clock::now();
             DecompressTotal += std::chrono::duration_cast<std::chrono::microseconds>(decompressEnd - decompressStart);
