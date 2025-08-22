@@ -5,6 +5,7 @@
 #include <hidusage.h>
 #include <iostream>
 #include <dwmapi.h>
+#define ABSCURSOR
 
 #pragma comment(lib, "dwmapi.lib")
 
@@ -203,11 +204,9 @@ static bool bDoNotTrap = true;
 LRESULT CALLBACK D2DWindow::WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) {
     switch (message) {
         case WM_NCLBUTTONDOWN:
-            #ifdef ABSCURSOR
             // Prevent cursor trap
             bDoNotTrap = true;
             ShowCursor(true);
-            #endif
             break;
         case WM_CLOSE:
             if (m_cursorTrapped) {

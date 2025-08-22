@@ -595,9 +595,8 @@ public:
 
             frames++;
             auto now = std::chrono::steady_clock::now();
-            /*
             if (std::chrono::duration_cast<std::chrono::seconds>(now - lastTime).count() >= 1) {
-                std::cout << "\r                                                                                                       \r";
+                std::cout << "\r                                                                                                                \r";
                 std::cout << "FPS: " << frames << " | FlagWait: " << FlagWaitTotal.count() / frames
                           << "us | Decompress: " << DecompressTotal.count() / frames
                           << "us | Draw: " << DrawTotal.count() / frames << "us" << std::flush;
@@ -607,8 +606,6 @@ public:
                 DrawTotal = std::chrono::microseconds(0);
                 lastTime = now;
             }
-            */
-
             if (_kbhit()) {
                 char c = _getch();
                 if (c == 'q' || c == 'Q') {
@@ -1284,9 +1281,8 @@ public:
             frames++;
 
             auto now = std::chrono::system_clock::now();
-            /*
             if (std::chrono::duration_cast<std::chrono::seconds>(now - lastProbe).count() >= 1) {
-                std::cout << "\r                                                                                                       \r";
+                std::cout << "\r                                                                                                                \r";
                 std::cout << "FPS: " << frames
                           << " | Get: " << GetAndCompressTotal.count() / frames
                           << "us | Map: " << MapTotal.count() / frames << "us"
@@ -1305,7 +1301,6 @@ public:
 
                 lastProbe = now;
             }
-            */
         }
 
         Shutdown();

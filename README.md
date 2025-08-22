@@ -29,7 +29,7 @@ Command-line:
 Two cursor control modes:
 
 - Gaming Mode (default build): cursor is clipped to the window and uses raw input for minimal latency.
-- Remote Desktop Mode: free cursor handling; higher latency (no raw input). Enable by building with the `ABSCURSOR` macro.
+- Remote Desktop Mode: free cursor handling; higher latency (no raw input). Enable by add the `ABSCURSOR` macro in InputNDSession.cpp and D2DWindow.cpp.
 
 ## Audio
 Client primary audio device should be 48 kHz, 16-bit stereo.

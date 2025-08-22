@@ -1,4 +1,5 @@
 #include "InputNDSession.hpp"
+#define ABSCURSOR
 
 #include <emmintrin.h>
 #include <exception>
@@ -91,10 +92,6 @@ void InputNDSessionServer::ExchangePeerInfo() {
 
     memset(m_Buf, 0, INPUT_EVENT_BUFFER_SIZE);
 }
-
-static bool isAlt = false;
-static bool isTab = false;
-static bool isLastAlt = false;
 
 static UINT KeyFlags = 0;
 
@@ -199,10 +196,12 @@ void InputNDSessionServer::SendEvent(RAWINPUT input) {
                 case RI_KEY_E0:
                 case RI_KEY_E1:
                     m_Keyboard.down.store(0);
+                    m_Keyboard.isE0.store(true);
                     break;
                 case RI_KEY_E0 + 1:
                 case RI_KEY_E1 + 1:
                     m_Keyboard.down.store(1);
+                    m_Keyboard.isE0.store(true);
                     break;
                 default:
                     m_Keyboard.down.store(2); // No change
@@ -223,7 +222,7 @@ void InputNDSessionServer::Loop() {
     packet->key = { 0, 2 }; // 2 - nothing
 
     ND2_SGE flagSge = { m_Buf, 1, m_pMr->GetLocalToken() };
-    ND2_SGE sge = { m_Buf, sizeof(Packet), m_pMr->GetLocalToken() };
+    ND2_SGE sge = { reinterpret_cast<uint8_t*>(m_Buf) + 1, sizeof(Packet), m_pMr->GetLocalToken() };
     volatile uint8_t* flag = reinterpret_cast<uint8_t*>(m_Buf);
     flag[0] = 0; // Reset flag
     _mm_clflush(m_Buf);
@@ -251,9 +250,10 @@ void InputNDSessionServer::Loop() {
 
         packet->key = {
             m_Keyboard.scanCode.exchange(0),
-            m_Keyboard.down.exchange(2)
+            m_Keyboard.down.exchange(2),
+            m_Keyboard.isE0.exchange(false)
         };
-
+        
         auto flagWaitStart = std::chrono::steady_clock::now();
         while (flag[0] != 1) {
             if (FAILED(Read(&flagSge, 1, remoteInfo.remoteAddr, remoteInfo.remoteToken, 0, READ_CTXT))) {
@@ -271,9 +271,6 @@ void InputNDSessionServer::Loop() {
 
         auto flagWaitEnd = std::chrono::steady_clock::now();
         flagWaitTotal += std::chrono::duration_cast<std::chrono::microseconds>(flagWaitEnd - flagWaitStart);
-
-        std::cout << "\r                                                                                                       \r";
-        std::cout << "Mouse position: " << packet->mouse.x << ", " << packet->mouse.y << std::flush;
     
         //ND2_SGE sge = { m_Buf, INPUT_EVENT_BUFFER_SIZE, m_pMr->GetLocalToken() };
         if (FAILED(Send(&sge, 1, 0, SEND_CTXT))) {
@@ -433,7 +430,7 @@ void InputNDSessionClient::Loop() {
     unsigned int count = 0;
     unsigned char sgeCount = 0;
 
-    ND2_SGE sge = { m_Buf, sizeof(Packet), m_pMr->GetLocalToken() };
+    ND2_SGE sge = { reinterpret_cast<uint8_t*>(m_Buf) + 1, sizeof(Packet), m_pMr->GetLocalToken() };
     for (int i = 0; i < 20; i++) {
         HRESULT hr = PostReceive(&sge, 1, RECV_CTXT);
         if (FAILED(hr)) {
@@ -445,7 +442,7 @@ void InputNDSessionClient::Loop() {
     sgeCount += 20;
 
     uint8_t* flag = reinterpret_cast<uint8_t*>(m_Buf); // 0 = Cannot accomodate 1 = Good to go
-    Packet* received = reinterpret_cast<Packet*>(reinterpret_cast<uint8_t*>(m_Buf) + 1); // Buffer for MousePacket
+    Packet* received = reinterpret_cast<Packet*>(reinterpret_cast<uint8_t*>(m_Buf) + 1);
 
     while (m_isRunning && !g_shouldQuit.load()) {
         if (sgeCount < 10) {
@@ -535,9 +532,6 @@ void InputNDSessionClient::Loop() {
                     #endif
                     break;
             }
-
-            std::cout << "\r                                                                              \r";
-            std::cout << "INPUT: x: " << mouse.x << ", y: " << mouse.y << " abs: " << std::boolalpha << mouse.absolute << std::flush;
 
             if (mouse.absolute) {
                 input.mi.dwFlags |= MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_MOVE;
@@ -670,6 +664,7 @@ void InputNDSessionClient::Loop() {
         }
         */
     }
+    LiftAllKeys();
     g_shouldQuit.store(true);
 }
 
