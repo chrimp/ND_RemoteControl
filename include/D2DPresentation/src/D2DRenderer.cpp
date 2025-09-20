@@ -354,7 +354,7 @@ HRESULT D2DRenderer::createD3DDeviceAndSwapChain(IDXGIAdapter* pAdapter) {
     swapChainDesc.Flags = DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
 
     UINT flags = 0;
-    #ifdef _DEBUG
+    #if defined(_DEBUG) && !defined(NDR_SERVICE)
     flags |= D3D11_CREATE_DEVICE_DEBUG;
     #endif
 

@@ -18,6 +18,25 @@
 #include <ws2tcpip.h>
 #include <future>
 
+void SetupConsole() {
+    if (!AllocConsole()) {
+        std::string reason = "AllocConsole failed with error: " + std::to_string(GetLastError());
+        throw std::runtime_error(reason);
+    };
+    FILE* fp;
+    freopen_s(&fp, "CONOUT$", "w", stdout);
+    freopen_s(&fp, "CONOUT$", "w", stderr);
+
+    setvbuf(stdout, NULL, _IONBF, 0);
+    setvbuf(stderr, NULL, _IONBF, 0);
+}
+
+//#define DPRINT(x) printf("%s\n", x); fflush(stdout);
+#define DPRINT(x)
+
+//#define NOCONTROL
+//#define NOAUDIO
+
 #pragma comment(lib, "ws2_32.lib")
 
 #undef max
@@ -436,7 +455,7 @@ public:
 
         bool isWindowOpen = true;
 
-        while (isWindowOpen) {
+        while (isWindowOpen && !g_shouldQuit.load()) {
             isWindowOpen = m_Window->isRunning();
             auto flagWaitStart = std::chrono::steady_clock::now();
             sge.Buffer = m_Buf;
@@ -446,6 +465,7 @@ public:
                 std::cerr << "PostReceive for frame data failed." << std::endl;
                 break;
             }
+            DPRINT("PR for frame");
 
             *reinterpret_cast<uint8_t*>(m_Buf) = 2;
 
@@ -453,6 +473,7 @@ public:
                 std::cerr << "WaitForCompletion for frame data failed." << std::endl;
                 break;
             }
+            DPRINT("Completion for frame");
 
             auto flagWaitEnd = std::chrono::steady_clock::now();
             FlagWaitTotal += std::chrono::duration_cast<std::chrono::microseconds>(flagWaitEnd - flagWaitStart);
@@ -478,6 +499,7 @@ public:
             } else {
                 throw std::exception();
             }
+            DPRINT("Decompressed frame");
             auto decompressEnd = std::chrono::steady_clock::now();
             DecompressTotal += std::chrono::duration_cast<std::chrono::microseconds>(decompressEnd - decompressStart);
 
@@ -544,7 +566,7 @@ public:
             return;
         }
 
-        while (isWindowOpen) {
+        while (isWindowOpen && !g_shouldQuit.load()) {
             isWindowOpen = m_Window->isRunning();
             auto flagWaitStart = std::chrono::steady_clock::now();
             sge.Buffer = m_Buf;
@@ -747,6 +769,8 @@ private:
         sge.BufferLength = 1;
         sge.MemoryRegionToken = m_pMr->GetLocalToken();
 
+        std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
+
         while (flag != 2) {
             if (FAILED(Read(&sge, 1, remoteInfo.remoteAddr, remoteInfo.remoteToken, 0, READ_CTXT))) {
                 std::cerr << "Read failed." << std::endl;
@@ -757,9 +781,19 @@ private:
                 return false;
             }
 
+            auto now = std::chrono::steady_clock::now();
+            if (std::chrono::duration_cast<std::chrono::seconds>(now - start).count() >= 10) {
+                std::cerr << "Read timeout." << std::endl;
+
+                MessageBoxW(NULL, L"Read timeout. (AsyncWrite)" , L"Error", MB_OK | MB_ICONERROR);
+
+                return false;
+            }
+
             flag = data[0];
             _mm_pause();
         }
+        DPRINT("Read");
         sge.Buffer = data;
         sge.BufferLength = m_LengthPerFrame;
         sge.MemoryRegionToken = m_pMr->GetLocalToken();
@@ -772,6 +806,7 @@ private:
             std::cerr << "WaitForCompletion for frame data write failed." << std::endl;
             return false;
         }
+        DPRINT("Write");
 
         data[0] = 1;
         sge.Buffer = data;
@@ -786,6 +821,7 @@ private:
             std::cerr << "WaitForCompletion for frame data send failed." << std::endl;
             return false;
         }
+        DPRINT("Send");
 
         return true;
     }
@@ -1054,10 +1090,11 @@ public:
             auto GetAndCompressStart = std::chrono::steady_clock::now();
 
             bool success = dupl.GetStagedTexture(yPlane, uvPlane, 1000 / m_RefreshRate);
+            DPRINT("Got frame");
 
-            sge.Buffer = thisBuffer;
-            sge.BufferLength = 1;
-            sge.MemoryRegionToken = m_pMr->GetLocalToken();
+            //sge.Buffer = thisBuffer;
+            //sge.BufferLength = 1;
+            //sge.MemoryRegionToken = m_pMr->GetLocalToken();
 
             if (!success) continue;
 
@@ -1135,6 +1172,7 @@ public:
             MapTotal += std::chrono::duration_cast<std::chrono::microseconds>(MapEnd - MapStart);
 
             //UVMemCpyTotal += std::chrono::duration_cast<std::chrono::microseconds>(MapEnd - UVMemCpyStart);
+            DPRINT("Map");
 
             auto WriteStart = std::chrono::steady_clock::now();
 
@@ -1152,7 +1190,7 @@ public:
             frames++;
 
             auto now = std::chrono::system_clock::now();
-            if (std::chrono::duration_cast<std::chrono::seconds>(now - lastProbe).count() >= 1) {
+            if (false && std::chrono::duration_cast<std::chrono::seconds>(now - lastProbe).count() >= 1) {
                 std::cout << "\r                                                                                                       \r";
                 std::cout << "FPS: " << frames
                           << " | Get: " << GetAndCompressTotal.count() / frames
@@ -1211,6 +1249,7 @@ public:
             auto GetAndCompressStart = std::chrono::steady_clock::now();
 
             bool success = dupl.GetStagedTexture(frameTexture, 1000 / m_RefreshRate);
+            DPRINT("GetTexture");
 
             sge.Buffer = thisBuffer;
             sge.BufferLength = 1;
@@ -1262,6 +1301,7 @@ public:
             dupl.GetContext()->Unmap(frameTexture, 0);
             //frameTexture->Release();
 
+            DPRINT("Map");
             auto MapEnd = std::chrono::steady_clock::now();
             MapTotal += std::chrono::duration_cast<std::chrono::microseconds>(MapEnd - MapStart);
             MemCpyTotal += std::chrono::duration_cast<std::chrono::microseconds>(MapEnd - MemCpyStart);
@@ -1274,6 +1314,7 @@ public:
                     return;
                 }
             }
+            DPRINT("Send");
             WriteFuture = std::async(std::launch::async, &TestClient::AsyncWrite, this, thisBuffer);
             auto WriteEnd = std::chrono::steady_clock::now();
             WriteTotal += std::chrono::duration_cast<std::chrono::microseconds>(WriteEnd - WriteStart);
@@ -1281,7 +1322,7 @@ public:
             frames++;
 
             auto now = std::chrono::system_clock::now();
-            if (std::chrono::duration_cast<std::chrono::seconds>(now - lastProbe).count() >= 1) {
+            if (false && std::chrono::duration_cast<std::chrono::seconds>(now - lastProbe).count() >= 1) {
                 std::cout << "\r                                                                                                                \r";
                 std::cout << "FPS: " << frames
                           << " | Get: " << GetAndCompressTotal.count() / frames
@@ -1309,6 +1350,7 @@ public:
     }
 
     void Run(const char* localAddr, const char* serverAddr, bool compress) {
+        //SetupConsole();
         FindAndSendMode(const_cast<char*>(localAddr), compress);
         #ifndef NOCONTROL
         inputSession.Start(const_cast<char*>(localAddr), serverAddr);
@@ -1350,117 +1392,6 @@ public:
     unsigned long m_YPlaneSize = 0;
     unsigned long m_UVPlaneSize = 0;
 };
-
-bool GetCurrentProcessUsername(std::wstring& username) {
-    HANDLE hToken = nullptr;
-    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &hToken)) {
-        std::cerr << "Failed to open process token: " << GetLastError() << std::endl;
-        return false;
-    }
-
-    DWORD size = 0;
-    GetTokenInformation(hToken, TokenUser, nullptr, 0, &size);
-    std::vector<BYTE> buffer(size);
-    if (!GetTokenInformation(hToken, TokenUser, buffer.data(), size, &size)) {
-        std::cerr << "Failed to get token information: " << GetLastError() << std::endl;
-        CloseHandle(hToken);
-        return false;
-    }
-
-    SID_NAME_USE sidType;
-    wchar_t name[256], domain[256];
-    DWORD nameSize = sizeof(name) / sizeof(wchar_t);
-    DWORD domainSize = sizeof(domain) / sizeof(wchar_t);
-
-    if (!LookupAccountSidW(nullptr, reinterpret_cast<PTOKEN_USER>(buffer.data())->User.Sid, name, &nameSize, domain, &domainSize, &sidType)) {
-        std::cerr << "Failed to lookup account SID: " << GetLastError() << std::endl;
-        CloseHandle(hToken);
-        return false;
-    }
-
-    username = name;
-    CloseHandle(hToken);
-    return true;
-}
-
-bool GetActiveUserUsername(std::wstring& username) {
-    DWORD sessionId = WTSGetActiveConsoleSessionId();
-    if (sessionId == 0xFFFFFFFF) {
-        std::cerr << "Failed to get active console session ID: " << GetLastError() << std::endl;
-        return false;
-    }
-
-    LPWSTR userName = nullptr;
-    DWORD bytesReturned = 0;
-    if (WTSQuerySessionInformationW(WTS_CURRENT_SERVER_HANDLE, sessionId, WTSUserName, &userName, &bytesReturned) && userName) {
-        username = userName;
-        WTSFreeMemory(userName);
-        return true;
-    } else {
-        std::cerr << "Failed to query username for session ID " << sessionId << ": " << GetLastError() << std::endl;
-        return false;
-    }
-}
-
-bool SpawnProcessInActiveSession(const wchar_t* processPath, int argc, char* argv[]) {
-    DWORD sessionId = WTSGetActiveConsoleSessionId();
-    if (sessionId == 0xFFFFFFFF) {
-        std::cerr << "Failed to get active console session ID: " << GetLastError() << std::endl;
-        return false;
-    }
-
-    HANDLE hToken = nullptr;
-    if (!WTSQueryUserToken(sessionId, &hToken)) {
-        std::cerr << "WTSQueryUserToken failed: " << GetLastError() << std::endl;
-        return false;
-    }
-
-    HANDLE hDupToken = nullptr;
-    if (!DuplicateTokenEx(hToken, MAXIMUM_ALLOWED, nullptr, SecurityImpersonation, TokenPrimary, &hDupToken)) {
-        std::cerr << "DuplicateTokenEx failed: " << GetLastError() << std::endl;
-        CloseHandle(hToken);
-        return false;
-    }
-
-    // Construct the command line with the arguments
-    std::wstring commandLine = L"\"";
-    commandLine += processPath;
-    commandLine += L"\"";
-    for (int i = 1; i < argc; ++i) {
-        commandLine += L" ";
-        std::wstring arg = std::wstring(argv[i], argv[i] + strlen(argv[i]));
-        commandLine += L"\"";
-        commandLine += arg;
-        commandLine += L"\"";
-    }
-
-    STARTUPINFOW si = { sizeof(STARTUPINFOW) };
-    PROCESS_INFORMATION pi = {};
-    if (!CreateProcessAsUserW(
-            hDupToken,
-            nullptr, // Use command line instead of application name
-            commandLine.data(),
-            nullptr,
-            nullptr,
-            FALSE,
-            CREATE_NO_WINDOW,
-            nullptr,
-            nullptr,
-            &si,
-            &pi)) {
-        std::cerr << "CreateProcessAsUser failed: " << GetLastError() << std::endl;
-        CloseHandle(hDupToken);
-        CloseHandle(hToken);
-        return false;
-    }
-
-    CloseHandle(pi.hProcess);
-    CloseHandle(pi.hThread);
-    CloseHandle(hDupToken);
-    CloseHandle(hToken);
-
-    return true;
-}
 
 int main(int argc, char* argv[]) {
     #ifdef _DEBUG

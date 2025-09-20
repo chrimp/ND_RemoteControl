@@ -155,7 +155,7 @@ bool Duplication::InitDuplication() {
     }
 
     UINT flag = D3D11_CREATE_DEVICE_BGRA_SUPPORT;
-    #ifdef _DEBUG
+    #if defined(_DEBUG) && !defined(NDR_SERVICE)
     flag |= D3D11_CREATE_DEVICE_DEBUG;
     #endif
 

@@ -1,89 +1,202 @@
 #define UNICODE
-
 #include <windows.h>
 #include <tlhelp32.h>
-#include <tchar.h>
 #include <WtsApi32.h>
+#include <shellapi.h>
 #include <string>
-#include <TlHelp32.h>
+#include <vector>
+#include <thread>
+#include <mutex>
 
 #pragma comment(lib, "Wtsapi32.lib")
 
-SERVICE_STATUS ServiceStatus;
-SERVICE_STATUS_HANDLE hStatus;
+#define ENABLE_STDIO_PIPING 1
 
-void ServiceMain(int argc, char** argv);
+static const wchar_t* kServiceName = L"ND_Remote_Test";
+static const wchar_t* processName  = L"main_service.exe";
+
+SERVICE_STATUS         ServiceStatus;
+SERVICE_STATUS_HANDLE  hStatus;
+static std::wstring    g_ChildArguments; // REQUIRED (service stops if empty)
+
+void WINAPI ServiceMain(DWORD argc, LPWSTR* argv);
 void ControlHandler(DWORD request);
 void RunServiceLogic();
 bool IsProcessRunning(const wchar_t* processName);
 bool StartProcessAsUser(const wchar_t* processPath, const wchar_t* arguments);
 void LogMessage(const char* message);
 
-const wchar_t* processName = L"main_service.exe";
+// ---------- Logging ----------
+void LogMessage(const char* message) {
+    static std::mutex logMutex;
+    std::lock_guard<std::mutex> lock(logMutex);
+    const wchar_t* logFilePath = L"C:\\NDR\\service.log";
 
-int main() {
-    SERVICE_TABLE_ENTRY ServiceTable[] = {
-        { (LPWSTR)L"ND_Remote_Test", (LPSERVICE_MAIN_FUNCTION)ServiceMain },
-        { NULL, NULL }
-    };
-
-    if (!StartServiceCtrlDispatcher(ServiceTable)) {
-        LogMessage("Failed to start service control dispatcher.");
-        return GetLastError();
+    DWORD attrs = GetFileAttributesW(logFilePath);
+    if (attrs == INVALID_FILE_ATTRIBUTES) {
+        HANDLE hNew = CreateFileW(logFilePath, GENERIC_WRITE, FILE_SHARE_READ, NULL,
+                                  CREATE_NEW, FILE_ATTRIBUTE_NORMAL, NULL);
+        if (hNew != INVALID_HANDLE_VALUE) CloseHandle(hNew);
     }
 
+    HANDLE hFile = CreateFileW(logFilePath, FILE_APPEND_DATA, FILE_SHARE_READ, NULL,
+                               OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (hFile == INVALID_HANDLE_VALUE) return;
+
+    SYSTEMTIME st; GetLocalTime(&st);
+    char ts[64];
+    sprintf_s(ts, "[%04d-%02d-%02d %02d:%02d:%02d.%03d] ",
+              st.wYear, st.wMonth, st.wDay,
+              st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
+
+    DWORD written;
+    WriteFile(hFile, ts, (DWORD)strlen(ts), &written, NULL);
+    WriteFile(hFile, message, (DWORD)strlen(message), &written, NULL);
+    WriteFile(hFile, "\r\n", 2, &written, NULL);
+    CloseHandle(hFile);
+}
+
+// ---------- Registry argument load (Parameters key) ----------
+static bool LoadRegistryArguments(std::wstring& outArgs) {
+    outArgs.clear();
+    std::wstring baseKey = L"SYSTEM\\CurrentControlSet\\Services\\";
+    baseKey += kServiceName;
+    baseKey += L"\\Parameters";
+    HKEY hKey;
+    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, baseKey.c_str(), 0, KEY_READ, &hKey) != ERROR_SUCCESS)
+        return false;
+
+    auto TryValue = [&](const wchar_t* valueName) -> bool {
+        DWORD type = 0;
+        DWORD bytes = 0;
+        if (RegQueryValueExW(hKey, valueName, NULL, &type, NULL, &bytes) != ERROR_SUCCESS ||
+            (type != REG_SZ && type != REG_EXPAND_SZ) || bytes < sizeof(wchar_t))
+            return false;
+        std::vector<wchar_t> buf(bytes / sizeof(wchar_t) + 1, 0);
+        if (RegQueryValueExW(hKey, valueName, NULL, &type, (LPBYTE)buf.data(), &bytes) != ERROR_SUCCESS)
+            return false;
+        outArgs.assign(buf.data());
+        return !outArgs.empty();
+    };
+
+    bool ok = TryValue(L"Arguments") || TryValue(L"Args") || TryValue(L"CommandLine");
+    RegCloseKey(hKey);
+    return ok;
+}
+
+// ---------- Merge / choose argument sources ----------
+static bool CollectChildArguments(DWORD svcArgc, LPWSTR* svcArgv) {
+    g_ChildArguments.clear();
+
+    // 1) Runtime start parameters (Services.msc "Start parameters" or 'sc start svc arg1 arg2')
+    if (svcArgc > 1) {
+        for (DWORD i = 1; i < svcArgc; ++i) {
+            if (!g_ChildArguments.empty()) g_ChildArguments += L" ";
+            g_ChildArguments += svcArgv[i];
+        }
+        LogMessage("Using arguments from service start parameters.");
+        return true;
+    }
+
+    // 2) Arguments appended to binPath (parse full process command line)
+    {
+        LPWSTR fullCmd = GetCommandLineW();
+        int cmdArgc = 0;
+        LPWSTR* cmdArgv = CommandLineToArgvW(fullCmd, &cmdArgc);
+        if (cmdArgv) {
+            if (cmdArgc > 1) {
+                // Skip first (exe path). Take the rest as candidate binPath args.
+                std::wstring tmp;
+                for (int i = 1; i < cmdArgc; ++i) {
+                    if (!tmp.empty()) tmp += L" ";
+                    tmp += cmdArgv[i];
+                }
+                // BUT avoid duplicating: If SCM provided runtime params, they already handled above.
+                if (!tmp.empty()) {
+                    g_ChildArguments = tmp;
+                    LogMessage("Using arguments from binPath command line.");
+                    LocalFree(cmdArgv);
+                    return true;
+                }
+            }
+            LocalFree(cmdArgv);
+        }
+    }
+
+    // 3) Registry Parameters key
+    {
+        std::wstring regArgs;
+        if (LoadRegistryArguments(regArgs) && !regArgs.empty()) {
+            g_ChildArguments = regArgs;
+            LogMessage("Using arguments from registry Parameters key.");
+            return true;
+        }
+    }
+
+    LogMessage("No arguments found (runtime/binPath/registry).");
+    return false;
+}
+
+// ---------- Entry ----------
+int wmain() {
+    SERVICE_TABLE_ENTRYW table[] = {
+        { const_cast<LPWSTR>(kServiceName), (LPSERVICE_MAIN_FUNCTIONW)ServiceMain },
+        { NULL, NULL }
+    };
+    if (!StartServiceCtrlDispatcherW(table)) {
+        LogMessage("Failed to start service control dispatcher.");
+        return (int)GetLastError();
+    }
     return 0;
 }
 
-void ServiceMain(int argc, char** argv) {
-    hStatus = RegisterServiceCtrlHandler(L"ND_Remote_Test", (LPHANDLER_FUNCTION)ControlHandler);
-    if (hStatus == NULL) {
-        LogMessage("Failed to register service control handler.");
+// ---------- ServiceMain ----------
+void WINAPI ServiceMain(DWORD argc, LPWSTR* argv) {
+    hStatus = RegisterServiceCtrlHandlerW(kServiceName, (LPHANDLER_FUNCTION)ControlHandler);
+    if (!hStatus) {
+        LogMessage("RegisterServiceCtrlHandler failed.");
         return;
     }
 
+    ServiceStatus = {};
     ServiceStatus.dwServiceType = SERVICE_WIN32_OWN_PROCESS;
     ServiceStatus.dwCurrentState = SERVICE_START_PENDING;
     ServiceStatus.dwControlsAccepted = SERVICE_ACCEPT_STOP | SERVICE_ACCEPT_SHUTDOWN;
-    ServiceStatus.dwWin32ExitCode = 0;
-    ServiceStatus.dwServiceSpecificExitCode = 0;
-    ServiceStatus.dwCheckPoint = 0;
-    ServiceStatus.dwWaitHint = 0;
-
     SetServiceStatus(hStatus, &ServiceStatus);
 
-    // Service is now running
+    if (!CollectChildArguments(argc, argv) || g_ChildArguments.empty()) {
+        LogMessage("No valid arguments. Stopping service.");
+        ServiceStatus.dwCurrentState = SERVICE_STOPPED;
+        ServiceStatus.dwWin32ExitCode = ERROR_INVALID_PARAMETER;
+        SetServiceStatus(hStatus, &ServiceStatus);
+        return;
+    }
+
     ServiceStatus.dwCurrentState = SERVICE_RUNNING;
     SetServiceStatus(hStatus, &ServiceStatus);
-
-    LogMessage("Service started successfully.");
+    LogMessage("Service running.");
     RunServiceLogic();
 }
 
+// ---------- Control Handler ----------
 void ControlHandler(DWORD request) {
     switch (request) {
     case SERVICE_CONTROL_STOP:
-    case SERVICE_CONTROL_SHUTDOWN:
-    {
-        // kill main_service.exe
-        HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-        PROCESSENTRY32W pEntry;
-        pEntry.dwSize = sizeof(pEntry);
-        BOOL hRes = Process32FirstW(hSnapshot, &pEntry);
-
-        while (hRes) {
-            if (_wcsicmp(pEntry.szExeFile, processName) == 0) {
-                HANDLE hProcess = OpenProcess(PROCESS_TERMINATE, FALSE, pEntry.th32ProcessID);
-                if (hProcess) {
-                    TerminateProcess(hProcess, 0);
-                    CloseHandle(hProcess);
-                }
-                break;
+    case SERVICE_CONTROL_SHUTDOWN: {
+        HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if (snap != INVALID_HANDLE_VALUE) {
+            PROCESSENTRY32W pe{ sizeof(pe) };
+            if (Process32FirstW(snap, &pe)) {
+                do {
+                    if (_wcsicmp(pe.szExeFile, processName) == 0) {
+                        HANDLE hp = OpenProcess(PROCESS_TERMINATE, FALSE, pe.th32ProcessID);
+                        if (hp) { TerminateProcess(hp, 0); CloseHandle(hp); }
+                        break;
+                    }
+                } while (Process32NextW(snap, &pe));
             }
-            hRes = Process32NextW(hSnapshot, &pEntry);
+            CloseHandle(snap);
         }
-
-        CloseHandle(hSnapshot);
         ServiceStatus.dwCurrentState = SERVICE_STOPPED;
         SetServiceStatus(hStatus, &ServiceStatus);
         LogMessage("Service stopped.");
@@ -92,260 +205,229 @@ void ControlHandler(DWORD request) {
     default:
         break;
     }
-
     SetServiceStatus(hStatus, &ServiceStatus);
 }
 
+// ---------- Monitor loop ----------
 void RunServiceLogic() {
-    std::wstring processPath = L"C:\\NDR\\" + std::wstring(processName);
-    //const wchar_t* processPath = L"C:\\NDR\\main_service.exe"
-    const wchar_t* arguments = L"-c 192.168.10.1 192.168.10.20 R"; // Put your actual arguments here
-
+    std::wstring processPath = std::wstring(L"C:\\NDR\\") + processName;
     while (ServiceStatus.dwCurrentState == SERVICE_RUNNING) {
         if (!IsProcessRunning(processName)) {
-            LogMessage("main_service.exe is not running. Attempting to restart...");
-            if (!StartProcessAsUser(processPath.c_str(), arguments)) {
-                LogMessage("Failed to start main_service.exe.");
-            } else {
-                LogMessage("Successfully started main_service.exe.");
-            }
+            LogMessage("Child not running. Starting...");
+            if (!StartProcessAsUser(processPath.c_str(), g_ChildArguments.c_str()))
+                LogMessage("Child start failed.");
+            else
+                LogMessage("Child started.");
         }
-
-        Sleep(2000); // Check every 1 second
+        Sleep(2000);
     }
 }
 
-bool IsProcessRunning(const wchar_t* processName) {
-    HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-    if (hSnapshot == INVALID_HANDLE_VALUE) {
-        LogMessage("Failed to create process snapshot.");
+// ---------- Process check ----------
+bool IsProcessRunning(const wchar_t* name) {
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snap == INVALID_HANDLE_VALUE) {
+        LogMessage("Snapshot failed.");
         return false;
     }
-
-    PROCESSENTRY32 pe32;
-    pe32.dwSize = sizeof(PROCESSENTRY32);
-
-    if (Process32First(hSnapshot, &pe32)) {
+    PROCESSENTRY32W pe{ sizeof(pe) };
+    if (Process32FirstW(snap, &pe)) {
         do {
-            if (_wcsicmp(pe32.szExeFile, processName) == 0) {
-                CloseHandle(hSnapshot);
+            if (_wcsicmp(pe.szExeFile, name) == 0) {
+                CloseHandle(snap);
                 return true;
             }
-        } while (Process32Next(hSnapshot, &pe32));
+        } while (Process32NextW(snap, &pe));
     }
-
-    CloseHandle(hSnapshot);
+    CloseHandle(snap);
     return false;
 }
 
-bool StartProcessAsUser(const wchar_t* processPath, const wchar_t* arguments) {
-    DWORD sessionId = WTSGetActiveConsoleSessionId();
-    HANDLE hToken = NULL;
+#if ENABLE_STDIO_PIPING
+static void PipeReaderThread(HANDLE hRead) {
+    if (!hRead) return;
+    std::string line;
+    char buf[1024];
+    DWORD n = 0;
+    while (ReadFile(hRead, buf, sizeof(buf), &n, NULL) && n) {
+        for (DWORD i = 0; i < n; ++i) {
+            char c = buf[i];
+            if (c == '\n' || c == '\r') {
+                if (!line.empty()) {
+                    LogMessage(line.c_str());
+                    line.clear();
+                } else {
+                    LogMessage("");
+                }
+            } else {
+                line.push_back(c);
+                if (line.size() > 8192) {
+                    LogMessage(line.c_str());
+                    line.clear();
+                }
+            }
+        }
+    }
+    if (!line.empty()) LogMessage(line.c_str());
+    CloseHandle(hRead);
+}
+#endif
 
+// ---------- Start child ----------
+bool StartProcessAsUser(const wchar_t* processPath, const wchar_t* arguments) {
+    if (!arguments || !*arguments) {
+        LogMessage("StartProcessAsUser: empty args.");
+        return false;
+    }
+
+    DWORD sessionId = WTSGetActiveConsoleSessionId();
+    HANDLE hTok = NULL;
     auto EnablePriv = [](LPCWSTR name) {
         HANDLE tok;
         if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &tok)) return;
-
         LUID luid;
-        if (!LookupPrivilegeValueW(nullptr, name, &luid)) {
-            CloseHandle(tok);
-            return;
-        }
-        TOKEN_PRIVILEGES tp = {};
+        if (!LookupPrivilegeValueW(NULL, name, &luid)) { CloseHandle(tok); return; }
+        TOKEN_PRIVILEGES tp{};
         tp.PrivilegeCount = 1;
         tp.Privileges[0].Luid = luid;
         tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
-        AdjustTokenPrivileges(tok, FALSE, &tp, sizeof(tp), nullptr, nullptr);
+        AdjustTokenPrivileges(tok, FALSE, &tp, sizeof(tp), NULL, NULL);
         CloseHandle(tok);
     };
     EnablePriv(SE_ASSIGNPRIMARYTOKEN_NAME);
     EnablePriv(SE_INCREASE_QUOTA_NAME);
     EnablePriv(SE_TCB_NAME);
 
-    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_DUPLICATE | TOKEN_QUERY | TOKEN_ASSIGN_PRIMARY, &hToken)) {
-        LogMessage("Failed to open process token for SYSTEM.");
+    if (!OpenProcessToken(GetCurrentProcess(),
+        TOKEN_DUPLICATE | TOKEN_QUERY | TOKEN_ASSIGN_PRIMARY,
+        &hTok)) {
+        LogMessage("OpenProcessToken failed.");
         return false;
     }
 
-    HANDLE hDupToken = NULL;
-    if (!DuplicateTokenEx(hToken, MAXIMUM_ALLOWED, NULL, SecurityImpersonation, TokenPrimary, &hDupToken)) {
-        CloseHandle(hToken);
-        LogMessage("Failed to duplicate user token.");
+    HANDLE hDup = NULL;
+    if (!DuplicateTokenEx(hTok, MAXIMUM_ALLOWED, NULL, SecurityImpersonation, TokenPrimary, &hDup)) {
+        CloseHandle(hTok);
+        LogMessage("DuplicateTokenEx failed.");
         return false;
     }
+    if (sessionId != 0xFFFFFFFF)
+        SetTokenInformation(hDup, TokenSessionId, &sessionId, sizeof(sessionId));
 
-    if (sessionId != 0xFFFFFFFF) {
-        SetTokenInformation(hDupToken, TokenSessionId, &sessionId, sizeof(sessionId));
-    }
-
-    HANDLE hStdOutRead, hStdOutWrite;
-    HANDLE hStdErrRead, hStdErrWrite;
-
-    SECURITY_ATTRIBUTES sa = { sizeof(SECURITY_ATTRIBUTES), NULL, TRUE };
-    if (!CreatePipe(&hStdOutRead, &hStdOutWrite, &sa, 0) ||
-        !CreatePipe(&hStdErrRead, &hStdErrWrite, &sa, 0)) {
-        CloseHandle(hToken);
-        CloseHandle(hDupToken);
-        LogMessage("Failed to create pipes for stdout and stderr.");
+#if ENABLE_STDIO_PIPING
+    HANDLE outR = NULL, outW = NULL;
+    HANDLE errR = NULL, errW = NULL;
+    SECURITY_ATTRIBUTES sa{ sizeof(SECURITY_ATTRIBUTES), NULL, TRUE };
+    if (!CreatePipe(&outR, &outW, &sa, 0) || !CreatePipe(&errR, &errW, &sa, 0)) {
+        CloseHandle(hTok); CloseHandle(hDup);
+        LogMessage("CreatePipe failed.");
         return false;
     }
+    SetHandleInformation(outR, HANDLE_FLAG_INHERIT, 0);
+    SetHandleInformation(errR, HANDLE_FLAG_INHERIT, 0);
+#endif
 
-    SetHandleInformation(hStdOutRead, HANDLE_FLAG_INHERIT, 0);
-    SetHandleInformation(hStdErrRead, HANDLE_FLAG_INHERIT, 0);
+    STARTUPINFOEXW si{};
+    si.StartupInfo.cb = sizeof(STARTUPINFOW);
+    si.StartupInfo.lpDesktop = const_cast<LPWSTR>(L"winsta0\\default");
+#if ENABLE_STDIO_PIPING
+    si.StartupInfo.hStdOutput = outW;
+    si.StartupInfo.hStdError  = errW;
+    si.StartupInfo.dwFlags   |= STARTF_USESTDHANDLES;
+#endif
 
-    STARTUPINFOEX siEx = { 0 };
-    siEx.StartupInfo.cb = sizeof(STARTUPINFO);
-    siEx.StartupInfo.lpDesktop = (LPWSTR)L"winsta0\\default";
-    siEx.StartupInfo.hStdError = hStdErrWrite;
-    siEx.StartupInfo.hStdOutput = hStdOutWrite;
-    siEx.StartupInfo.dwFlags |= STARTF_USESTDHANDLES;
-
-    SIZE_T attributeListSize = 0;
-    InitializeProcThreadAttributeList(NULL, 1, 0, &attributeListSize);
-    siEx.lpAttributeList = (LPPROC_THREAD_ATTRIBUTE_LIST)HeapAlloc(GetProcessHeap(), 0, attributeListSize);
-    if (!siEx.lpAttributeList || !InitializeProcThreadAttributeList(siEx.lpAttributeList, 1, 0, &attributeListSize)) {
-        CloseHandle(hDupToken);
-        CloseHandle(hStdOutRead);
-        CloseHandle(hStdOutWrite);
-        CloseHandle(hStdErrRead);
-        CloseHandle(hStdErrWrite);
-        if (siEx.lpAttributeList) HeapFree(GetProcessHeap(), 0, siEx.lpAttributeList);
-        LogMessage("Failed to initialize attribute list.");
+#if ENABLE_STDIO_PIPING
+    SIZE_T attrSize = 0;
+    InitializeProcThreadAttributeList(NULL, 1, 0, &attrSize);
+    si.lpAttributeList = (LPPROC_THREAD_ATTRIBUTE_LIST)HeapAlloc(GetProcessHeap(), 0, attrSize);
+    if (!si.lpAttributeList ||
+        !InitializeProcThreadAttributeList(si.lpAttributeList, 1, 0, &attrSize)) {
+        if (si.lpAttributeList) HeapFree(GetProcessHeap(), 0, si.lpAttributeList);
+        CloseHandle(hDup); CloseHandle(hTok);
+        CloseHandle(outR); CloseHandle(outW);
+        CloseHandle(errR); CloseHandle(errW);
+        LogMessage("Init attribute list failed.");
         return false;
     }
-
-    HANDLE handlesToInherit[] = { hStdOutWrite, hStdErrWrite };
-    if (!UpdateProcThreadAttribute(siEx.lpAttributeList, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, handlesToInherit, sizeof(handlesToInherit), NULL, NULL)) {
-        DeleteProcThreadAttributeList(siEx.lpAttributeList);
-        HeapFree(GetProcessHeap(), 0, siEx.lpAttributeList);
-        CloseHandle(hDupToken);
-        CloseHandle(hStdOutRead);
-        CloseHandle(hStdOutWrite);
-        CloseHandle(hStdErrRead);
-        CloseHandle(hStdErrWrite);
-        LogMessage("Failed to update attribute list with handles.");
+    HANDLE inherit[] = { outW, errW };
+    if (!UpdateProcThreadAttribute(si.lpAttributeList, 0,
+                                   PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+                                   inherit, sizeof(inherit), NULL, NULL)) {
+        DeleteProcThreadAttributeList(si.lpAttributeList);
+        HeapFree(GetProcessHeap(), 0, si.lpAttributeList);
+        CloseHandle(hDup); CloseHandle(hTok);
+        CloseHandle(outR); CloseHandle(outW);
+        CloseHandle(errR); CloseHandle(errW);
+        LogMessage("UpdateProcThreadAttribute failed.");
         return false;
     }
+#endif
 
-    PROCESS_INFORMATION pi = { 0 };
+    std::wstring cmd = L"\"" + std::wstring(processPath) + L"\" ";
+    cmd += arguments;
+    std::vector<wchar_t> cmdBuf(cmd.begin(), cmd.end());
+    cmdBuf.push_back(L'\0');
 
-    wchar_t commandLine[MAX_PATH];
-    swprintf_s(commandLine, MAX_PATH, L"\"%s\" %s", processPath, arguments);
-
-    BOOL result = CreateProcessAsUserW(
-        hDupToken,
+    PROCESS_INFORMATION pi{};
+    BOOL ok = CreateProcessAsUserW(
+        hDup,
         processPath,
-        commandLine,
+        cmdBuf.data(),
         NULL,
         NULL,
+#if ENABLE_STDIO_PIPING
         TRUE,
+#else
+        FALSE,
+#endif
         CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW | DETACHED_PROCESS,
         NULL,
         L"C:\\NDR",
-        &siEx.StartupInfo,
+        &si.StartupInfo,
         &pi
     );
 
-    CloseHandle(hStdOutWrite);
-    CloseHandle(hStdErrWrite);
-    CloseHandle(hToken);
-    CloseHandle(hDupToken);
+#if ENABLE_STDIO_PIPING
+    CloseHandle(outW);
+    CloseHandle(errW);
+#endif
+    CloseHandle(hTok);
+    CloseHandle(hDup);
 
-    if (!result) {
-        CloseHandle(hStdOutRead);
-        CloseHandle(hStdErrRead);
-        std::string reason = "CreateProcessAsUser failed with error: " + std::to_string(GetLastError());
-        LogMessage("Failed to create process as user.");
-        LogMessage(reason.c_str());
+    if (!ok) {
+#if ENABLE_STDIO_PIPING
+        CloseHandle(outR);
+        CloseHandle(errR);
+#endif
+        if (si.lpAttributeList) {
+            DeleteProcThreadAttributeList(si.lpAttributeList);
+            HeapFree(GetProcessHeap(), 0, si.lpAttributeList);
+        }
+        std::string err = "CreateProcessAsUser failed err=" + std::to_string(GetLastError());
+        LogMessage(err.c_str());
         return false;
     }
 
-    // Wait for process to exit so its stdio buffers flush
+#if ENABLE_STDIO_PIPING
+    std::thread tOut(PipeReaderThread, outR);
+    std::thread tErr(PipeReaderThread, errR);
+#endif
+
     WaitForSingleObject(pi.hProcess, INFINITE);
 
-    HANDLE hFile = CreateFile(L"C:\\NDR\\main.log", GENERIC_WRITE, FILE_SHARE_READ, NULL, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
-    if (hFile != INVALID_HANDLE_VALUE) {
-        SetFilePointer(hFile, 0, NULL, FILE_END);
+#if ENABLE_STDIO_PIPING
+    if (tOut.joinable()) tOut.join();
+    if (tErr.joinable()) tErr.join();
+#endif
 
-        char buffer[1024];
-        DWORD bytesRead, bytesWritten;
-
-        while (ReadFile(hStdOutRead, buffer, sizeof(buffer) - 1, &bytesRead, NULL) && bytesRead > 0) {
-            buffer[bytesRead] = '\0';
-            SYSTEMTIME st; GetLocalTime(&st);
-            char timestamp[64];
-            sprintf_s(timestamp, "%04d-%02d-%02d %02d:%02d:%02d.%03d: ",
-                      st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
-            WriteFile(hFile, timestamp, (DWORD)strlen(timestamp), &bytesWritten, NULL);
-            WriteFile(hFile, buffer, bytesRead, &bytesWritten, NULL);
-        }
-
-        while (ReadFile(hStdErrRead, buffer, sizeof(buffer) - 1, &bytesRead, NULL) && bytesRead > 0) {
-            buffer[bytesRead] = '\0';
-            SYSTEMTIME st; GetLocalTime(&st);
-            char timestamp[64];
-            sprintf_s(timestamp, "%04d-%02d-%02d %02d:%02d:%02d.%03d: ",
-                      st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
-            WriteFile(hFile, timestamp, (DWORD)strlen(timestamp), &bytesWritten, NULL);
-            WriteFile(hFile, buffer, bytesRead, &bytesWritten, NULL);
-        }
-        CloseHandle(hFile);
-    }
-
-    CloseHandle(hStdOutRead);
-    CloseHandle(hStdErrRead);
     CloseHandle(pi.hProcess);
     CloseHandle(pi.hThread);
+
+#if ENABLE_STDIO_PIPING
+    if (si.lpAttributeList) {
+        DeleteProcThreadAttributeList(si.lpAttributeList);
+        HeapFree(GetProcessHeap(), 0, si.lpAttributeList);
+    }
+#endif
     return true;
-}
-
-void LogMessage(const char* message) {
-    const wchar_t* logFilePath = L"C:\\NDR\\service.log"; // Full path to the log file
-
-    DWORD fileAttributes = GetFileAttributes(logFilePath);
-    if (fileAttributes == INVALID_FILE_ATTRIBUTES) {
-        // File does not exist, create it
-        HANDLE hFile = CreateFile(
-            logFilePath,
-            GENERIC_WRITE,      // Open for writing
-            FILE_SHARE_READ,    // Allow other processes to read
-            NULL,
-            CREATE_NEW,         // Create the file only if it doesn't exist
-            FILE_ATTRIBUTE_NORMAL,
-            NULL
-        );
-
-        if (hFile != INVALID_HANDLE_VALUE) {
-            CloseHandle(hFile); // Close the handle after creating the file
-        }
-    }
-
-    // Open the file for appending
-    HANDLE hFile = CreateFile(
-        logFilePath,
-        FILE_APPEND_DATA, // Open for appending
-        FILE_SHARE_READ,  // Allow other processes to read
-        NULL,
-        OPEN_EXISTING,    // Open the file only if it exists
-        FILE_ATTRIBUTE_NORMAL,
-        NULL
-    );
-
-    if (hFile != INVALID_HANDLE_VALUE) {
-        SYSTEMTIME st;
-        GetLocalTime(&st);
-
-        // Prepare the timestamp
-        char timestamp[64];
-        sprintf_s(timestamp, "[%04d-%02d-%02d %02d:%02d:%02d] ",
-                  st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
-
-        // Write the timestamp and message to the log file
-        DWORD bytesWritten;
-        WriteFile(hFile, timestamp, strlen(timestamp), &bytesWritten, NULL);
-        WriteFile(hFile, message, strlen(message), &bytesWritten, NULL);
-        WriteFile(hFile, "\r\n", 2, &bytesWritten, NULL); // Add a newline
-
-        CloseHandle(hFile);
-    }
 }

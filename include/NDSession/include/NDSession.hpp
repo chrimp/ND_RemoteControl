@@ -29,6 +29,8 @@ class NDSessionBase {
         }
     }
 
+    IND2QueuePair* GetQP() { return m_pQp; }
+
     protected:
     IND2Adapter *m_pAdapter;
     IND2MemoryRegion *m_pMr;
