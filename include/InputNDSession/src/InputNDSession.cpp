@@ -1,5 +1,6 @@
 #include "InputNDSession.hpp"
-#define ABSCURSOR
+#include <string>
+//#define ABSCURSOR
 
 #include <emmintrin.h>
 #include <exception>
@@ -41,12 +42,11 @@ bool InputNDSessionServer::Setup(char* localAddr) {
     return true;
 }
 
-void InputNDSessionServer::OpenListener(const char* localAddr) {
-    char fullAddress[INET_ADDRSTRLEN + 6];
-    sprintf_s(fullAddress, "%s:%s", localAddr, TEST_PORT);
-    
+void InputNDSessionServer::OpenListener(const char* localAddr, const unsigned short port) {
+    std::string fullAddress = std::string(localAddr) + ":" + std::to_string(port);
+
     std::cout << "INPUT: Listening on " << fullAddress << "..." << std::endl;
-    if (FAILED(Listen(fullAddress))) std::terminate();
+    if (FAILED(Listen(fullAddress.c_str()))) std::terminate();
 
     if (FAILED(GetConnectionRequest())) {
         std::cerr << "INPUT: " << "GetConnectionRequest failed. Reason: " << std::hex << GetResult() << std::endl;
@@ -216,7 +216,7 @@ void InputNDSessionServer::SendEvent(RAWINPUT input) {
     }
 }
 
-void InputNDSessionServer::Loop() {
+void InputNDSessionServer::Loop() { //MARK: Remove flagging
     Packet* packet = reinterpret_cast<Packet*>(reinterpret_cast<uint8_t*>(m_Buf) + 1);
     packet->mouse = { 0, 0, 0, 0 };
     packet->key = { 0, 2 }; // 2 - nothing
@@ -359,13 +359,13 @@ bool InputNDSessionClient::Setup(const char* localAddr) {
     return true;
 }
 
-void InputNDSessionClient::OpenConnector(const char* localAddr, const char* serverAddr) {
-    char fullServerAddress[INET_ADDRSTRLEN + 6];
-    sprintf_s(fullServerAddress, "%s:%s", serverAddr, TEST_PORT);
+void InputNDSessionClient::OpenConnector(const char* localAddr, const char* serverAddr, const unsigned short port) {
+    std::string fullServerAddress = std::string(serverAddr) + ":" + std::to_string(port);
+    
     std::this_thread::sleep_for(std::chrono::seconds(2));
     std::cout << "INPUT: Connecting to " << fullServerAddress << "..." << std::endl;
 
-    if (FAILED(Connect(localAddr, fullServerAddress, 1, 1, nullptr, 0))) {
+    if (FAILED(Connect(localAddr, fullServerAddress.c_str(), 1, 1, nullptr, 0))) {
         std::cerr << "INPUT: " << "Connect failed." << std::endl;
         return;
     }
@@ -425,7 +425,7 @@ void LiftAllKeys() {
     }
 }
 
-void InputNDSessionClient::Loop() {
+void InputNDSessionClient::Loop() { //MARK: Remove flagging
     auto lastprobe = std::chrono::steady_clock::now();
     unsigned int count = 0;
     unsigned char sgeCount = 0;

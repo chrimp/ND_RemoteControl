@@ -24,17 +24,17 @@ constexpr size_t BUFFER_ALLOC_SIZE = 1 + AUDIO_BUFFER_SIZE;
 class AudioNDSessionServer : private NDSessionServerBase {
     public:
     bool Setup(char* localAddr);
-    void OpenListener(const char* localAddr);
+    void OpenListener(const char* localAddr, const unsigned short port);
     void ExchangePeerInfo();
 
     private:
     void Loop();
 
     public:
-    void Start(char* localAddr) {
+    void Start(char* localAddr, const unsigned short port) {
         m_hCallbackEvent = CreateEvent(NULL, FALSE, FALSE, NULL);
         Setup(localAddr);
-        OpenListener(localAddr);
+        OpenListener(localAddr, port);
         ExchangePeerInfo();
 
         m_isRunning = true;
@@ -68,16 +68,16 @@ class AudioNDSessionClient : private NDSessionClientBase {
     AudioNDSessionClient() {}
 
     bool Setup(const char* localAddr);
-    void OpenConnector(const char* localAddr, const char* serverAddr);
+    void OpenConnector(const char* localAddr, const char* serverAddr, const unsigned short port);
     void ExchangePeerInfo();
 
     private:
     void Loop();
     
     public:
-    void Start(char* localAddr, const char* serverAddr) {
+    void Start(char* localAddr, const char* serverAddr, const unsigned short port) {
         Setup(localAddr);
-        OpenConnector(localAddr, serverAddr);
+        OpenConnector(localAddr, serverAddr, port);
         ExchangePeerInfo();
 
         m_isRunning = true;

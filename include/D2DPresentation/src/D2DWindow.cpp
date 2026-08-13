@@ -5,7 +5,7 @@
 #include <hidusage.h>
 #include <iostream>
 #include <dwmapi.h>
-#define ABSCURSOR
+//#define ABSCURSOR
 
 #pragma comment(lib, "dwmapi.lib")
 

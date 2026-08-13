@@ -1,6 +1,7 @@
 #include "AudioNDSession.hpp"
 
-#include <emmintrin.h>
+#include <immintrin.h>
+#include <string>
 #include <windows.h>
 #include <Functiondiscoverykeys_devpkey.h>
 
@@ -14,7 +15,6 @@
 
 extern std::atomic<bool> g_shouldQuit;
 
-constexpr char TEST_PORT[] = "54323";
 
 void SetupAudioRenderer(_Out_ IAudioRenderClient*& pRenderClient, _Out_ IAudioClient*& pAudioClient, _In_ const HANDLE& hEvent) {
     CoInitializeEx(nullptr, COINIT_MULTITHREADED);
@@ -65,12 +65,11 @@ bool AudioNDSessionServer::Setup(char* localAddr) {
     return true;
 }
 
-void AudioNDSessionServer::OpenListener(const char* localAddr) {
-    char fullAddress[INET_ADDRSTRLEN + 6];
-    sprintf_s(fullAddress, "%s:%s", localAddr, TEST_PORT);
-    
+void AudioNDSessionServer::OpenListener(const char* localAddr, const unsigned short port) {
+    std::string fullAddress = std::string(localAddr) + ":" + std::to_string(port);
+
     std::cout << "AUDIO: Listening on " << fullAddress << std::endl;
-    if (FAILED(Listen(fullAddress))) std::terminate();
+    if (FAILED(Listen(fullAddress.c_str()))) std::terminate();
 
     if (FAILED(GetConnectionRequest())) {
         std::cerr << "AUDIO: " << "GetConnectionRequest failed. Reason: " << std::hex << GetResult() << std::endl;
@@ -118,7 +117,7 @@ void AudioNDSessionServer::ExchangePeerInfo() {
     memset(m_Buf, 0, BUFFER_ALLOC_SIZE);
 }
 
-void AudioNDSessionServer::Loop() {
+void AudioNDSessionServer::Loop() { //MARK: Remove flagging
     uint8_t* flag = reinterpret_cast<uint8_t*>(m_Buf); // 0 = Cannot accomodate 1 = Good to go
     uint8_t* data = reinterpret_cast<uint8_t*>(m_Buf) + 1; // Audio data starts after the flag
 
@@ -231,12 +230,11 @@ bool AudioNDSessionClient::Setup(const char* localAddr) {
     return true;
 }
 
-void AudioNDSessionClient::OpenConnector(const char* localAddr, const char* serverAddr) {
-    char fullServerAddress[INET_ADDRSTRLEN + 6];
-    sprintf_s(fullServerAddress, "%s:%s", serverAddr, TEST_PORT);
-
+void AudioNDSessionClient::OpenConnector(const char* localAddr, const char* serverAddr, const unsigned short port) {
+    std::string fullServerAddress = std::string(serverAddr) + ":" + std::to_string(port);
+    
     std::this_thread::sleep_for(std::chrono::seconds(1));
-    if (FAILED(Connect(localAddr, fullServerAddress, 1, 1, nullptr, 0))) {
+    if (FAILED(Connect(localAddr, fullServerAddress.c_str(), 1, 1, nullptr, 0))) {
         std::cerr << "AUDIO: " << "Connect failed." << std::endl;
         return;
     }
@@ -283,7 +281,7 @@ void AudioNDSessionClient::ExchangePeerInfo() {
     memset(m_Buf, 0, BUFFER_ALLOC_SIZE);
 }
 
-void AudioNDSessionClient::Loop() {
+void AudioNDSessionClient::Loop() { //MARK: Remove flagging
     uint8_t* flag = reinterpret_cast<uint8_t*>(m_Buf); // 0 = Cannot accomodate 1 = Good to go
     uint8_t* data = reinterpret_cast<uint8_t*>(m_Buf) + 1; // Audio data starts after the flag
     ND2_SGE flagSge = { m_Buf, 1, m_pMr->GetLocalToken() };
