@@ -187,8 +187,8 @@ private:
         }
         
         listenSock = listenSock1;
-        closesocket(listenSock2);
-        closesocket(listenSock3);
+        //closesocket(listenSock2);
+        //closesocket(listenSock3);
 
         return true;
     }
