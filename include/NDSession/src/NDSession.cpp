@@ -1,4 +1,5 @@
 #include "NDSession.hpp"
+#include <algorithm>
 #include <cassert>
 #include <iostream>
 
@@ -122,6 +123,9 @@ HRESULT NDSessionBase::CreateQP(DWORD queueDepth, DWORD nSge, DWORD inlineDataSi
 }
 
 HRESULT NDSessionBase::CreateQP(DWORD receiveQueueDepth, DWORD initiatorQueueDepth, DWORD maxReceiveRequestSge, DWORD maxInitiatorRequestSge) {
+    receiveQueueDepth = std::clamp(receiveQueueDepth, (unsigned long)1, (unsigned long)128);
+    initiatorQueueDepth = std::clamp(initiatorQueueDepth, (unsigned long)1, (unsigned long)128);
+
     HRESULT hr = m_pAdapter->CreateQueuePair(IID_IND2QueuePair, m_pCq, m_pCq, nullptr, maxReceiveRequestSge, initiatorQueueDepth,
         maxReceiveRequestSge, maxInitiatorRequestSge, 0, reinterpret_cast<void**>(&m_pQp));
     return hr;

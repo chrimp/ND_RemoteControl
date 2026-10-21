@@ -5,6 +5,7 @@
 #include "InputNDSession.hpp"
 #include "AudioNDSession.hpp"
 
+#include <WinSock2.h>
 #include <WtsApi32.h>
 #include <conio.h>
 #include <d3d11.h>
@@ -88,7 +89,7 @@ bool SyncThreadDesktop() {
 // MARK: TestServer
 class TestServer : public NDSessionServerBase {
 private:
-    static void SendMultiCast(std::stop_token stopToken, const char* localAddr, const unsigned short port) {
+    static void SendMultiCast(std::stop_token stopToken, const char* localAddr, const std::array<unsigned short, 3>& ports) {
         SOCKET mSock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
         if (mSock == INVALID_SOCKET) {
             std::cerr << "Failed to create multicast socket: " << WSAGetLastError() << std::endl;
@@ -116,7 +117,9 @@ private:
         inet_pton(AF_INET, "239.255.0.1", &mAddr.sin_addr);
         mAddr.sin_port = htons(56789);
 
-        std::string message = std::string(localAddr) + ":" + std::to_string(port);
+        std::string port = std::to_string(ports[0]) + ";" + std::to_string(ports[1]) + ";" + std::to_string(ports[2]);
+
+        std::string message = std::string(localAddr) + ":" + port;
 
         while (!stopToken.stop_requested() && !g_shouldQuit.load()) {
             std::this_thread::sleep_for(std::chrono::seconds(1));
@@ -129,34 +132,63 @@ private:
         }
     }
 
-    static bool SetSockets(_In_ const char* localAddr, _Out_ SOCKET& listenSock, _Out_ unsigned short& port) {
-        listenSock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-        if (listenSock == INVALID_SOCKET) {
-            std::cerr << "Failed to create listen socket: " << WSAGetLastError() << std::endl;
-            g_shouldQuit.store(true);
+    static bool SetSockets(_In_ const char* localAddr, _Out_ SOCKET& listenSock, _Out_ std::array<unsigned short, 3> & ports) {
+
+        SOCKET listenSock1 = INVALID_SOCKET;
+        SOCKET listenSock2 = INVALID_SOCKET;
+        SOCKET listenSock3 = INVALID_SOCKET;
+
+        auto bind_ephemeral = [&](SOCKET& sockOut, unsigned short& portOut) -> bool {
+            sockOut = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+            if (sockOut == INVALID_SOCKET) {
+                std::cerr << "Failed to create socket: " << WSAGetLastError() << std::endl;
+                g_shouldQuit.store(true);
+                return false;
+            }
+
+            sockaddr_in addr = {};
+            addr.sin_family = AF_INET;
+            inet_pton(AF_INET, localAddr, &addr.sin_addr);
+            addr.sin_port = htons(0); // request ephemeral port
+
+            if (bind(sockOut, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == SOCKET_ERROR) {
+                std::cerr << "Failed to bind socket: " << WSAGetLastError() << std::endl;
+                closesocket(sockOut);
+                sockOut = INVALID_SOCKET;
+                g_shouldQuit.store(true);
+                return false;
+            }
+
+            sockaddr_in actual = {};
+            int addrLen = sizeof(actual);
+            if (getsockname(sockOut, reinterpret_cast<sockaddr*>(&actual), &addrLen) == SOCKET_ERROR) {
+                std::cerr << "Failed to getsockname: " << WSAGetLastError() << std::endl;
+                closesocket(sockOut);
+                sockOut = INVALID_SOCKET;
+                g_shouldQuit.store(true);
+                return false;
+            }
+
+            portOut = ntohs(actual.sin_port);
+            return true;
+        };
+
+        bool success = true;
+
+        if (!bind_ephemeral(listenSock1, ports[0])) success = false;
+        if (!bind_ephemeral(listenSock2, ports[1])) success = false;
+        if (!bind_ephemeral(listenSock3, ports[2])) success = false;
+
+        if (!success) {
+            if (listenSock1 != INVALID_SOCKET) closesocket(listenSock1);
+            if (listenSock2 != INVALID_SOCKET) closesocket(listenSock2);
+            if (listenSock3 != INVALID_SOCKET) closesocket(listenSock3);
             return false;
         }
-
-        sockaddr_in localAddrin = {};
-        localAddrin.sin_family = AF_INET;
-        inet_pton(AF_INET, localAddr, &localAddrin.sin_addr);
-        localAddrin.sin_port = htons(0);
-
-        if (bind(listenSock, reinterpret_cast<sockaddr*>(&localAddrin), sizeof(localAddrin)) == SOCKET_ERROR) {
-            std::cerr << "Failed to bind listen socket: " << WSAGetLastError() << std::endl;
-            closesocket(listenSock);
-            g_shouldQuit.store(true);
-            return false;
-        }
-
-        sockaddr_in actual = {};
-        int addrLen = sizeof(actual);
-        if (getsockname(listenSock, reinterpret_cast<sockaddr*>(&actual), &addrLen) == SOCKET_ERROR) {
-            std::cerr << "Failed to get socket name: " << WSAGetLastError() << std::endl;
-            closesocket(listenSock);
-            return false; 
-        }
-        port = ntohs(actual.sin_port);
+        
+        listenSock = listenSock1;
+        //closesocket(listenSock2);
+        //closesocket(listenSock3);
 
         return true;
     }
@@ -227,29 +259,34 @@ private:
 public:
     bool Announce(char* localAddr) { // Multicast IP and Port
         WSADATA wsaData;
+        bool ret = false;
+
         if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
             std::cerr << "WSAStartup failed: " << WSAGetLastError() << std::endl;
-            return false;
+            return ret;
         }
 
         SOCKET listenSock, clientSock;
-        unsigned short assignedPort = 0;
 
-        if (!SetSockets(localAddr, listenSock, assignedPort)) {
+        //unsigned short assignedPort = 0;
+
+        if (!SetSockets(localAddr, listenSock, m_listenPorts)) {
             WSACleanup();
-            return false;
+            return ret;
         }
 
-        m_listenPort = assignedPort;
-        std::jthread multicastThread(SendMultiCast, localAddr, assignedPort);
+        //m_listenPorts = assignedPort;
+        std::jthread multicastThread(SendMultiCast, localAddr, m_listenPorts);
 
-        std::cout << "Starting Announce with localAddr: " << localAddr << ":" << assignedPort << std::endl;
+        std::string ports = std::to_string(m_listenPorts[0]) + ", " + std::to_string(m_listenPorts[1]) + ", " + std::to_string(m_listenPorts[2]);
+
+        std::cout << "Starting Announce with localAddr: " << localAddr << ", " << ports << std::endl;
 
         if (listen(listenSock, SOMAXCONN) == SOCKET_ERROR) {
             std::cerr << "Failed to listen on socket: " << WSAGetLastError() << std::endl;
             multicastThread.request_stop();
             closesocket(listenSock);
-            return false; 
+            return ret; 
         }
 
         sockaddr_in clientAddr = {};
@@ -260,7 +297,7 @@ public:
             std::cerr << "Failed to accept connection: " << WSAGetLastError() << std::endl;
             multicastThread.request_stop();
             closesocket(listenSock);
-            return false;
+            return ret;
         }
 
         multicastThread.request_stop();
@@ -275,12 +312,12 @@ public:
             std::cerr << "Failed to receive data: " << WSAGetLastError() << std::endl;
             closesocket(clientSock);
             closesocket(listenSock);
-            return false;
+            return ret;
         } else if (bytesReceived == 0) {
             std::cerr << "Connection closed by client." << std::endl;
             closesocket(clientSock);
             closesocket(listenSock);
-            return false;
+            return ret;
         }
 
         uint16_t width = buffer[0];
@@ -372,10 +409,9 @@ public:
     }
 
     void OpenListener(const char* localAddr) {
-        char fullAddress[INET_ADDRSTRLEN + 6];
-        sprintf_s(fullAddress, "%s:%d", localAddr, m_listenPort);
+        std::string fullAddress = std::string(localAddr) + ":" + std::to_string(m_listenPorts[0]);
         std::cout << "Listening on " << fullAddress << "..." << std::endl;
-        if (FAILED(Listen(fullAddress))) return;
+        if (FAILED(Listen(fullAddress.c_str()))) return;
 
         std::cout << "Waiting for connection request..." << std::endl;
         if (FAILED(GetConnectionRequest())) {
@@ -542,7 +578,7 @@ public:
         CoUninitialize();
     }
 
-    void Loop() {
+    void Loop() { //MARK: Remove flagging
         unsigned int frames = 0;
         auto lastTime = std::chrono::steady_clock::now();
 
@@ -650,11 +686,11 @@ public:
         bool a = Announce(const_cast<char*>(localAddr));
         if (!a) return;
         #ifndef NOCONTROL
-        inputSession.Start(const_cast<char*>(localAddr));
+        inputSession.Start(const_cast<char*>(localAddr), m_listenPorts[1]);
         #endif
 
         #ifndef NOAUDIO
-        audioSession.Start(const_cast<char*>(localAddr));
+        audioSession.Start(const_cast<char*>(localAddr), m_listenPorts[2]);
         #endif
         
         if (!Setup(const_cast<char*>(localAddr))) return;
@@ -690,7 +726,7 @@ public:
     unsigned short m_RefreshRate = 0;
     bool m_Compress = false;
 
-    unsigned short m_listenPort = 0;
+    std::array<unsigned short, 3> m_listenPorts = { 0 };
 
     unsigned long m_LengthPerFrame = 0;
     unsigned long m_BufferSize = 0;
@@ -702,7 +738,7 @@ public:
 // MARK: TestClient
 class TestClient : public NDSessionClientBase {
 private:
-    bool LookForServer(char* localAddr, _Out_ std::string& serverAddr, _Out_ unsigned short& port) {
+    bool LookForServer(char* localAddr, _Out_ std::string& serverAddr, _Out_ std::array<unsigned short, 3>& port) {
         std::cout << "Looking for server on multicast address" << std::endl;
 
         SOCKET mSock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
@@ -753,8 +789,21 @@ private:
         }
 
         std::string ip = message.substr(0, colonPos);
-        std::string portStr = message.substr(colonPos + 1);
-        port = static_cast<unsigned short>(std::stoi(portStr));
+        std::string portsStr = message.substr(colonPos + 1);
+        size_t firstSemicolon = portsStr.find(';');
+        size_t secondSemicolon = portsStr.find(';', firstSemicolon + 1);
+        if (firstSemicolon == std::string::npos || secondSemicolon == std::string::npos) {
+            std::cerr << "Invalid ports format: " << portsStr << std::endl;
+            closesocket(mSock);
+            return false;
+        }
+        std::string portStr = portsStr.substr(0, firstSemicolon);
+        port[0] = static_cast<unsigned short>(std::stoi(portStr));
+        portStr = portsStr.substr(firstSemicolon + 1, secondSemicolon - firstSemicolon - 1);
+        port[1] = static_cast<unsigned short>(std::stoi(portStr));
+        portStr = portsStr.substr(secondSemicolon + 1);
+        port[2] = static_cast<unsigned short>(std::stoi(portStr));
+
         serverAddr = ip;
 
         closesocket(mSock);
@@ -903,17 +952,17 @@ public:
         if (!dupl.InitDuplication()) return false;
 
         std::string ip;
-        unsigned short port;
+        m_ServerPorts = { 0 };
 
-        if (!LookForServer(localAddr, ip, port)) {
+        if (!LookForServer(localAddr, ip, m_ServerPorts)) {
             std::cerr << "LookForServer failed." << std::endl;
             return false;
         }
 
-        m_ServerPort = port;
+        //m_ServerPort = m_ServerPorts[0];
         m_ServerAddress = ip;
 
-        std::cout << "Found server at " << ip << ":" << port << std::endl;
+        std::cout << "Found server at " << ip << ":" << m_ServerPorts[0] << std::endl;
 
         SOCKET tcpSock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
         if (tcpSock == INVALID_SOCKET) {
@@ -924,7 +973,7 @@ public:
         sockaddr_in serverAddr = {};
         serverAddr.sin_family = AF_INET;
         inet_pton(AF_INET, ip.c_str(), &serverAddr.sin_addr);
-        serverAddr.sin_port = htons(port);
+        serverAddr.sin_port = htons(m_ServerPorts[0]);
 
         int connectResult = connect(tcpSock, reinterpret_cast<sockaddr*>(&serverAddr), sizeof(serverAddr));
         if (connectResult == SOCKET_ERROR) {
@@ -991,7 +1040,7 @@ public:
         }
 
         char fullServerAddress[INET_ADDRSTRLEN + 6];
-        sprintf_s(fullServerAddress, "%s:%d", serverAddr, m_ServerPort);
+        sprintf_s(fullServerAddress, "%s:%d", serverAddr, m_ServerPorts[0]);
 
         std::cout << "Connecting from " << localAddr << " to " << fullServerAddress << "..." << std::endl;
         std::this_thread::sleep_for(std::chrono::seconds(2));
@@ -1220,7 +1269,7 @@ public:
         g_shouldQuit.store(true);
     }
 
-    void Loop() {
+    void Loop() { // MARK: Remove flagging
         std::cout << "Sending frames to the server." << std::endl;
         DesktopDuplication::Duplication& dupl = DesktopDuplication::Singleton<DesktopDuplication::Duplication>::Instance();
         ND2_SGE sge = { 0 };
@@ -1349,14 +1398,14 @@ public:
         g_shouldQuit.store(true);
     }
 
-    void Run(const char* localAddr, const char* serverAddr, bool compress) {
+    void Run(const char* localAddr, bool compress) {
         //SetupConsole();
         FindAndSendMode(const_cast<char*>(localAddr), compress);
         #ifndef NOCONTROL
-        inputSession.Start(const_cast<char*>(localAddr), serverAddr);
+        inputSession.Start(const_cast<char*>(localAddr), m_ServerAddress.c_str(), m_ServerPorts[1]);
         #endif
         #ifndef NOAUDIO
-        audioSession.Start(const_cast<char*>(localAddr), serverAddr);
+        audioSession.Start(const_cast<char*>(localAddr), m_ServerAddress.c_str(), m_ServerPorts[2]);
         #endif
         Setup(const_cast<char*>(localAddr), compress);
         OpenConnector(localAddr);
@@ -1370,7 +1419,7 @@ public:
     private:
     PeerInfo remoteInfo;
     std::string m_ServerAddress = "";
-    unsigned short m_ServerPort = 0;
+    std::array<unsigned short, 3> m_ServerPorts = { 0 };
 
     std::atomic<bool> m_isRunning = true;
     std::mutex m_CoutMutex;
@@ -1409,7 +1458,7 @@ int main(int argc, char* argv[]) {
         if (argc != 3) { ShowUsage(); return 1; }
         isServer = true;
     } else if (strcmp(argv[1], "-c") == 0) {
-        if (argc != 5) { ShowUsage(); return 1; }
+        if (argc != 4) { ShowUsage(); return 1; }
         isServer = false;
     } else {
         ShowUsage();
@@ -1435,16 +1484,16 @@ int main(int argc, char* argv[]) {
         TestClient client;
         bool compress = false;
 
-        if (_stricmp(argv[4], "r") == 0) {
+        if (_stricmp(argv[3], "r") == 0) {
             compress = false;
-        } else if (_stricmp(argv[4], "c") == 0) {
+        } else if (_stricmp(argv[3], "c") == 0) {
             compress = true;
         } else {
             std::cerr << "Invalid compression flag. Use 'r' for raw or 'c' for compressed." << std::endl;
             return 1;
         }
 
-        client.Run(argv[2], argv[3], compress);
+        client.Run(argv[2], compress);
     }
 
     NdCleanup();
