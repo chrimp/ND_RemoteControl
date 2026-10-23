@@ -65,6 +65,7 @@ class NDSessionBase {
     HRESULT CreateConnector();
     HRESULT CreateQP(DWORD queueDepth, DWORD nSge, DWORD inlineDataSize = 0);
     HRESULT CreateQP(DWORD receiveQueueDepth, DWORD initiatorQueueDepth, DWORD maxReceiveRequestSge, DWORD maxInitiatorRequestSge);
+    HRESULT CreateQP(DWORD receiveQueueDepth, DWORD initiatorQueueDepth, DWORD maxReceiveRequestSge, DWORD maxInitiatorRequestSge, DWORD maxInlineDataSize);
 
     void ClearOPs();
     

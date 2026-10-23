@@ -29,6 +29,7 @@ class AudioNDSessionServer : private NDSessionServerBase {
 
     private:
     void Loop();
+    bool WaitForCompletionAndCheckContext(void *expectedContext, ULONG notifyFlag = ND_CQ_NOTIFY_ANY);
 
     public:
     void Start(char* localAddr, const unsigned short port) {
@@ -60,7 +61,7 @@ class AudioNDSessionServer : private NDSessionServerBase {
 
     HANDLE m_hCallbackEvent = nullptr;
 
-    bool WaitForCompletionAndCheckContext(void *expectedContext, ULONG notifyFlag = ND_CQ_NOTIFY_ANY);
+    bool m_isTest = false;
 };
 
 class AudioNDSessionClient : private NDSessionClientBase {
@@ -73,6 +74,7 @@ class AudioNDSessionClient : private NDSessionClientBase {
 
     private:
     void Loop();
+    bool WaitForCompletionAndCheckContext(void *expectedContext, ULONG notifyFlag = ND_CQ_NOTIFY_ANY);
     
     public:
     void Start(char* localAddr, const char* serverAddr, const unsigned short port) {
@@ -90,13 +92,24 @@ class AudioNDSessionClient : private NDSessionClientBase {
         }
     }
 
+    void EnableTestMode() {
+        m_isTest = true;
+    }
+
+    void GetEventHandle(HANDLE& hEvent) {
+        if (!m_isTest) return;
+        hEvent = m_hEvent;
+        return;
+    }
+
     private:
     std::atomic<bool> m_isRunning = true;
     PeerInfo remoteInfo;
     std::thread m_thread;
     ComPtr<IAudioCaptureClient> m_audioCaptureClient;
 
-    bool WaitForCompletionAndCheckContext(void *expectedContext, ULONG notifyFlag = ND_CQ_NOTIFY_ANY);
+    bool m_isTest = false;
+    HANDLE m_hEvent = NULL;
 };
 
 #endif

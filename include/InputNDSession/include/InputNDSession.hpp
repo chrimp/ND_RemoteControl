@@ -129,6 +129,7 @@ class InputNDSessionClient : private NDSessionClientBase {
 
     private:
     void Loop();
+    bool WaitForCompletionAndCheckContext(void *expectedContext, ULONG notifyFlag = ND_CQ_NOTIFY_ANY);
     
     public:
     void Start(char* localAddr, const char* serverAddr, const unsigned short port) {
@@ -146,6 +147,23 @@ class InputNDSessionClient : private NDSessionClientBase {
         }
     }
 
+    void EnableTestMode() {
+        m_isTest = true;
+    }
+
+    bool GetMouse(short& x, short& y) const {
+        if (!m_isTest) return false;
+        x = m_Packet.mouse.x;
+        y = m_Packet.mouse.y;
+        return true;
+    }
+
+    void SetEventHandle(HANDLE hEvent) {
+        if (!m_isTest) return;
+        m_hEvent = hEvent;
+        return;
+    }
+
     private:
     std::atomic<bool> m_isRunning = true;
     PeerInfo remoteInfo;
@@ -153,7 +171,10 @@ class InputNDSessionClient : private NDSessionClientBase {
 
     std::mutex& m_coutMutex;
 
-    bool WaitForCompletionAndCheckContext(void *expectedContext, ULONG notifyFlag = ND_CQ_NOTIFY_ANY);
+    bool m_isTest = false;
+
+    Packet m_Packet = { {0, 0, 0, false, 0}, {0, 2, false} };
+    HANDLE m_hEvent = NULL;
 };
 
 #endif
