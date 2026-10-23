@@ -1,4 +1,7 @@
+// TODO: Server/Input definition is reversed here
+
 #include "InputNDSession.hpp"
+#include <iostream>
 #include <string>
 //#define ABSCURSOR
 
@@ -233,10 +236,6 @@ void InputNDSessionServer::Loop() { //MARK: Remove flagging
     auto flagWaitTotal = std::chrono::microseconds(0);
 
     while (m_isRunning && !g_shouldQuit.load()) {
-        flag[0] = 0; // Reset flag
-        _mm_clflush(m_Buf);
-        _mm_sfence();
-
         WaitForSingleObject(m_hCallbackEvent, INFINITE);
         //delta = {m_Mouse.x.exchange(0), m_Mouse.y.exchange(0)};
 
@@ -253,24 +252,6 @@ void InputNDSessionServer::Loop() { //MARK: Remove flagging
             m_Keyboard.down.exchange(2),
             m_Keyboard.isE0.exchange(false)
         };
-        
-        auto flagWaitStart = std::chrono::steady_clock::now();
-        while (flag[0] != 1) {
-            if (FAILED(Read(&flagSge, 1, remoteInfo.remoteAddr, remoteInfo.remoteToken, 0, READ_CTXT))) {
-                std::cerr << "INPUT: " << "Read failed." << std::endl;
-                return;
-            }
-            if (!WaitForCompletionAndCheckContext(READ_CTXT)) {
-                std::cerr << "INPUT: " << "WaitForCompletion for read failed." << std::endl;
-                return;
-            }
-            _mm_clflush(m_Buf);
-            _mm_lfence();
-            _mm_pause();
-        }
-
-        auto flagWaitEnd = std::chrono::steady_clock::now();
-        flagWaitTotal += std::chrono::duration_cast<std::chrono::microseconds>(flagWaitEnd - flagWaitStart);
     
         //ND2_SGE sge = { m_Buf, INPUT_EVENT_BUFFER_SIZE, m_pMr->GetLocalToken() };
         if (FAILED(Send(&sge, 1, 0, SEND_CTXT))) {
@@ -295,9 +276,6 @@ void InputNDSessionServer::Loop() { //MARK: Remove flagging
         // But it is. Maybe it's just slow and letting DMA is more faster?
         // Maybe it's just friggin' hot to do things itself, I don't have fan attached to the card.
 
-        flag[0] = 0;
-        _mm_clflush(m_Buf);
-        _mm_sfence();
         if (!WaitForCompletionAndCheckContext(SEND_CTXT)) {
             std::cerr << "INPUT: " << "WaitForCompletion for send failed." << std::endl;
             return;
@@ -308,7 +286,6 @@ void InputNDSessionServer::Loop() { //MARK: Remove flagging
         if (now - lastCheck > std::chrono::seconds(1)) {
             std::cout << "\r                                                                               \r" << std::flush;
             std::cout << "INPUT: " << "Flag wait time: " << flagWaitTotal.count() / static_cast<float>(count) << std::flush;
-            flagWaitTotal = std::chrono::microseconds(0);
             lastCheck = now;
             count = 0;
         }
@@ -439,230 +416,234 @@ void InputNDSessionClient::Loop() { //MARK: Remove flagging
         }
     }
 
-    sgeCount += 20;
-
     uint8_t* flag = reinterpret_cast<uint8_t*>(m_Buf); // 0 = Cannot accomodate 1 = Good to go
     Packet* received = reinterpret_cast<Packet*>(reinterpret_cast<uint8_t*>(m_Buf) + 1);
 
-    while (m_isRunning && !g_shouldQuit.load()) {
-        if (sgeCount < 10) {
-            for (int i = 0; i < 10; i++) {
-                if (FAILED(PostReceive(&sge, 1, RECV_CTXT))) {
-                    std::cerr << "INPUT: " << "PostReceive failed." << std::endl;
-                    return;
+    if (!m_isTest) {
+        while (m_isRunning && !g_shouldQuit.load()) {
+            if (FAILED(PostReceive(&sge, 1, RECV_CTXT))) {
+                std::cerr << "INPUT: " << "PostReceive failed." << std::endl;
+                return;
+            }
+
+            if (!WaitForCompletionAndCheckContext(RECV_CTXT)) {
+                std::cerr << "INPUT: " << "WaitForCompletion for PostReceive failed." << std::endl;
+                return;
+            }
+
+            MousePacket mouse = received->mouse;
+            KeyPacket key = received->key;
+
+            bool shouldMouse = (mouse.x != 0 || mouse.y != 0 || mouse.wheel != 0 || mouse.buttonFlags != 0);
+            bool shouldKey = (key.scanCode != 0 && key.down != 2);
+
+            if (!shouldMouse && !shouldKey) {
+                continue; // Nothing to do
+            }
+
+            if (shouldMouse) {
+                // Handle mouse
+                INPUT input = {0};
+                input.type = INPUT_MOUSE;
+                input.mi.dx = mouse.x;
+                input.mi.dy = mouse.y;
+
+                bool isWheel = (mouse.buttonFlags & RI_MOUSE_WHEEL);
+                bool isX = (mouse.buttonFlags & (RI_MOUSE_BUTTON_4_DOWN | RI_MOUSE_BUTTON_5_DOWN | RI_MOUSE_BUTTON_4_UP | RI_MOUSE_BUTTON_5_UP));
+            
+                if (isWheel && isX) { // Both can't be set at the same time
+                    isX = false;
+                    mouse.buttonFlags &= ~(RI_MOUSE_BUTTON_4_DOWN | RI_MOUSE_BUTTON_5_DOWN | RI_MOUSE_BUTTON_4_UP | RI_MOUSE_BUTTON_5_UP);
                 }
-            }
-            sgeCount += 10;
-        }
 
-        flag[0] = 1;
-        _mm_clflush(m_Buf);
-        _mm_sfence();
+                ULONG xFlag = -1;
 
-        if (!WaitForCompletionAndCheckContext(RECV_CTXT)) {
-            std::cerr << "INPUT: " << "WaitForCompletion for PostReceive failed." << std::endl;
-            return;
-        }
-        sgeCount--;
-
-        count++;
-
-        flag[0] = 0;
-        _mm_clflush(m_Buf);
-        _mm_sfence();
-
-        MousePacket mouse = received->mouse;
-        KeyPacket key = received->key;
-
-        bool shouldMouse = (mouse.x != 0 || mouse.y != 0 || mouse.wheel != 0 || mouse.buttonFlags != 0);
-        bool shouldKey = (key.scanCode != 0 && key.down != 2);
-
-        if (!shouldMouse && !shouldKey) {
-            continue; // Nothing to do
-        }
-
-        if (shouldMouse) {
-            // Handle mouse
-            INPUT input = {0};
-            input.type = INPUT_MOUSE;
-            input.mi.dx = mouse.x;
-            input.mi.dy = mouse.y;
-
-            bool isWheel = (mouse.buttonFlags & RI_MOUSE_WHEEL);
-            bool isX = (mouse.buttonFlags & (RI_MOUSE_BUTTON_4_DOWN | RI_MOUSE_BUTTON_5_DOWN | RI_MOUSE_BUTTON_4_UP | RI_MOUSE_BUTTON_5_UP));
-        
-            if (isWheel && isX) { // Both can't be set at the same time
-                isX = false;
-                mouse.buttonFlags &= ~(RI_MOUSE_BUTTON_4_DOWN | RI_MOUSE_BUTTON_5_DOWN | RI_MOUSE_BUTTON_4_UP | RI_MOUSE_BUTTON_5_UP);
-            }
-
-            ULONG xFlag = -1;
-
-            if (isWheel) {
-                input.mi.dwFlags = mouse.buttonFlags * 2 | MOUSEEVENTF_MOVE;
-                input.mi.mouseData = mouse.wheel;
-            } else if (isX) {
-                xFlag = mouse.buttonFlags & (RI_MOUSE_BUTTON_4_DOWN | RI_MOUSE_BUTTON_5_DOWN | RI_MOUSE_BUTTON_4_UP | RI_MOUSE_BUTTON_5_UP);
-                input.mi.dwFlags = (mouse.buttonFlags & ~(RI_MOUSE_BUTTON_4_DOWN | RI_MOUSE_BUTTON_5_DOWN | RI_MOUSE_BUTTON_4_UP | RI_MOUSE_BUTTON_5_UP)) * 2 | MOUSEEVENTF_MOVE;
-            } else {
-                input.mi.dwFlags = mouse.buttonFlags * 2 | MOUSEEVENTF_MOVE;
-                input.mi.mouseData = 0;
-            }
-
-            switch (xFlag) {
-                case RI_MOUSE_BUTTON_4_DOWN:
-                    input.mi.dwFlags |= MOUSEEVENTF_XDOWN;
-                    input.mi.mouseData = XBUTTON1;
-                    break;
-                case RI_MOUSE_BUTTON_5_DOWN:
-                    input.mi.dwFlags |= MOUSEEVENTF_XDOWN;
-                    input.mi.mouseData = XBUTTON2;
-                    break;
-                case RI_MOUSE_BUTTON_4_UP:
-                    input.mi.dwFlags |= MOUSEEVENTF_XUP;
-                    input.mi.mouseData = XBUTTON1;
-                    break;
-                case RI_MOUSE_BUTTON_5_UP:
-                    input.mi.dwFlags |= MOUSEEVENTF_XUP;
-                    input.mi.mouseData = XBUTTON2;
-                    break;
-                default: // This cannot happen, or well could happen if isX is false
-                    #ifdef _DEBUG
-                    if (isX) throw std::runtime_error("Unexpected X button state.");
-                    #endif
-                    break;
-            }
-
-            if (mouse.absolute) {
-                input.mi.dwFlags |= MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_MOVE;
-                input.mi.dx = (mouse.x * 65536) / GetSystemMetrics(SM_CXSCREEN);
-                input.mi.dy = (mouse.y * 65536) / GetSystemMetrics(SM_CYSCREEN);
-            } else {
-                input.mi.dwFlags |= MOUSEEVENTF_MOVE;
-            }
-
-            SetLastError(0);
-            if (SendInput(1, &input, sizeof(INPUT)) == 0) {
-                DWORD error = GetLastError();
-                if (error == ERROR_ACCESS_DENIED || error == 0) {
-                    std::cout << "INPUT: SendInput ACCESS_DENIED, attempting desktop change." << std::endl;
-
-                    WCHAR name[256];
-                    DWORD needed = 0;
-                    HDESK hDesk = nullptr;
-
-                    // Retry open/query loop if OpenInputDesktop fails or GetUserObjectInformationW fails with ERROR_INVALID_HANDLE (6)
-                    for (;;) {
-                        hDesk = OpenInputDesktop(0, FALSE, GENERIC_ALL);
-                        if (!hDesk) {
-                            DWORD ge = GetLastError();
-                            if (ge == ERROR_INVALID_HANDLE) { Sleep(50); continue; }
-                            std::cerr << "INPUT: OpenInputDesktop failed. Error: " << ge << std::endl;
-                            break;
-                        }
-                        if (!GetUserObjectInformationW(hDesk, UOI_NAME, name, sizeof(name), &needed)) {
-                            DWORD ge = GetLastError();
-                            CloseDesktop(hDesk);
-                            hDesk = nullptr;
-                            if (ge == ERROR_INVALID_HANDLE) { Sleep(50); continue; }
-                            std::cerr << "INPUT: GetUserObjectInformationW failed. Error: " << ge << std::endl;
-                            break;
-                        }
-                        break;
-                    }
-
-                    if (hDesk) {
-                        CloseDesktop(hDesk);
-                        HDESK hNewDesk = OpenDesktopW(name, 0, FALSE, GENERIC_ALL);
-                        if (hNewDesk) {
-                            if (!SetThreadDesktop(hNewDesk)) {
-                                DWORD ge = GetLastError();
-                                CloseDesktop(hNewDesk);
-                                std::cerr << "INPUT: SetThreadDesktop failed. Error: " << ge << std::endl;
-                            } else {
-                                CloseDesktop(hNewDesk);
-                                SetLastError(0);
-                                if (SendInput(1, &input, sizeof(INPUT)) == 0) {
-                                    std::cerr << "INPUT: SendInput failed after desktop change: " << GetLastError() << std::endl;
-                                    abort();
-                                }
-                            }
-                        } else {
-                            std::cerr << "INPUT: OpenDesktopW failed. Error: " << GetLastError() << std::endl;
-                        }
-                    }
+                if (isWheel) {
+                    input.mi.dwFlags = mouse.buttonFlags * 2 | MOUSEEVENTF_MOVE;
+                    input.mi.mouseData = mouse.wheel;
+                } else if (isX) {
+                    xFlag = mouse.buttonFlags & (RI_MOUSE_BUTTON_4_DOWN | RI_MOUSE_BUTTON_5_DOWN | RI_MOUSE_BUTTON_4_UP | RI_MOUSE_BUTTON_5_UP);
+                    input.mi.dwFlags = (mouse.buttonFlags & ~(RI_MOUSE_BUTTON_4_DOWN | RI_MOUSE_BUTTON_5_DOWN | RI_MOUSE_BUTTON_4_UP | RI_MOUSE_BUTTON_5_UP)) * 2 | MOUSEEVENTF_MOVE;
                 } else {
-                    std::cerr << "INPUT: SendInput failed. Error: " << error << std::endl;
-                    abort();
+                    input.mi.dwFlags = mouse.buttonFlags * 2 | MOUSEEVENTF_MOVE;
+                    input.mi.mouseData = 0;
                 }
-            }
-        }
-        
-        // Handle keyboard
-        if (shouldKey) {
-            INPUT input = {0};
-            input.type = INPUT_KEYBOARD;
-            input.ki.wScan = key.scanCode;
 
-            if (key.down == 0) { // Key down
-                input.ki.dwFlags = KEYEVENTF_SCANCODE; // Key down
-            } else if (key.down == 1) { // Key up
-                input.ki.dwFlags = KEYEVENTF_SCANCODE | KEYEVENTF_KEYUP; // Key up
-            } else if (key.down == 3) {
-                LiftAllKeys();
-            } else {
-                continue; // No change, skip
-            }
+                switch (xFlag) {
+                    case RI_MOUSE_BUTTON_4_DOWN:
+                        input.mi.dwFlags |= MOUSEEVENTF_XDOWN;
+                        input.mi.mouseData = XBUTTON1;
+                        break;
+                    case RI_MOUSE_BUTTON_5_DOWN:
+                        input.mi.dwFlags |= MOUSEEVENTF_XDOWN;
+                        input.mi.mouseData = XBUTTON2;
+                        break;
+                    case RI_MOUSE_BUTTON_4_UP:
+                        input.mi.dwFlags |= MOUSEEVENTF_XUP;
+                        input.mi.mouseData = XBUTTON1;
+                        break;
+                    case RI_MOUSE_BUTTON_5_UP:
+                        input.mi.dwFlags |= MOUSEEVENTF_XUP;
+                        input.mi.mouseData = XBUTTON2;
+                        break;
+                    default: // This cannot happen, or well could happen if isX is false
+                        #ifdef _DEBUG
+                        if (isX) throw std::runtime_error("Unexpected X button state.");
+                        #endif
+                        break;
+                }
 
-            if (key.isE0) {
-                input.ki.dwFlags |= KEYEVENTF_EXTENDEDKEY;
-            } // E0
+                if (mouse.absolute) {
+                    input.mi.dwFlags |= MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_MOVE;
+                    input.mi.dx = (mouse.x * 65536) / GetSystemMetrics(SM_CXSCREEN);
+                    input.mi.dy = (mouse.y * 65536) / GetSystemMetrics(SM_CYSCREEN);
+                } else {
+                    input.mi.dwFlags |= MOUSEEVENTF_MOVE;
+                }
 
-            if (SendInput(1, &input, sizeof(INPUT)) == 0) {
-                DWORD error = GetLastError();
-                if (error == ERROR_ACCESS_DENIED) {
-                    std::cout << "INPUT: " << "SendInput failed with ERROR_ACCESS_DENIED, trying to change desktop." << std::endl;
-                    HDESK hDesk = OpenInputDesktop(0, FALSE, GENERIC_ALL);
-                    WCHAR name[256];
-                    DWORD needed = 0;
+                SetLastError(0);
+                if (SendInput(1, &input, sizeof(INPUT)) == 0) {
+                    DWORD error = GetLastError();
+                    if (error == ERROR_ACCESS_DENIED || error == 0) {
+                        std::cout << "INPUT: SendInput ACCESS_DENIED, attempting desktop change." << std::endl;
 
-                    std::wcout << L"INPUT: " << L"Current desktop name: " << std::endl;
+                        WCHAR name[256];
+                        DWORD needed = 0;
+                        HDESK hDesk = nullptr;
 
-                    if (hDesk && GetUserObjectInformationW(hDesk, UOI_NAME, name, sizeof(name), &needed)) {
-                        CloseDesktop(hDesk);
-
-                        HDESK hNewDesk = OpenDesktopW(name, 0, FALSE, GENERIC_ALL);
-                        SetThreadDesktop(hNewDesk);
-                        CloseDesktop(hNewDesk);
-
-                        if (SendInput(1, &input, sizeof(INPUT)) == 0) {
-                            std::cerr << "INPUT: " << "SendInput failed after desktop change: " << GetLastError() << std::endl;
-                            abort();
+                        // Retry open/query loop if OpenInputDesktop fails or GetUserObjectInformationW fails with ERROR_INVALID_HANDLE (6)
+                        for (;;) {
+                            hDesk = OpenInputDesktop(0, FALSE, GENERIC_ALL);
+                            if (!hDesk) {
+                                DWORD ge = GetLastError();
+                                if (ge == ERROR_INVALID_HANDLE) { Sleep(50); continue; }
+                                std::cerr << "INPUT: OpenInputDesktop failed. Error: " << ge << std::endl;
+                                break;
+                            }
+                            if (!GetUserObjectInformationW(hDesk, UOI_NAME, name, sizeof(name), &needed)) {
+                                DWORD ge = GetLastError();
+                                CloseDesktop(hDesk);
+                                hDesk = nullptr;
+                                if (ge == ERROR_INVALID_HANDLE) { Sleep(50); continue; }
+                                std::cerr << "INPUT: GetUserObjectInformationW failed. Error: " << ge << std::endl;
+                                break;
+                            }
                             break;
+                        }
+
+                        if (hDesk) {
+                            CloseDesktop(hDesk);
+                            HDESK hNewDesk = OpenDesktopW(name, 0, FALSE, GENERIC_ALL);
+                            if (hNewDesk) {
+                                if (!SetThreadDesktop(hNewDesk)) {
+                                    DWORD ge = GetLastError();
+                                    CloseDesktop(hNewDesk);
+                                    std::cerr << "INPUT: SetThreadDesktop failed. Error: " << ge << std::endl;
+                                } else {
+                                    CloseDesktop(hNewDesk);
+                                    SetLastError(0);
+                                    if (SendInput(1, &input, sizeof(INPUT)) == 0) {
+                                        std::cerr << "INPUT: SendInput failed after desktop change: " << GetLastError() << std::endl;
+                                        abort();
+                                    }
+                                }
+                            } else {
+                                std::cerr << "INPUT: OpenDesktopW failed. Error: " << GetLastError() << std::endl;
+                            }
                         }
                     } else {
-                        CloseDesktop(hDesk);
-                        std::cerr << "INPUT: " << "Failed to get desktop name. Error: " << GetLastError() << std::endl;
+                        std::cerr << "INPUT: SendInput failed. Error: " << error << std::endl;
+                        abort();
                     }
-                } else {
-                    std::cerr << "INPUT: " << "SendInput failed with error: " << std::dec << error << std::endl;
-                    abort();
-                    break;
                 }
             }
-        }
+            
+            // Handle keyboard
+            if (shouldKey) {
+                INPUT input = {0};
+                input.type = INPUT_KEYBOARD;
+                input.ki.wScan = key.scanCode;
 
-        /*
-        auto now = std::chrono::steady_clock::now();
+                if (key.down == 0) { // Key down
+                    input.ki.dwFlags = KEYEVENTF_SCANCODE; // Key down
+                } else if (key.down == 1) { // Key up
+                    input.ki.dwFlags = KEYEVENTF_SCANCODE | KEYEVENTF_KEYUP; // Key up
+                } else if (key.down == 3) {
+                    LiftAllKeys();
+                } else {
+                    continue; // No change, skip
+                }
 
-        if (now - lastprobe >= std::chrono::seconds(1)) {
-            std::scoped_lock<std::mutex> lock(m_coutMutex);
-            std::cout << "\r                                                       \r" << std::flush;
-            std::cout << "INPUT: " << "Input frequency: " << count << " Hz | SGE: " << static_cast<int>(sgeCount) << std::flush;
-            lastprobe = now;
-            count = 0;
+                if (key.isE0) {
+                    input.ki.dwFlags |= KEYEVENTF_EXTENDEDKEY;
+                } // E0
+
+                if (SendInput(1, &input, sizeof(INPUT)) == 0) {
+                    DWORD error = GetLastError();
+                    if (error == ERROR_ACCESS_DENIED) {
+                        std::cout << "INPUT: " << "SendInput failed with ERROR_ACCESS_DENIED, trying to change desktop." << std::endl;
+                        HDESK hDesk = OpenInputDesktop(0, FALSE, GENERIC_ALL);
+                        WCHAR name[256];
+                        DWORD needed = 0;
+
+                        std::wcout << L"INPUT: " << L"Current desktop name: " << std::endl;
+
+                        if (hDesk && GetUserObjectInformationW(hDesk, UOI_NAME, name, sizeof(name), &needed)) {
+                            CloseDesktop(hDesk);
+
+                            HDESK hNewDesk = OpenDesktopW(name, 0, FALSE, GENERIC_ALL);
+                            SetThreadDesktop(hNewDesk);
+                            CloseDesktop(hNewDesk);
+
+                            if (SendInput(1, &input, sizeof(INPUT)) == 0) {
+                                std::cerr << "INPUT: " << "SendInput failed after desktop change: " << GetLastError() << std::endl;
+                                abort();
+                                break;
+                            }
+                        } else {
+                            CloseDesktop(hDesk);
+                            std::cerr << "INPUT: " << "Failed to get desktop name. Error: " << GetLastError() << std::endl;
+                        }
+                    } else {
+                        std::cerr << "INPUT: " << "SendInput failed with error: " << std::dec << error << std::endl;
+                        abort();
+                        break;
+                    }
+                }
+            }
+
+            /*
+            auto now = std::chrono::steady_clock::now();
+
+            if (now - lastprobe >= std::chrono::seconds(1)) {
+                std::scoped_lock<std::mutex> lock(m_coutMutex);
+                std::cout << "\r                                                       \r" << std::flush;
+                std::cout << "INPUT: " << "Input frequency: " << count << " Hz | SGE: " << static_cast<int>(sgeCount) << std::flush;
+                lastprobe = now;
+                count = 0;
+            }
+            */
         }
-        */
+    } else if (m_isTest) {
+        while (m_isRunning && !g_shouldQuit.load()) {
+            if (!WaitForCompletionAndCheckContext(RECV_CTXT)) {
+                std::cerr << "INPUT: " << "WaitForCompletion for PostReceive failed." << std::endl;
+                return;
+            }
+
+            MousePacket mouse = received->mouse;
+            KeyPacket key = received->key;
+            m_Packet = { mouse, key };
+            
+            if (key.down == 0 && key.scanCode == 0x0019) {
+                SetEvent(m_hEvent);
+            }
+
+            if (FAILED(PostReceive(&sge, 1, RECV_CTXT))) {
+                std::cerr << "INPUT: " << "PostReceive failed." << std::endl;
+                return;
+            }
+        }
     }
     LiftAllKeys();
     g_shouldQuit.store(true);

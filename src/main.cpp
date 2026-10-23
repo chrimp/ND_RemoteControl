@@ -337,10 +337,9 @@ public:
     }
 
     bool Setup(char* localAddr) {
-        m_YPlaneSize = m_Width * m_Height;
-        m_UVPlaneSize = m_Width * (m_Height / 2) * 2;
-
         if (m_Compress) {
+            m_YPlaneSize = m_Width * m_Height;
+            m_UVPlaneSize = m_Width * (m_Height / 2) * 2;
             m_LengthPerFrame = m_YPlaneSize + m_UVPlaneSize;
         } else {
             m_LengthPerFrame = m_Width * m_Height * 4;
@@ -578,7 +577,7 @@ public:
         CoUninitialize();
     }
 
-    void Loop() { //MARK: Remove flagging
+    void Loop() {
         unsigned int frames = 0;
         auto lastTime = std::chrono::steady_clock::now();
 
@@ -685,6 +684,7 @@ public:
     void Run(const char* localAddr) {
         bool a = Announce(const_cast<char*>(localAddr));
         if (!a) return;
+
         #ifndef NOCONTROL
         inputSession.Start(const_cast<char*>(localAddr), m_listenPorts[1]);
         #endif
@@ -692,7 +692,7 @@ public:
         #ifndef NOAUDIO
         audioSession.Start(const_cast<char*>(localAddr), m_listenPorts[2]);
         #endif
-        
+
         if (!Setup(const_cast<char*>(localAddr))) return;
         m_Window->RegisterRawInputCallback([this](RAWINPUT rawInput) {
             inputSession.SendEvent(rawInput);
@@ -875,34 +875,41 @@ private:
         return true;
     }
 
-    void CreateTextures() {
+    void CreateTextures(bool compress) {
         DesktopDuplication::Duplication& dupl = DesktopDuplication::Singleton<DesktopDuplication::Duplication>::Instance();
+        ComPtr<ID3D11Device> d3dDevice = dupl.GetDevice();
+        std::array<HRESULT, 3> HResults;
 
-        D3D11_TEXTURE2D_DESC yPlaneDesc = {};
-        yPlaneDesc.Width = m_Width;
-        yPlaneDesc.Height = m_Height;
-        yPlaneDesc.MipLevels = 1;
-        yPlaneDesc.ArraySize = 1;
-        yPlaneDesc.Format = DXGI_FORMAT_R8_UNORM;
-        yPlaneDesc.SampleDesc.Count = 1;
-        yPlaneDesc.SampleDesc.Quality = 0;
-        yPlaneDesc.Usage = D3D11_USAGE_STAGING;
-        yPlaneDesc.BindFlags = 0;
-        yPlaneDesc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-        yPlaneDesc.MiscFlags = 0;
+        if (compress) {
+            D3D11_TEXTURE2D_DESC yPlaneDesc = {};
+            yPlaneDesc.Width = m_Width;
+            yPlaneDesc.Height = m_Height;
+            yPlaneDesc.MipLevels = 1;
+            yPlaneDesc.ArraySize = 1;
+            yPlaneDesc.Format = DXGI_FORMAT_R8_UNORM;
+            yPlaneDesc.SampleDesc.Count = 1;
+            yPlaneDesc.SampleDesc.Quality = 0;
+            yPlaneDesc.Usage = D3D11_USAGE_STAGING;
+            yPlaneDesc.BindFlags = 0;
+            yPlaneDesc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+            yPlaneDesc.MiscFlags = 0;
 
-        D3D11_TEXTURE2D_DESC uvPlaneDesc = {};
-        uvPlaneDesc.Width = m_Width;
-        uvPlaneDesc.Height = m_Height / 2;
-        uvPlaneDesc.MipLevels = 1;
-        uvPlaneDesc.ArraySize = 1;
-        uvPlaneDesc.Format = DXGI_FORMAT_R8G8_UNORM;
-        uvPlaneDesc.SampleDesc.Count = 1;
-        uvPlaneDesc.SampleDesc.Quality = 0;
-        uvPlaneDesc.Usage = D3D11_USAGE_STAGING;
-        uvPlaneDesc.BindFlags = 0;
-        uvPlaneDesc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-        uvPlaneDesc.MiscFlags = 0;
+            D3D11_TEXTURE2D_DESC uvPlaneDesc = {};
+            uvPlaneDesc.Width = m_Width;
+            uvPlaneDesc.Height = m_Height / 2;
+            uvPlaneDesc.MipLevels = 1;
+            uvPlaneDesc.ArraySize = 1;
+            uvPlaneDesc.Format = DXGI_FORMAT_R8G8_UNORM;
+            uvPlaneDesc.SampleDesc.Count = 1;
+            uvPlaneDesc.SampleDesc.Quality = 0;
+            uvPlaneDesc.Usage = D3D11_USAGE_STAGING;
+            uvPlaneDesc.BindFlags = 0;
+            uvPlaneDesc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+            uvPlaneDesc.MiscFlags = 0;
+
+            HResults[0] = d3dDevice->CreateTexture2D(&yPlaneDesc, nullptr, m_YPlaneTexture.GetAddressOf());
+            HResults[1] = d3dDevice->CreateTexture2D(&uvPlaneDesc, nullptr, m_UVPlaneTexture.GetAddressOf());
+        }
 
         D3D11_TEXTURE2D_DESC frameDesc = {};
         frameDesc.Width = m_Width;
@@ -917,10 +924,6 @@ private:
         frameDesc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
         frameDesc.MiscFlags = 0;
 
-        ComPtr<ID3D11Device> d3dDevice = dupl.GetDevice();
-        std::array<HRESULT, 3> HResults;
-        HResults[0] = d3dDevice->CreateTexture2D(&yPlaneDesc, nullptr, m_YPlaneTexture.GetAddressOf());
-        HResults[1] = d3dDevice->CreateTexture2D(&uvPlaneDesc, nullptr, m_UVPlaneTexture.GetAddressOf());
         HResults[2] = d3dDevice->CreateTexture2D(&frameDesc, nullptr, m_FrameTexture.GetAddressOf());
 
         for (const auto& hr : HResults) {
@@ -943,13 +946,19 @@ public:
             return false;
         }
 
-        SyncThreadDesktop();
-        DesktopDuplication::ChooseOutput(m_Width, m_Height, m_RefreshRate);
-        if (m_Width == 0 || m_Height == 0 || m_RefreshRate == 0) {
-            throw std::runtime_error("Invalid output resolution or refresh rate.");
+        if (!m_isTest) {
+            SyncThreadDesktop();
+            DesktopDuplication::ChooseOutput(m_Width, m_Height, m_RefreshRate);
+            if (m_Width == 0 || m_Height == 0 || m_RefreshRate == 0) {
+                throw std::runtime_error("Invalid output resolution or refresh rate.");
+            }
+            DesktopDuplication::Duplication& dupl = DesktopDuplication::Singleton<DesktopDuplication::Duplication>::Instance();
+            if (!dupl.InitDuplication()) return false;
+        } else if (m_isTest) {
+            m_Width = 1920;
+            m_Height = 1080;
+            m_RefreshRate = 360;
         }
-        DesktopDuplication::Duplication& dupl = DesktopDuplication::Singleton<DesktopDuplication::Duplication>::Instance();
-        if (!dupl.InitDuplication()) return false;
 
         std::string ip;
         m_ServerPorts = { 0 };
@@ -998,10 +1007,9 @@ public:
     }
 
     bool Setup(char* localAddr, bool compress) {
-        m_YPlaneSize = m_Width * m_Height;
-        m_UVPlaneSize = m_Width * (m_Height / 2) * 2;
-
         if (compress) {
+            m_YPlaneSize = m_Width * m_Height;
+            m_UVPlaneSize = m_Width * (m_Height / 2) * 2;
             m_LengthPerFrame = m_YPlaneSize + m_UVPlaneSize;
         } else {
             m_LengthPerFrame = m_Width * m_Height * 4;
@@ -1009,7 +1017,7 @@ public:
         m_BufferSize = 1 + m_LengthPerFrame;
         m_BufferSize = m_BufferSize * 2;
 
-        CreateTextures();
+        if (!m_isTest) CreateTextures(compress);
 
         if (!Initialize(localAddr)) return false;
 
@@ -1271,125 +1279,277 @@ public:
 
     void Loop() { // MARK: Remove flagging
         std::cout << "Sending frames to the server." << std::endl;
-        DesktopDuplication::Duplication& dupl = DesktopDuplication::Singleton<DesktopDuplication::Duplication>::Instance();
         ND2_SGE sge = { 0 };
-
-        auto lastProbe = std::chrono::system_clock::now();
-        auto GetAndCompressTotal = std::chrono::microseconds::zero();
-        auto MapTotal = std::chrono::microseconds::zero();
-        auto WriteTotal = std::chrono::microseconds::zero();
-        auto FlagWaitTotal = std::chrono::microseconds::zero();
-
-        auto DevMapTotal = std::chrono::microseconds::zero();
-        auto MemCpyTotal = std::chrono::microseconds::zero();
-        int frames = 0;
-
-        bool index = 0;
         uint8_t* buffers[] = { reinterpret_cast<uint8_t*>(m_Buf), reinterpret_cast<uint8_t*>(m_Buf) + (m_LengthPerFrame + 1) };
-
         std::future<bool> WriteFuture;
 
-        ID3D11Texture2D* frameTexture = m_FrameTexture.Get();
 
-        while (true) {
-            index = !index;
-            uint8_t* thisBuffer = buffers[index];
-
-            auto GetAndCompressStart = std::chrono::steady_clock::now();
-
-            bool success = dupl.GetStagedTexture(frameTexture, 1000 / m_RefreshRate);
-            DPRINT("GetTexture");
-
-            sge.Buffer = thisBuffer;
-            sge.BufferLength = 1;
-            sge.MemoryRegionToken = m_pMr->GetLocalToken();
+        if (!m_isTest) {
+            DesktopDuplication::Duplication& dupl = DesktopDuplication::Singleton<DesktopDuplication::Duplication>::Instance();
             
-            if (!success) continue; // no need to notify
+            auto lastProbe = std::chrono::system_clock::now();
+            auto GetAndCompressTotal = std::chrono::microseconds::zero();
+            auto MapTotal = std::chrono::microseconds::zero();
+            auto WriteTotal = std::chrono::microseconds::zero();
+            auto FlagWaitTotal = std::chrono::microseconds::zero();
 
-            auto GetAndCompressEnd = std::chrono::steady_clock::now();
-            GetAndCompressTotal += std::chrono::duration_cast<std::chrono::microseconds>(GetAndCompressEnd - GetAndCompressStart);
-            
-            auto MapStart = std::chrono::steady_clock::now();
+            auto DevMapTotal = std::chrono::microseconds::zero();
+            auto MemCpyTotal = std::chrono::microseconds::zero();
+            int frames = 0;
 
-            thisBuffer[0] = 2;
+            bool index = 0;
 
-            auto DevMapStart = std::chrono::steady_clock::now();
-            D3D11_MAPPED_SUBRESOURCE mappedResource;
-            dupl.GetContext()->Map(frameTexture, 0, D3D11_MAP_READ, 0 , &mappedResource);
-            uint8_t* dst = thisBuffer + 1;
-            uint8_t* src = reinterpret_cast<uint8_t*>(mappedResource.pData);
-            auto DevMapEnd = std::chrono::steady_clock::now();
-            DevMapTotal += std::chrono::duration_cast<std::chrono::microseconds>(DevMapEnd - DevMapStart);
+            ID3D11Texture2D* frameTexture = m_FrameTexture.Get();
+            while (true) {
+                index = !index;
+                uint8_t* thisBuffer = buffers[index];
 
-            auto MemCpyStart = std::chrono::steady_clock::now();
-            const size_t rowSize = static_cast<size_t>(m_Width * 4);
+                auto GetAndCompressStart = std::chrono::steady_clock::now();
 
-            const size_t avx_width = rowSize / 32;
-            const size_t remainder_width = rowSize % 32;
+                bool success = dupl.GetStagedTexture(frameTexture, 1000 / m_RefreshRate);
+                DPRINT("GetTexture");
 
-            for (unsigned int i = 0; i < m_Height; ++i) {
-                uint8_t* p_dst_row = dst + i * rowSize;
-                uint8_t* p_src_row = src + i * mappedResource.RowPitch;
+                sge.Buffer = thisBuffer;
+                sge.BufferLength = 1;
+                sge.MemoryRegionToken = m_pMr->GetLocalToken();
                 
-                // Process the bulk of the row in 32-byte chunks
-                for (size_t j = 0; j < avx_width; ++j) {
-                    // Load 32 bytes from the source row
-                    __m256i chunk = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(p_src_row));
-                    // Store 32 bytes to the destination row
-                    _mm256_storeu_si256(reinterpret_cast<__m256i*>(p_dst_row), chunk);
-                    p_src_row += 32;
-                    p_dst_row += 32;
+                if (!success) continue; // no need to notify
+
+                auto GetAndCompressEnd = std::chrono::steady_clock::now();
+                GetAndCompressTotal += std::chrono::duration_cast<std::chrono::microseconds>(GetAndCompressEnd - GetAndCompressStart);
+                
+                auto MapStart = std::chrono::steady_clock::now();
+
+                thisBuffer[0] = 2;
+
+                auto DevMapStart = std::chrono::steady_clock::now();
+                D3D11_MAPPED_SUBRESOURCE mappedResource;
+                dupl.GetContext()->Map(frameTexture, 0, D3D11_MAP_READ, 0 , &mappedResource);
+                uint8_t* dst = thisBuffer + 1;
+                uint8_t* src = reinterpret_cast<uint8_t*>(mappedResource.pData);
+                auto DevMapEnd = std::chrono::steady_clock::now();
+                DevMapTotal += std::chrono::duration_cast<std::chrono::microseconds>(DevMapEnd - DevMapStart);
+
+                auto MemCpyStart = std::chrono::steady_clock::now();
+                const size_t rowSize = static_cast<size_t>(m_Width * 4);
+
+                const size_t avx_width = rowSize / 32;
+                const size_t remainder_width = rowSize % 32;
+
+                for (unsigned int i = 0; i < m_Height; ++i) {
+                    uint8_t* p_dst_row = dst + i * rowSize;
+                    uint8_t* p_src_row = src + i * mappedResource.RowPitch;
+                    
+                    // Process the bulk of the row in 32-byte chunks
+                    for (size_t j = 0; j < avx_width; ++j) {
+                        // Load 32 bytes from the source row
+                        __m256i chunk = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(p_src_row));
+                        // Store 32 bytes to the destination row
+                        _mm256_storeu_si256(reinterpret_cast<__m256i*>(p_dst_row), chunk);
+                        p_src_row += 32;
+                        p_dst_row += 32;
+                    }
+                    
+                    // Handle any remaining bytes that are not a multiple of 32
+                    if (remainder_width > 0) {
+                        memcpy(p_dst_row, p_src_row, remainder_width);
+                    }
                 }
-                
-                // Handle any remaining bytes that are not a multiple of 32
-                if (remainder_width > 0) {
-                    memcpy(p_dst_row, p_src_row, remainder_width);
+
+                dupl.GetContext()->Unmap(frameTexture, 0);
+                //frameTexture->Release();
+
+                DPRINT("Map");
+                auto MapEnd = std::chrono::steady_clock::now();
+                MapTotal += std::chrono::duration_cast<std::chrono::microseconds>(MapEnd - MapStart);
+                MemCpyTotal += std::chrono::duration_cast<std::chrono::microseconds>(MapEnd - MemCpyStart);
+
+                auto WriteStart = std::chrono::steady_clock::now();
+                // Start AsyncWrite()
+                if (WriteFuture.valid()) {
+                    if (!WriteFuture.get()) {
+                        std::cerr << "AsyncWrite failed." << std::endl;
+                        return;
+                    }
+                }
+                DPRINT("Send");
+                WriteFuture = std::async(std::launch::async, &TestClient::AsyncWrite, this, thisBuffer);
+                auto WriteEnd = std::chrono::steady_clock::now();
+                WriteTotal += std::chrono::duration_cast<std::chrono::microseconds>(WriteEnd - WriteStart);
+
+                frames++;
+
+                auto now = std::chrono::system_clock::now();
+                if (false && std::chrono::duration_cast<std::chrono::seconds>(now - lastProbe).count() >= 1) {
+                    std::cout << "\r                                                                                                                \r";
+                    std::cout << "FPS: " << frames
+                            << " | Get: " << GetAndCompressTotal.count() / frames
+                            << "us | Map: " << MapTotal.count() / frames << "us"
+                            << " | DevMap: " << DevMapTotal.count() / frames << "us"
+                            << " | MemCpy: " << MemCpyTotal.count() / frames << "us"
+                            << " | Write: " << WriteTotal.count() / frames << "us"
+                            << std::flush;
+                    frames = 0;
+                    FlagWaitTotal = std::chrono::microseconds(0);
+                    GetAndCompressTotal = std::chrono::microseconds(0);
+                    MapTotal = std::chrono::microseconds(0);
+                    WriteTotal = std::chrono::microseconds(0);
+
+                    DevMapTotal = std::chrono::microseconds(0);
+                    MemCpyTotal = std::chrono::microseconds(0);
+
+                    lastProbe = now;
                 }
             }
+        } else if (m_isTest) {
+            D3D_DRIVER_TYPE driverType = D3D_DRIVER_TYPE_WARP;
+            UINT creationFlags = D3D11_CREATE_DEVICE_BGRA_SUPPORT;
 
-            dupl.GetContext()->Unmap(frameTexture, 0);
-            //frameTexture->Release();
+            #ifdef _DEBUG
+            creationFlags |= D3D11_CREATE_DEVICE_DEBUG;
+            #endif
 
-            DPRINT("Map");
-            auto MapEnd = std::chrono::steady_clock::now();
-            MapTotal += std::chrono::duration_cast<std::chrono::microseconds>(MapEnd - MapStart);
-            MemCpyTotal += std::chrono::duration_cast<std::chrono::microseconds>(MapEnd - MemCpyStart);
+            ComPtr<ID3D11Device> d3dDevice;
+            ComPtr<ID3D11DeviceContext> d3dContext;
 
-            auto WriteStart = std::chrono::steady_clock::now();
-            // Start AsyncWrite()
-            if (WriteFuture.valid()) {
-                if (!WriteFuture.get()) {
-                    std::cerr << "AsyncWrite failed." << std::endl;
-                    return;
-                }
+            HRESULT hr = D3D11CreateDevice(
+                nullptr,
+                driverType,
+                nullptr,
+                creationFlags,
+                nullptr,
+                0,
+                D3D11_SDK_VERSION,
+                d3dDevice.GetAddressOf(),
+                nullptr,
+                d3dContext.GetAddressOf()
+            );
+
+            if (FAILED(hr)) {
+                std::cerr << "Failed to create D3D11 device: " << std::hex << hr << std::endl;
+                return;
             }
-            DPRINT("Send");
-            WriteFuture = std::async(std::launch::async, &TestClient::AsyncWrite, this, thisBuffer);
-            auto WriteEnd = std::chrono::steady_clock::now();
-            WriteTotal += std::chrono::duration_cast<std::chrono::microseconds>(WriteEnd - WriteStart);
 
-            frames++;
+            ComPtr<IDXGIDevice> dxgiDevice;
+            hr = d3dDevice->QueryInterface(IID_PPV_ARGS(dxgiDevice.GetAddressOf()));
+            if (FAILED(hr)) {
+                std::cerr << "Failed to query IDXGIDevice: " << std::hex << hr << std::endl;
+                return;
+            }
 
-            auto now = std::chrono::system_clock::now();
-            if (false && std::chrono::duration_cast<std::chrono::seconds>(now - lastProbe).count() >= 1) {
-                std::cout << "\r                                                                                                                \r";
-                std::cout << "FPS: " << frames
-                          << " | Get: " << GetAndCompressTotal.count() / frames
-                          << "us | Map: " << MapTotal.count() / frames << "us"
-                          << " | DevMap: " << DevMapTotal.count() / frames << "us"
-                          << " | MemCpy: " << MemCpyTotal.count() / frames << "us"
-                          << " | Write: " << WriteTotal.count() / frames << "us"
-                          << std::flush;
-                frames = 0;
-                FlagWaitTotal = std::chrono::microseconds(0);
-                GetAndCompressTotal = std::chrono::microseconds(0);
-                MapTotal = std::chrono::microseconds(0);
-                WriteTotal = std::chrono::microseconds(0);
+            ComPtr<ID2D1Factory1> d2dFactory;
+            hr = D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, d2dFactory.GetAddressOf());
+            if (FAILED(hr)) {
+                std::cerr << "Failed to create D2D1 factory: " << std::hex << hr << std::endl;
+                return;
+            }
 
-                DevMapTotal = std::chrono::microseconds(0);
-                MemCpyTotal = std::chrono::microseconds(0);
+            ComPtr<ID2D1Device> d2dDevice;
+            hr = d2dFactory->CreateDevice(dxgiDevice.Get(), d2dDevice.GetAddressOf());
+            if (FAILED(hr)) {
+                std::cerr << "Failed to create D2D1 device: " << std::hex << hr << std::endl;
+                return;
+            }
 
-                lastProbe = now;
+            ComPtr<ID2D1DeviceContext> d2dContext;
+            hr = d2dDevice->CreateDeviceContext(D2D1_DEVICE_CONTEXT_OPTIONS_NONE, d2dContext.GetAddressOf());
+            if (FAILED(hr)) {
+                std::cerr << "Failed to create D2D1 device context: " << std::hex << hr << std::endl;
+                return;
+            }
+
+            D2D1_SIZE_U size = D2D1::SizeU(m_Width, m_Height);
+
+            D2D1_BITMAP_PROPERTIES1 bitmapProperties = D2D1::BitmapProperties1(
+                D2D1_BITMAP_OPTIONS_TARGET,
+                D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED)
+            );
+
+            ComPtr<ID2D1Bitmap1> d2dBitmap;
+            hr = d2dContext->CreateBitmap(size, nullptr, 0, &bitmapProperties, d2dBitmap.GetAddressOf());
+            if (FAILED(hr)) {
+                std::cerr << "Failed to create D2D1 bitmap: " << std::hex << hr << std::endl;
+                return;
+            }
+
+            D2D1_BITMAP_PROPERTIES1 stagingBitmapProperties = D2D1::BitmapProperties1(
+                D2D1_BITMAP_OPTIONS_CPU_READ | D2D1_BITMAP_OPTIONS_CANNOT_DRAW,
+                D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED)
+            );
+
+            ComPtr<ID2D1Bitmap1> stagingBitmap;
+            hr = d2dContext->CreateBitmap(size, nullptr, 0, &stagingBitmapProperties, stagingBitmap.GetAddressOf());
+
+            ComPtr<ID2D1SolidColorBrush> brush;
+            hr = d2dContext->CreateSolidColorBrush(D2D1::ColorF(0xF70063, 1.0f), &brush);
+            if (FAILED(hr)) {
+                std::cerr << "Failed to create D2D1 solid color brush: " << std::hex << hr << std::endl;
+                return;
+            }
+
+            bool index = 0;
+
+            short curposX = 0;
+            short curposY = 0;
+
+            while (true) {
+                index = !index;
+                uint8_t* thisbuffer = buffers[index];
+
+                thisbuffer[0] = 2;
+
+                short x, y;
+                inputSession.GetMouse(x, y);
+                curposX += x;
+                curposY += y;
+                D2D1_ELLIPSE ellipse = D2D1::Ellipse(D2D1::Point2F(curposX, curposY), 30.0f, 30.0f);
+
+                d2dContext->SetTarget(d2dBitmap.Get());
+                d2dContext->BeginDraw();
+                d2dContext->Clear(D2D1::ColorF(0x5882E8, 1.0f));
+                d2dContext->FillEllipse(ellipse, brush.Get());
+
+                d2dContext->EndDraw();
+
+                stagingBitmap->CopyFromBitmap(nullptr, d2dBitmap.Get(), nullptr);
+
+                D2D1_MAPPED_RECT mappedRect;
+                stagingBitmap->Map(D2D1_MAP_OPTIONS_READ, &mappedRect);
+
+                uint8_t* dst = thisbuffer + 1;
+                uint8_t* src = mappedRect.bits;
+
+                const size_t rowSize = static_cast<size_t>(m_Width * 4);
+
+                const size_t avx_width = rowSize / 32;
+                const size_t remainder_width = rowSize % 32;
+
+                for (unsigned int i = 0; i < m_Height; ++i) {
+                    uint8_t* p_dst_row = dst + i * rowSize;
+                    uint8_t* p_src_row = src + i * mappedRect.pitch;
+
+                    for (size_t j = 0; j < avx_width; ++j) {
+                        __m256i chunk = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(p_src_row));
+                        _mm256_storeu_si256(reinterpret_cast<__m256i*>(p_dst_row), chunk);
+                        p_src_row += 32;
+                        p_dst_row += 32;
+                    }
+
+                    if (remainder_width > 0) {
+                        memcpy(p_dst_row, p_src_row, remainder_width);
+                    }
+                }
+
+                stagingBitmap->Unmap();
+
+                if (WriteFuture.valid()) {
+                    if (!WriteFuture.get()) {
+                        std::cerr << "AsyncWrite failed." << std::endl;
+                        return;
+                    }
+                }
+
+                WriteFuture = std::async(std::launch::async, &TestClient::AsyncWrite, this, thisbuffer);
             }
         }
 
@@ -1399,14 +1559,24 @@ public:
     }
 
     void Run(const char* localAddr, bool compress) {
-        //SetupConsole();
         FindAndSendMode(const_cast<char*>(localAddr), compress);
-        #ifndef NOCONTROL
-        inputSession.Start(const_cast<char*>(localAddr), m_ServerAddress.c_str(), m_ServerPorts[1]);
-        #endif
-        #ifndef NOAUDIO
-        audioSession.Start(const_cast<char*>(localAddr), m_ServerAddress.c_str(), m_ServerPorts[2]);
-        #endif
+        if (m_isTest) {
+            inputSession.EnableTestMode();
+            inputSession.Start(const_cast<char*>(localAddr), m_ServerAddress.c_str(), m_ServerPorts[1]);
+            audioSession.EnableTestMode();
+            audioSession.Start(const_cast<char*>(localAddr), m_ServerAddress.c_str(), m_ServerPorts[2]);
+            HANDLE hEvent;
+            audioSession.GetEventHandle(hEvent);
+            inputSession.SetEventHandle(hEvent);
+        } else if (!m_isTest) {
+            #ifndef NOCONTROL
+            inputSession.Start(const_cast<char*>(localAddr), m_ServerAddress.c_str(), m_ServerPorts[1]);
+            #endif
+            #ifndef NOAUDIO
+            audioSession.Start(const_cast<char*>(localAddr), m_ServerAddress.c_str(), m_ServerPorts[2]);
+            #endif
+        }
+
         Setup(const_cast<char*>(localAddr), compress);
         OpenConnector(localAddr);
         ExchangePeerInfo();
@@ -1414,6 +1584,10 @@ public:
         else Loop();
         inputSession.Stop();
         audioSession.Stop();
+    }
+
+    void EnableTestMode() {
+        m_isTest = true;
     }
 
     private:
@@ -1440,6 +1614,8 @@ public:
 
     unsigned long m_YPlaneSize = 0;
     unsigned long m_UVPlaneSize = 0;
+
+    bool m_isTest = false;
 };
 
 int main(int argc, char* argv[]) {
@@ -1454,11 +1630,23 @@ int main(int argc, char* argv[]) {
     }
 
     bool isServer = false;
+    bool isTest = false;
+
     if (strcmp(argv[1], "-s") == 0) {
+        //if (argc == 4) {
+            //if (strcmp(argv[3], "-T") == 0) {
+            //    isTest = true;
+            //}
+        //}
+        //else if (argc != 3) { ShowUsage(); return 1; }
         if (argc != 3) { ShowUsage(); return 1; }
         isServer = true;
     } else if (strcmp(argv[1], "-c") == 0) {
-        if (argc != 4) { ShowUsage(); return 1; }
+        if (argc == 5) {
+            if (strcmp(argv[4], "-T") == 0) {
+                isTest = true;
+            }
+        } else if (argc != 4) { ShowUsage(); return 1; }
         isServer = false;
     } else {
         ShowUsage();
@@ -1485,8 +1673,13 @@ int main(int argc, char* argv[]) {
         bool compress = false;
 
         if (_stricmp(argv[3], "r") == 0) {
+            if (isTest) client.EnableTestMode();
             compress = false;
         } else if (_stricmp(argv[3], "c") == 0) {
+            if (isTest) {
+                std::cerr << "Test mode is not supported with compression." << std::endl;
+                return 1;
+            }
             compress = true;
         } else {
             std::cerr << "Invalid compression flag. Use 'r' for raw or 'c' for compressed." << std::endl;

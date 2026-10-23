@@ -131,6 +131,15 @@ HRESULT NDSessionBase::CreateQP(DWORD receiveQueueDepth, DWORD initiatorQueueDep
     return hr;
 }
 
+HRESULT NDSessionBase::CreateQP(DWORD receiveQueueDepth, DWORD initiatorQueueDepth, DWORD maxReceiveRequestSge, DWORD maxInitiatorRequestSge, DWORD maxInlineDataSize) {
+    receiveQueueDepth = std::clamp(receiveQueueDepth, (unsigned long)1, (unsigned long)128);
+    initiatorQueueDepth = std::clamp(initiatorQueueDepth, (unsigned long)1, (unsigned long)128);
+
+    HRESULT hr = m_pAdapter->CreateQueuePair(IID_IND2QueuePair, m_pCq, m_pCq, nullptr, maxReceiveRequestSge, initiatorQueueDepth,
+        maxReceiveRequestSge, maxInitiatorRequestSge, maxInlineDataSize, reinterpret_cast<void**>(&m_pQp));
+    return hr;
+}
+
 bool NDSessionBase::Initialize(char* localAddr) {
     struct sockaddr_in addr = { 0 };
     addr.sin_family = AF_INET;
