@@ -1140,7 +1140,7 @@ public:
         ID3D11Texture2D* yPlane = m_YPlaneTexture.Get();
         ID3D11Texture2D* uvPlane = m_UVPlaneTexture.Get();
 
-        while (true) {
+        while (!g_shouldQuit.load()) {
             index = !index;
             uint8_t* thisBuffer = buffers[index];
 
@@ -1300,7 +1300,7 @@ public:
             bool index = 0;
 
             ID3D11Texture2D* frameTexture = m_FrameTexture.Get();
-            while (true) {
+            while (!g_shouldQuit.load()) {
                 index = !index;
                 uint8_t* thisBuffer = buffers[index];
 
@@ -1492,7 +1492,7 @@ public:
             short curposX = 0;
             short curposY = 0;
 
-            while (true) {
+            while (!g_shouldQuit.load()) {
                 index = !index;
                 uint8_t* thisbuffer = buffers[index];
 

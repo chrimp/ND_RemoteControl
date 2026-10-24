@@ -33,7 +33,6 @@ class AudioNDSessionServer : private NDSessionServerBase {
 
     public:
     void Start(char* localAddr, const unsigned short port) {
-        m_hCallbackEvent = CreateEvent(NULL, FALSE, FALSE, NULL);
         Setup(localAddr);
         OpenListener(localAddr, port);
         ExchangePeerInfo();
@@ -43,14 +42,16 @@ class AudioNDSessionServer : private NDSessionServerBase {
     }
 
     void Stop() {
+        if (m_hEvent) {
+            SetEvent(m_hEvent);
+            CloseHandle(m_hEvent);
+            m_hEvent = nullptr;
+        }
         m_isRunning = false;
+        Shutdown();
         if (m_thread.joinable()) {
             m_thread.join();
         }
-    }
-
-    HANDLE GetCallbackEvent() const {
-        return m_hCallbackEvent;
     }
 
     private:
@@ -59,9 +60,8 @@ class AudioNDSessionServer : private NDSessionServerBase {
     std::thread m_thread;
     std::array<unsigned short, AUDIO_BUFFER_SIZE> m_audioData;
 
-    HANDLE m_hCallbackEvent = nullptr;
-
     bool m_isTest = false;
+    HANDLE m_hEvent = NULL;
 };
 
 class AudioNDSessionClient : private NDSessionClientBase {
@@ -86,6 +86,12 @@ class AudioNDSessionClient : private NDSessionClientBase {
         m_thread = std::thread(&AudioNDSessionClient::Loop, this);
     }
     void Stop() {
+        if (m_hEvent) {
+            SetEvent(m_hEvent);
+            CloseHandle(m_hEvent);
+            m_hEvent = nullptr;
+        }
+        Shutdown();
         m_isRunning = false;
         if (m_thread.joinable()) {
             m_thread.join();

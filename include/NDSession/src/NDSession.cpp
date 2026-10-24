@@ -236,6 +236,7 @@ HRESULT NDSessionBase::GetResult() {
 }
 
 void NDSessionBase::Shutdown() {
+    FlushQP();
     DisconnectConnector();
     DeregisterMemory();
 }

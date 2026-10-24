@@ -73,6 +73,12 @@ class InputNDSessionServer : private NDSessionServerBase {
     }
 
     void Stop() {
+        if (m_hCallbackEvent) {
+            SetEvent(m_hCallbackEvent);
+            CloseHandle(m_hCallbackEvent);
+            m_hCallbackEvent = nullptr;
+        }
+        Shutdown();
         m_isRunning = false;
         if (m_thread.joinable()) {
             m_thread.join();
@@ -141,6 +147,7 @@ class InputNDSessionClient : private NDSessionClientBase {
         m_thread = std::thread(&InputNDSessionClient::Loop, this);
     }
     void Stop() {
+        Shutdown();
         m_isRunning = false;
         if (m_thread.joinable()) {
             m_thread.join();

@@ -120,10 +120,9 @@ void AudioNDSessionServer::ExchangePeerInfo() {
 
 void AudioNDSessionServer::Loop() { //MARK: Remove flagging
     uint8_t* data = reinterpret_cast<uint8_t*>(m_Buf) + 1; // Audio data starts after the flag
-
     ND2_SGE sge = { data, AUDIO_BUFFER_SIZE, m_pMr->GetLocalToken() };
 
-    HANDLE hEvent = CreateEvent(nullptr, FALSE, FALSE, nullptr);
+    m_hEvent = CreateEvent(nullptr, FALSE, FALSE, nullptr);
 
     for (int i = 0; i < 16; i++) {
         if (FAILED(PostReceive(&sge, 1, RECV_CTXT))) {
@@ -136,7 +135,7 @@ void AudioNDSessionServer::Loop() { //MARK: Remove flagging
     IAudioClient* pAudioClient = nullptr;
     UINT32 bufferFrameCount;
 
-    SetupAudioRenderer(pRenderClient, pAudioClient, hEvent);
+    SetupAudioRenderer(pRenderClient, pAudioClient, m_hEvent);
     pAudioClient->GetBufferSize(&bufferFrameCount);
     if (bufferFrameCount != 480) { // 10ms
         std::cerr << "AUDIO: " << "Buffer size mismatch: " << bufferFrameCount << std::endl;
@@ -144,7 +143,7 @@ void AudioNDSessionServer::Loop() { //MARK: Remove flagging
     pAudioClient->Start();
 
     while (m_isRunning && !g_shouldQuit.load()) {
-        WaitForSingleObject(hEvent, INFINITE);
+        WaitForSingleObject(m_hEvent, INFINITE);
 
         UINT32 padding = 0;
         UINT32 nBufferToWrite = bufferFrameCount;
@@ -201,6 +200,11 @@ void AudioNDSessionServer::Loop() { //MARK: Remove flagging
 
 bool AudioNDSessionServer::WaitForCompletionAndCheckContext(void *expectedContext, ULONG notifyFlag) {
     ND2_RESULT ndRes = WaitForCompletion(notifyFlag, true);
+
+    if (ndRes.Status == ND_CANCELED) {
+        std::cout << "AUDIO: " << "Remote has closed the connection." << std::endl;
+        return false;
+    }
 
     if (ND_SUCCESS != ndRes.Status) {
         std::cerr << "AUDIO: " << "Operation failed with status: " << std::hex << ndRes.Status << std::endl;
@@ -291,13 +295,14 @@ void AudioNDSessionClient::Loop() { //MARK: Remove flagging
     uint8_t* data = reinterpret_cast<uint8_t*>(m_Buf) + 1; // Audio data starts after the flag
     ND2_SGE sge = { data, AUDIO_BUFFER_SIZE, m_pMr->GetLocalToken() };
 
+    m_hEvent = CreateEvent(nullptr, FALSE, FALSE, nullptr);
+
     if (FAILED(PostReceive(nullptr, 0, RECV_CTXT))) {
         std::cerr << "AUDIO: " << "PostReceive for audio data failed." << std::endl;
         return;
     }
 
     if (!m_isTest) {
-        HANDLE hEvent = CreateEvent(nullptr, FALSE, FALSE, nullptr);
         CoInitializeEx(nullptr, COINIT_MULTITHREADED);
 
         IMMDeviceEnumerator* pEnum = nullptr;
@@ -366,7 +371,7 @@ void AudioNDSessionClient::Loop() { //MARK: Remove flagging
             AUDCLNT_SHAREMODE_SHARED,
             AUDCLNT_STREAMFLAGS_EVENTCALLBACK | AUDCLNT_STREAMFLAGS_LOOPBACK,
             0, 0, pWaveFormat, nullptr);
-        pAudioClient->SetEventHandle(hEvent);
+        pAudioClient->SetEventHandle(m_hEvent);
 
         hr = pAudioClient->GetService(__uuidof(IAudioCaptureClient), reinterpret_cast<void**>(m_audioCaptureClient.GetAddressOf()));
         if (FAILED(hr)) {
@@ -382,7 +387,7 @@ void AudioNDSessionClient::Loop() { //MARK: Remove flagging
         pAudioClient->Start();
 
         while (m_isRunning && !g_shouldQuit.load()) {
-            DWORD waitResult = WaitForSingleObject(hEvent, INFINITE);
+            DWORD waitResult = WaitForSingleObject(m_hEvent, INFINITE);
             if (waitResult != WAIT_OBJECT_0) continue;
 
             UINT32 frames = 0;
@@ -432,7 +437,7 @@ void AudioNDSessionClient::Loop() { //MARK: Remove flagging
             }
         }
         pAudioClient->Stop();
-        CloseHandle(hEvent);
+        CloseHandle(m_hEvent);
     } else if (m_isTest) {
         constexpr double frequency = 440.0;
         constexpr double amplitude = 0.08;
