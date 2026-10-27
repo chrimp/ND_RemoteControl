@@ -105,7 +105,8 @@ void D2DWindow::WindowThread(
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
 
-    ShowWindow(m_hwnd, SW_SHOWDEFAULT);
+    //ShowWindow(m_hwnd, SW_SHOWDEFAULT);
+    ShowWindow(m_hwnd, SW_SHOWNOACTIVATE);
     UpdateWindow(m_hwnd);
 
     MSG msg;
@@ -283,7 +284,7 @@ LRESULT CALLBACK D2DWindow::WndProc(HWND hWnd, UINT message, WPARAM wParam, LPAR
             // fallthrough        
         case WM_SETFOCUS:
             if (bDoNotTrap) return 0;
-            while(ShowCursor(false) >= 0);
+            while(ShowCursor(false) >= 0) {}
             {
                 RECT rect;
                 GetClientRect(hWnd, &rect);

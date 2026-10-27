@@ -20,7 +20,7 @@
 
 #pragma comment(lib, "synchronization.lib")
 
-constexpr char TEST_PORT[] = "54322";
+using namespace InputNDSession;
 
 extern std::atomic<bool> g_shouldQuit;
 
@@ -32,8 +32,22 @@ bool InputNDSessionServer::Setup(char* localAddr) {
 
     m_MaxSge = info.MaxInitiatorSge;
 
-    if (FAILED(CreateCQ(info.MaxCompletionQueueDepth))) std::terminate();
-    if (FAILED(CreateQP(info.MaxReceiveQueueDepth, info.MaxInitiatorQueueDepth, info.MaxReceiveSge, info.MaxInitiatorSge))) std::terminate();
+    constexpr DWORD initDepth = 4;
+    constexpr DWORD recvDepth = 4;
+
+    HRESULT hr = CreateCQ(&m_pReceiveCq, recvDepth);
+    if (FAILED(hr)) {
+        std::cerr << "Failed to create receive completion queue: " << std::hex << hr << std::endl;
+        return false;
+    }
+
+    hr = CreateCQ(&m_pInitiatorCq, initDepth);
+    if (FAILED(hr)) {
+        std::cerr << "Failed to create initiator completion queue: " << std::hex << hr << std::endl;
+        return false;
+    }
+
+    if (FAILED(CreateQP(recvDepth, initDepth, 1, 1))) std::terminate();
     if (FAILED(CreateMR())) std::terminate();
 
     ULONG flags = ND_MR_FLAG_ALLOW_LOCAL_WRITE | ND_MR_FLAG_ALLOW_REMOTE_WRITE;
@@ -52,7 +66,7 @@ void InputNDSessionServer::OpenListener(const char* localAddr, const unsigned sh
     if (FAILED(Listen(fullAddress.c_str()))) std::terminate();
 
     if (FAILED(GetConnectionRequest())) {
-        std::cerr << "INPUT: " << "GetConnectionRequest failed. Reason: " << std::hex << GetResult() << std::endl;
+        std::cerr << "INPUT: " << "GetConnectionRequest failed. Reason: " << std::hex << GetResult(m_pReceiveCq, &m_ReceiveOv) << std::endl;
         return;
     }
 
@@ -278,7 +292,7 @@ void InputNDSessionServer::Loop() { //MARK: Remove flagging
 
         if (!WaitForCompletionAndCheckContext(SEND_CTXT)) {
             std::cerr << "INPUT: " << "WaitForCompletion for send failed." << std::endl;
-            return;
+            break;
         }
         
         /*
@@ -294,12 +308,92 @@ void InputNDSessionServer::Loop() { //MARK: Remove flagging
     g_shouldQuit.store(true);
 }
 
-bool InputNDSessionServer::WaitForCompletionAndCheckContext(void *expectedContext, ULONG notifyFlag) {
-    ND2_RESULT ndRes = WaitForCompletion(notifyFlag, true);
+bool InputNDSessionServer::WaitForCompletionAndCheckContextWithTimeout(void *expectedContext, bool& didTimedOut, ULONG notifyFlag) {
+    IND2CompletionQueue* pCq;
+    OVERLAPPED* pOv;
+
+    if (expectedContext == RECV_CTXT) {
+        pCq = m_pReceiveCq;
+        pOv = &m_ReceiveOv;
+    } else {
+        pCq = m_pInitiatorCq;
+        pOv = &m_InitiatorOv;
+    }
+    
+    didTimedOut = false;
+    ND2_RESULT ndRes = WaitForCompletionWithTimeout(pCq, pOv, notifyFlag, 10000, didTimedOut);
+
+    if (didTimedOut) {
+        uint8_t* buffer = reinterpret_cast<uint8_t*>(m_Buf) + INPUT_EVENT_LENGTH; // Point to the reserved space
+        ND2_SGE sge = { buffer, QP_CHECK_RESERVE_LENGTH, m_pMr->GetLocalToken() };
+        if (FAILED(Write(&sge, 1, remoteInfo.remoteAddr, remoteInfo.remoteToken, 0, WRITE_CTXT))) {
+            std::cerr << "INPUT: " << "QP check Write failed." << std::endl;
+            g_shouldQuit.store(true);
+            return false;
+        }
+
+        if (!WaitForCompletionAndCheckContext(WRITE_CTXT)) {
+            std::cerr << "INPUT: " << "QP check WaitForCompletion failed." << std::endl;
+            g_shouldQuit.store(true);
+            return false;
+        }
+
+        // QP is alive here
+        didTimedOut = true;
+        return true;
+    }
 
     if (ndRes.Status == ND_CANCELED) {
         std::cerr << "INPUT: Remote has closed the connection." << std::endl;
         g_shouldQuit.store(true);
+        return false;
+    } else if (ndRes.Status == ND_IO_TIMEOUT) {
+        std::cerr << "INPUT: Operation timed out." << std::endl;
+        std::cerr << "INPUT: Check for possible outstanding Send request without a posted receive." << std::endl;
+        g_shouldQuit.store(true);
+        _CrtDbgBreak(); // Break into debugger if attached
+        return false;
+    }
+
+    if (ND_SUCCESS != ndRes.Status) {
+        std::cerr << "INPUT: " << "Operation failed with status: " << std::hex << ndRes.Status << std::endl;
+        #ifdef _DEBUG
+        std::terminate();
+        #endif
+        return false;
+    }
+    if (expectedContext != ndRes.RequestContext) {
+        std::cerr << "INPUT: " << "Unexpected completion. Check for missing WaitForCompletion() call." << std::endl;
+        throw std::exception();
+        return false;
+    }
+
+    return true;
+}
+
+bool InputNDSessionServer::WaitForCompletionAndCheckContext(void *expectedContext, ULONG notifyFlag) {
+    IND2CompletionQueue* pCq;
+    OVERLAPPED* pOv;
+
+    if (expectedContext == RECV_CTXT) {
+        pCq = m_pReceiveCq;
+        pOv = &m_ReceiveOv;
+    } else {
+        pCq = m_pInitiatorCq;
+        pOv = &m_InitiatorOv;
+    }
+
+    ND2_RESULT ndRes = WaitForCompletion(pCq, pOv, notifyFlag, true);
+
+    if (ndRes.Status == ND_CANCELED) {
+        std::cerr << "INPUT: Remote has closed the connection." << std::endl;
+        g_shouldQuit.store(true);
+        return false;
+    } else if (ndRes.Status == ND_IO_TIMEOUT) {
+        std::cerr << "INPUT: Operation timed out." << std::endl;
+        std::cerr << "INPUT: Check for possible outstanding Send request without a posted receive." << std::endl;
+        g_shouldQuit.store(true);
+        _CrtDbgBreak(); // Break into debugger if attached
         return false;
     }
 
@@ -325,8 +419,21 @@ bool InputNDSessionClient::Setup(const char* localAddr) {
     ND2_ADAPTER_INFO info = GetAdapterInfo();
     if (info.AdapterId == 0) std::terminate();
 
-    if (FAILED(CreateCQ(info.MaxCompletionQueueDepth))) std::terminate();
-    if (FAILED(CreateQP(info.MaxReceiveQueueDepth, info.MaxInitiatorQueueDepth, info.MaxReceiveSge, info.MaxInitiatorSge))) std::terminate();
+    constexpr DWORD recvDepth = 32;
+    constexpr DWORD initDepth = 4;
+
+    HRESULT hr = CreateCQ(&m_pReceiveCq, recvDepth);
+    if (FAILED(hr)) {
+        std::cerr << "Failed to create receive completion queue: " << std::hex << hr << std::endl;
+        return false;
+    }
+
+    hr = CreateCQ(&m_pInitiatorCq, initDepth);
+    if (FAILED(hr)) {
+        std::cerr << "Failed to create initiator completion queue: " << std::hex << hr << std::endl;
+        return false;
+    }
+    if (FAILED(CreateQP(recvDepth, initDepth, 1, 1))) std::terminate();
     if (FAILED(CreateMR())) std::terminate();
 
     ULONG flags = ND_MR_FLAG_ALLOW_LOCAL_WRITE | ND_MR_FLAG_ALLOW_REMOTE_WRITE;
@@ -421,14 +528,12 @@ void InputNDSessionClient::Loop() { //MARK: Remove flagging
 
     if (!m_isTest) {
         while (m_isRunning && !g_shouldQuit.load()) {
-            if (FAILED(PostReceive(&sge, 1, RECV_CTXT))) {
-                std::cerr << "INPUT: " << "PostReceive failed." << std::endl;
-                return;
-            }
-
-            if (!WaitForCompletionAndCheckContext(RECV_CTXT)) {
+            bool didTimedOut = false;
+            if (!WaitForCompletionAndCheckContextWithTimeout(RECV_CTXT, didTimedOut)) {
                 std::cerr << "INPUT: " << "WaitForCompletion for PostReceive failed." << std::endl;
-                return;
+                break;
+            } else if (didTimedOut) {
+                continue;
             }
 
             MousePacket mouse = received->mouse;
@@ -612,7 +717,11 @@ void InputNDSessionClient::Loop() { //MARK: Remove flagging
                 }
             }
 
-            /*
+            if (FAILED(PostReceive(&sge, 1, RECV_CTXT))) {
+                std::cerr << "INPUT: " << "PostReceive failed." << std::endl;
+                break;
+            }
+
             auto now = std::chrono::steady_clock::now();
 
             if (now - lastprobe >= std::chrono::seconds(1)) {
@@ -622,13 +731,19 @@ void InputNDSessionClient::Loop() { //MARK: Remove flagging
                 lastprobe = now;
                 count = 0;
             }
-            */
         }
     } else if (m_isTest) {
+        auto lastProbe = std::chrono::steady_clock::now();
+        unsigned int count = 0;
+
         while (m_isRunning && !g_shouldQuit.load()) {
-            if (!WaitForCompletionAndCheckContext(RECV_CTXT)) {
+            bool didTimedOut = false;
+            if (!WaitForCompletionAndCheckContextWithTimeout(RECV_CTXT, didTimedOut)) {
                 std::cerr << "INPUT: " << "WaitForCompletion for PostReceive failed." << std::endl;
-                return;
+                break;
+            } else if (didTimedOut) {
+                // Connection is healthy
+                continue;
             }
 
             MousePacket mouse = received->mouse;
@@ -639,9 +754,21 @@ void InputNDSessionClient::Loop() { //MARK: Remove flagging
                 SetEvent(m_hEvent);
             }
 
+            count++;
+
             if (FAILED(PostReceive(&sge, 1, RECV_CTXT))) {
                 std::cerr << "INPUT: " << "PostReceive failed." << std::endl;
-                return;
+                break;
+            }
+
+            auto now = std::chrono::steady_clock::now();
+            if (now - lastProbe >= std::chrono::seconds(1)) {
+                std::scoped_lock<std::mutex> lock(m_coutMutex);
+                float Hz = static_cast<float>(count) / std::chrono::duration_cast<std::chrono::seconds>(now - lastProbe).count();
+                std::cout << "\r                                                       \r" << std::flush;
+                std::cout << "INPUT: " << "Input frequency: " << Hz << " Hz" << std::flush;
+                lastProbe = now;
+                count = 0;
             }
         }
     }
@@ -649,11 +776,92 @@ void InputNDSessionClient::Loop() { //MARK: Remove flagging
     g_shouldQuit.store(true);
 }
 
-bool InputNDSessionClient::WaitForCompletionAndCheckContext(void *expectedContext, ULONG notifyFlag) {
-    ND2_RESULT ndRes = WaitForCompletion(notifyFlag, true);
+bool InputNDSessionClient::WaitForCompletionAndCheckContextWithTimeout(void *expectedContext, bool& didTimedOut, ULONG notifyFlag) {
+    IND2CompletionQueue* pCq;
+    OVERLAPPED* pOv;
+
+    if (expectedContext == RECV_CTXT) {
+        pCq = m_pReceiveCq;
+        pOv = &m_ReceiveOv;
+    } else {
+        pCq = m_pInitiatorCq;
+        pOv = &m_InitiatorOv;
+    }
+    
+    didTimedOut = false;
+    ND2_RESULT ndRes = WaitForCompletionWithTimeout(pCq, pOv, notifyFlag, 10000, didTimedOut);
+
+    if (didTimedOut) {
+        uint8_t* buffer = reinterpret_cast<uint8_t*>(m_Buf) + INPUT_EVENT_LENGTH; // Point to the reserved space
+        ND2_SGE sge = { buffer, QP_CHECK_RESERVE_LENGTH, m_pMr->GetLocalToken() };
+        if (FAILED(Write(&sge, 1, remoteInfo.remoteAddr, remoteInfo.remoteToken, 0, WRITE_CTXT))) {
+            std::cerr << "INPUT: " << "QP check Write failed." << std::endl;
+            g_shouldQuit.store(true);
+            return false;
+        }
+
+        if (!WaitForCompletionAndCheckContext(WRITE_CTXT)) {
+            std::cerr << "INPUT: " << "QP check WaitForCompletion failed." << std::endl;
+            g_shouldQuit.store(true);
+            return false;
+        }
+
+        // QP is alive here
+        didTimedOut = true;
+        return true;
+    }
 
     if (ndRes.Status == ND_CANCELED) {
-        std::cout << "INPUT: " << "Remote has closed the connection." << std::endl;
+        std::cerr << "INPUT: Remote has closed the connection." << std::endl;
+        g_shouldQuit.store(true);
+        return false;
+    } else if (ndRes.Status == ND_IO_TIMEOUT) {
+        std::cerr << "INPUT: Operation timed out." << std::endl;
+        std::cerr << "INPUT: Check for possible outstanding Send request without a posted receive." << std::endl;
+        g_shouldQuit.store(true);
+        _CrtDbgBreak(); // Break into debugger if attached
+        return false;
+    }
+
+    if (ND_SUCCESS != ndRes.Status) {
+        std::cerr << "INPUT: " << "Operation failed with status: " << std::hex << ndRes.Status << std::endl;
+        #ifdef _DEBUG
+        std::terminate();
+        #endif
+        return false;
+    }
+    if (expectedContext != ndRes.RequestContext) {
+        std::cerr << "INPUT: " << "Unexpected completion. Check for missing WaitForCompletion() call." << std::endl;
+        throw std::exception();
+        return false;
+    }
+
+    return true;
+}
+
+bool InputNDSessionClient::WaitForCompletionAndCheckContext(void *expectedContext, ULONG notifyFlag) {
+    IND2CompletionQueue* pCq;
+    OVERLAPPED* pOv;
+
+    if (expectedContext == RECV_CTXT) {
+        pCq = m_pReceiveCq;
+        pOv = &m_ReceiveOv;
+    } else {
+        pCq = m_pInitiatorCq;
+        pOv = &m_InitiatorOv;
+    }
+
+    ND2_RESULT ndRes = WaitForCompletion(pCq, pOv, notifyFlag, true);
+
+    if (ndRes.Status == ND_CANCELED) {
+        std::cerr << "INPUT: Remote has closed the connection." << std::endl;
+        g_shouldQuit.store(true);
+        return false;
+    } else if (ndRes.Status == ND_IO_TIMEOUT) {
+        std::cerr << "INPUT: Operation timed out." << std::endl;
+        std::cerr << "INPUT: Check for possible outstanding Send request without a posted receive." << std::endl;
+        g_shouldQuit.store(true);
+        _CrtDbgBreak();
         return false;
     }
 

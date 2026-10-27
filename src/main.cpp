@@ -358,9 +358,22 @@ public:
 
         maxSge = info.MaxInitiatorSge;
 
-        if (FAILED(CreateCQ(info.MaxCompletionQueueDepth))) return false;
-        if (FAILED(CreateQP(info.MaxReceiveQueueDepth, info.MaxInitiatorQueueDepth, info.MaxReceiveSge, info.MaxInitiatorSge))) return false;
-        if (FAILED(CreateMR())) return false;
+        constexpr DWORD recvDepth = 4;
+        constexpr DWORD initDepth = 4;
+
+        HRESULT hr = CreateCQ(&m_pReceiveCq, recvDepth);
+        if (FAILED(hr)) {
+            std::cerr << "Failed to create receive completion queue: " << std::hex << hr << std::endl;
+            return false;
+        }
+
+        hr = CreateCQ(&m_pInitiatorCq, initDepth);
+        if (FAILED(hr)) {
+            std::cerr << "Failed to create initiator completion queue: " << std::hex << hr << std::endl;
+            return false;
+        }
+        if (FAILED(CreateQP(recvDepth, initDepth, 1, 1))) std::terminate();
+        if (FAILED(CreateMR())) std::terminate();
 
 
         ULONG flags = ND_MR_FLAG_ALLOW_LOCAL_WRITE | ND_MR_FLAG_ALLOW_REMOTE_WRITE;
@@ -389,7 +402,7 @@ public:
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
         }
 
-        HRESULT hr = m_Renderer->Initialize(nullptr, m_hWnd, m_Width, m_Height, nullptr);
+        hr = m_Renderer->Initialize(nullptr, m_hWnd, m_Width, m_Height, nullptr);
         if (FAILED(hr)) {
             std::cerr << "D2DRenderer initialization failed: " << std::hex << hr << std::endl;
             CoUninitialize();
@@ -414,7 +427,7 @@ public:
 
         std::cout << "Waiting for connection request..." << std::endl;
         if (FAILED(GetConnectionRequest())) {
-            std::cout << "GetConnectionRequest failed. Reason: " << std::hex << GetResult() << std::endl;
+            std::cout << "GetConnectionRequest failed. Reason: " << std::hex << GetResult(m_pReceiveCq, &m_ReceiveOv) << std::endl;
             return;
         }
 
@@ -650,6 +663,7 @@ public:
             auto drawEnd = std::chrono::steady_clock::now();
             DrawTotal += std::chrono::duration_cast<std::chrono::microseconds>(drawEnd - drawStart);
 
+            
             frames++;
             auto now = std::chrono::steady_clock::now();
             if (std::chrono::duration_cast<std::chrono::seconds>(now - lastTime).count() >= 1) {
@@ -663,6 +677,7 @@ public:
                 DrawTotal = std::chrono::microseconds(0);
                 lastTime = now;
             }
+            
             if (_kbhit()) {
                 char c = _getch();
                 if (c == 'q' || c == 'Q') {
@@ -718,8 +733,8 @@ public:
 
     PeerInfo remoteInfo;
 
-    InputNDSessionServer inputSession;
-    AudioNDSessionServer audioSession;
+    InputNDSession::InputNDSessionServer inputSession;
+    AudioNDSession::AudioNDSessionServer audioSession;
 
     unsigned short m_Width = 0;
     unsigned short m_Height = 0;
@@ -830,7 +845,7 @@ private:
                 return false;
             }
 
-            auto now = std::chrono::steady_clock::now();
+            /*auto now = std::chrono::steady_clock::now();
             if (std::chrono::duration_cast<std::chrono::seconds>(now - start).count() >= 10) {
                 std::cerr << "Read timeout." << std::endl;
 
@@ -838,6 +853,7 @@ private:
 
                 return false;
             }
+            */
 
             flag = data[0];
             _mm_pause();
@@ -1024,9 +1040,22 @@ public:
         ND2_ADAPTER_INFO info = GetAdapterInfo();
         if (info.AdapterId == 0) return false;
 
-        if (FAILED(CreateCQ(info.MaxCompletionQueueDepth))) return false;
-        if (FAILED(CreateQP(info.MaxReceiveQueueDepth, info.MaxInitiatorQueueDepth, info.MaxReceiveSge, info.MaxInitiatorSge))) return false;
-        if (FAILED(CreateMR())) return false;
+        constexpr DWORD recvDepth = 4;
+        constexpr DWORD initDepth = 4;
+
+        HRESULT hr = CreateCQ(&m_pReceiveCq, recvDepth);
+        if (FAILED(hr)) {
+            std::cerr << "Failed to create receive completion queue: " << std::hex << hr << std::endl;
+            return false;
+        }
+
+        hr = CreateCQ(&m_pInitiatorCq, initDepth);
+        if (FAILED(hr)) {
+            std::cerr << "Failed to create initiator completion queue: " << std::hex << hr << std::endl;
+            return false;
+        }
+        if (FAILED(CreateQP(recvDepth, initDepth, 1, 1))) std::terminate();
+        if (FAILED(CreateMR())) std::terminate();
 
         ULONG flags = ND_MR_FLAG_ALLOW_LOCAL_WRITE | ND_MR_FLAG_ALLOW_REMOTE_WRITE;
         if (FAILED(RegisterDataBuffer(m_BufferSize, flags))) return false;
@@ -1502,6 +1531,10 @@ public:
                 inputSession.GetMouse(x, y);
                 curposX += x;
                 curposY += y;
+
+                curposX = std::clamp(static_cast<int>(curposX), 0, static_cast<int>(m_Width - 1));
+                curposY = std::clamp(static_cast<int>(curposY), 0, static_cast<int>(m_Height - 1));
+
                 D2D1_ELLIPSE ellipse = D2D1::Ellipse(D2D1::Point2F(curposX, curposY), 30.0f, 30.0f);
 
                 d2dContext->SetTarget(d2dBitmap.Get());
@@ -1598,8 +1631,8 @@ public:
     std::atomic<bool> m_isRunning = true;
     std::mutex m_CoutMutex;
 
-    InputNDSessionClient inputSession;
-    AudioNDSessionClient audioSession;
+    InputNDSession::InputNDSessionClient inputSession;
+    AudioNDSession::AudioNDSessionClient audioSession;
 
     ComPtr<ID3D11Texture2D> m_YPlaneTexture;
     ComPtr<ID3D11Texture2D> m_UVPlaneTexture;

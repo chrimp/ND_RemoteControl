@@ -1,7 +1,10 @@
 #include "NDSession.hpp"
+#include "ndspi.h"
 #include <algorithm>
 #include <cassert>
 #include <iostream>
+#include <minwinbase.h>
+#include <stdexcept>
 
 
 template<typename T>
@@ -13,17 +16,16 @@ void SafeRelease(T*& p) {
 }
 
 // MARK: NDSessionBase
-NDSessionBase::NDSessionBase() :
-    m_pAdapter(nullptr), m_pMr(nullptr), m_pCq(nullptr), m_pQp(nullptr), m_pConnector(nullptr), m_hAdapterFile(nullptr),
-    m_Buf_Len(0), m_Buf(nullptr), m_pMw(nullptr)
-{
-    RtlZeroMemory(&m_Ov, sizeof(m_Ov));
+NDSessionBase::NDSessionBase() {
+    //RtlZeroMemory(&m_ReceiveOv, sizeof(m_ReceiveOv));
+    //RtlZeroMemory(&m_InitiatorOv, sizeof(m_InitiatorOv));
 }
 
 NDSessionBase::~NDSessionBase() {
     SafeRelease(m_pMr);
     SafeRelease(m_pMw);
-    SafeRelease(m_pCq);
+    SafeRelease(m_pReceiveCq);
+    SafeRelease(m_pInitiatorCq);
     SafeRelease(m_pQp);
     SafeRelease(m_pConnector);
     if (m_hAdapterFile) CloseHandle(m_hAdapterFile);
@@ -41,9 +43,9 @@ HRESULT NDSessionBase::CreateMR() {
 
 HRESULT NDSessionBase::RegisterDataBuffer(DWORD bufferLength, ULONG type) {
     if (m_Buf) {
-        HRESULT hr = m_pMr->Deregister(&m_Ov);
+        HRESULT hr = m_pMr->Deregister(&m_InitiatorOv);
         if (hr == ND_PENDING) {
-            hr = m_pMr->GetOverlappedResult(&m_Ov, true);
+            hr = m_pMr->GetOverlappedResult(&m_InitiatorOv, true);
         } else if (FAILED(hr)) {
             std::cerr << "Failed to deregister memory region: " << std::hex << hr << std::endl;
             #ifdef _DEBUG
@@ -66,9 +68,9 @@ HRESULT NDSessionBase::RegisterDataBuffer(DWORD bufferLength, ULONG type) {
 }
 
 HRESULT NDSessionBase::RegisterDataBuffer(void *pBuf, DWORD bufferLength, ULONG type) {
-    HRESULT hr = m_pMr->Register(pBuf, bufferLength, type, &m_Ov);
+    HRESULT hr = m_pMr->Register(pBuf, bufferLength, type, &m_InitiatorOv);
     if (hr == ND_PENDING) {
-        hr = m_pMr->GetOverlappedResult(&m_Ov, true);
+        hr = m_pMr->GetOverlappedResult(&m_InitiatorOv, true);
     }
     return hr;
 }
@@ -93,7 +95,7 @@ std::variant<HRESULT, ND2_RESULT> NDSessionBase::Bind(const void *pBuf, DWORD bu
         return hr;
     }
 
-    ND2_RESULT ndRes = WaitForCompletion(ND_CQ_NOTIFY_ANY, true);
+    ND2_RESULT ndRes = WaitForCompletion(m_pInitiatorCq, &m_InitiatorOv, ND_CQ_NOTIFY_ANY, true);
     if (ndRes.Status == ND_SUCCESS && ndRes.RequestContext != context) {
         return E_INVALIDARG;
     }
@@ -102,12 +104,13 @@ std::variant<HRESULT, ND2_RESULT> NDSessionBase::Bind(const void *pBuf, DWORD bu
 }
 
 HRESULT NDSessionBase::CreateCQ(DWORD depth) {
-    HRESULT hr = m_pAdapter->CreateCompletionQueue(IID_IND2CompletionQueue, m_hAdapterFile, depth, 0, 0, reinterpret_cast<void**>(&m_pCq));
+    HRESULT hr = m_pAdapter->CreateCompletionQueue(IID_IND2CompletionQueue, m_hAdapterFile, depth, 0, 0, reinterpret_cast<void**>(&m_pReceiveCq));
     return hr;
 }
 
-HRESULT NDSessionBase::CreateCQ(IND2CompletionQueue **pCq, DWORD depth) {
-    HRESULT hr = m_pAdapter->CreateCompletionQueue(IID_IND2CompletionQueue, m_hAdapterFile, depth, 0, 0, reinterpret_cast<void**>(pCq));
+HRESULT NDSessionBase::CreateCQ(IND2CompletionQueue **ppCq, DWORD depth) {
+    depth = 128;
+    HRESULT hr = m_pAdapter->CreateCompletionQueue(IID_IND2CompletionQueue, m_hAdapterFile, depth, 0, 0, reinterpret_cast<void**>(ppCq));
     return hr;
 }
 
@@ -117,7 +120,7 @@ HRESULT NDSessionBase::CreateConnector() {
 }
 
 HRESULT NDSessionBase::CreateQP(DWORD queueDepth, DWORD nSge, DWORD inlineDataSize) {
-    HRESULT hr = m_pAdapter->CreateQueuePair(IID_IND2QueuePair, m_pCq, m_pCq, nullptr, queueDepth, queueDepth,
+    HRESULT hr = m_pAdapter->CreateQueuePair(IID_IND2QueuePair, m_pReceiveCq, m_pInitiatorCq, nullptr, queueDepth, queueDepth,
         nSge, nSge, inlineDataSize, reinterpret_cast<void**>(&m_pQp));
     return hr;
 }
@@ -126,7 +129,7 @@ HRESULT NDSessionBase::CreateQP(DWORD receiveQueueDepth, DWORD initiatorQueueDep
     receiveQueueDepth = std::clamp(receiveQueueDepth, (unsigned long)1, (unsigned long)128);
     initiatorQueueDepth = std::clamp(initiatorQueueDepth, (unsigned long)1, (unsigned long)128);
 
-    HRESULT hr = m_pAdapter->CreateQueuePair(IID_IND2QueuePair, m_pCq, m_pCq, nullptr, maxReceiveRequestSge, initiatorQueueDepth,
+    HRESULT hr = m_pAdapter->CreateQueuePair(IID_IND2QueuePair, m_pReceiveCq, m_pInitiatorCq, nullptr, receiveQueueDepth, initiatorQueueDepth,
         maxReceiveRequestSge, maxInitiatorRequestSge, 0, reinterpret_cast<void**>(&m_pQp));
     return hr;
 }
@@ -135,7 +138,7 @@ HRESULT NDSessionBase::CreateQP(DWORD receiveQueueDepth, DWORD initiatorQueueDep
     receiveQueueDepth = std::clamp(receiveQueueDepth, (unsigned long)1, (unsigned long)128);
     initiatorQueueDepth = std::clamp(initiatorQueueDepth, (unsigned long)1, (unsigned long)128);
 
-    HRESULT hr = m_pAdapter->CreateQueuePair(IID_IND2QueuePair, m_pCq, m_pCq, nullptr, maxReceiveRequestSge, initiatorQueueDepth,
+    HRESULT hr = m_pAdapter->CreateQueuePair(IID_IND2QueuePair, m_pReceiveCq, m_pInitiatorCq, nullptr, receiveQueueDepth, initiatorQueueDepth,
         maxReceiveRequestSge, maxInitiatorRequestSge, maxInlineDataSize, reinterpret_cast<void**>(&m_pQp));
     return hr;
 }
@@ -169,16 +172,22 @@ bool NDSessionBase::Initialize(char* localAddr) {
 
     m_MaxPerTransfer = info.MaxTransferLength;
 
-    m_Ov.hEvent = CreateEvent(nullptr, false, false, nullptr);
-    if (m_Ov.hEvent == nullptr) {
+    m_ReceiveOv.hEvent = CreateEvent(nullptr, false, false, nullptr);
+    if (m_ReceiveOv.hEvent == nullptr) {
         std::cerr << "Failed to create event for overlapped operations." << std::endl;
+        return false;
+    }
+    m_InitiatorOv.hEvent = CreateEvent(nullptr, false, false, nullptr);
+    if (m_InitiatorOv.hEvent == nullptr) {
+        std::cerr << "Failed to create event for overlapped operations." << std::endl;
+        CloseHandle(m_ReceiveOv.hEvent);
         return false;
     }
 
     hr = m_pAdapter->CreateOverlappedFile(&m_hAdapterFile);
     if (FAILED(hr)) {
         std::cerr << "Failed to create overlapped file: " << std::hex << hr << std::endl;
-        CloseHandle(m_Ov.hEvent);
+        CloseHandle(m_ReceiveOv.hEvent);
         return false;
     }
 
@@ -221,21 +230,41 @@ DWORD NDSessionBase::PrepareSge(ND2_SGE *pSge, const DWORD nSge, char *buff, ULO
 
 void NDSessionBase::DisconnectConnector() {
     if (m_pConnector) {
-        m_pConnector->Disconnect(&m_Ov);
+        m_pConnector->Disconnect(&m_InitiatorOv);
+        m_pConnector->GetOverlappedResult(&m_InitiatorOv, true);
         SafeRelease(m_pConnector);
     }
 }
 
 void NDSessionBase::DeregisterMemory() {
-    m_pMr->Deregister(&m_Ov);
+    m_pMr->Deregister(&m_InitiatorOv);
+    m_pMr->GetOverlappedResult(&m_InitiatorOv, true);
 }
 
-HRESULT NDSessionBase::GetResult() {
-    HRESULT hr = m_pCq->GetOverlappedResult(&m_Ov, true);
+HRESULT NDSessionBase::GetResult(IND2CompletionQueue* pCq, OVERLAPPED* pOv) {
+    HRESULT hr = pCq->GetOverlappedResult(pOv, true);
     return hr;
 }
 
 void NDSessionBase::Shutdown() {
+    if (m_pCq) {
+        if (m_Ov.hEvent) {
+            m_pCq->CancelOverlappedRequests();
+        } else {
+            // Shouldn't happen
+            throw std::runtime_error("CQ is present but OVERLAPPED is not initialized.");
+        }
+    } else if (m_pReceiveCq && m_pInitiatorCq) {
+        if (m_ReceiveOv.hEvent && m_InitiatorOv.hEvent) {
+            m_pReceiveCq->CancelOverlappedRequests();
+            m_pInitiatorCq->CancelOverlappedRequests();
+        } else {
+            // Shouldn't happen
+            throw std::runtime_error("Completion queues are present but OVERLAPPEDs are not initialized.");
+        }
+    }
+
+
     FlushQP();
     DisconnectConnector();
     DeregisterMemory();
@@ -262,16 +291,46 @@ HRESULT NDSessionBase::Send(const ND2_SGE* Sge, const ULONG nSge, ULONG flags, v
 }
 
 void NDSessionBase::WaitForEventNotification(ULONG notifyFlag) {
-    HRESULT hr = m_pCq->Notify(notifyFlag, &m_Ov);
+    if (m_pCq && m_Ov.hEvent) {
+        WaitForEventNotification(m_pCq, &m_Ov, notifyFlag);
+        return;
+    }
+    throw std::runtime_error("Completion queue or overlapped event not initialized.");
+}
+
+void NDSessionBase::WaitForEventNotification(IND2CompletionQueue* pCq, OVERLAPPED* pOv, ULONG notifyFlag) {
+    HRESULT hr = pCq->Notify(notifyFlag, pOv);
     if (hr == ND_PENDING) {
-        hr = m_pCq->GetOverlappedResult(&m_Ov, true);
+        hr = pCq->GetOverlappedResult(pOv, true);
     }
 }
 
+bool NDSessionBase::WaitForEventNotificationWithTimeout(IND2CompletionQueue* pCq, OVERLAPPED* pOv, ULONG notifyFlag, DWORD timeoutMs) {
+    HRESULT hr = pCq->Notify(notifyFlag, pOv);
+    if (hr == ND_PENDING) {
+        DWORD waitRes = WaitForSingleObject(pOv->hEvent, timeoutMs);
+        if (waitRes == WAIT_OBJECT_0) {
+            pCq->GetOverlappedResult(pOv, false);
+        } else if (waitRes == WAIT_TIMEOUT) {
+            pCq->CancelOverlappedRequests();
+            pCq->GetOverlappedResult(pOv, true);
+            return false;
+        }
+    }
+    return true;
+}
+
 ND2_RESULT NDSessionBase::WaitForCompletion(ULONG notifyFlag, bool bBlocking) {
+    if (m_pCq == nullptr) {
+        throw std::runtime_error("Completion queue not initialized.");
+    }
+    return WaitForCompletion(m_pCq, &m_Ov, notifyFlag, bBlocking);
+}
+
+ND2_RESULT NDSessionBase::WaitForCompletion(IND2CompletionQueue* pCq, OVERLAPPED* pOv, ULONG notifyFlag, bool bBlocking) {
     ND2_RESULT ndRes;
 
-    ULONG numRes = m_pCq->GetResults(&ndRes, 1);
+    ULONG numRes = pCq->GetResults(&ndRes, 1);
 
     if (numRes == 1) {
         return ndRes;
@@ -284,17 +343,68 @@ ND2_RESULT NDSessionBase::WaitForCompletion(ULONG notifyFlag, bool bBlocking) {
     }
 
     do {
-        WaitForEventNotification(notifyFlag);
-    } while (m_pCq->GetResults(&ndRes, 1) == 0);
+        WaitForEventNotification(pCq, pOv, notifyFlag);
+    } while (pCq->GetResults(&ndRes, 1) == 0);
 
     return ndRes;
 }
 
+ND2_RESULT NDSessionBase::WaitForCompletionWithTimeout(IND2CompletionQueue* pCq, OVERLAPPED* pOv, ULONG notifyFlag, DWORD timeoutMs, bool& didTimedOut) {
+    ND2_RESULT ndRes;
+    ULONG numRes = pCq->GetResults(&ndRes, 1);
+
+    if (numRes == 1) return ndRes;
+    else if (numRes > 1) abort();
+
+    while (true) {
+        HRESULT hr = pCq->Notify(notifyFlag, pOv);
+
+        if (pCq->GetResults(&ndRes, 1) == 1) {
+            if (hr == ND_PENDING) {
+                pCq->CancelOverlappedRequests();
+                pCq->GetOverlappedResult(pOv, true);
+            }
+            return ndRes;
+        }
+
+        if (hr == ND_PENDING) {
+            DWORD waitRes = WaitForSingleObject(pOv->hEvent, timeoutMs);
+            if (waitRes == WAIT_OBJECT_0) {
+                pCq->GetOverlappedResult(pOv, false);
+            } else {
+                pCq->CancelOverlappedRequests();
+                pCq->GetOverlappedResult(pOv, true);
+                didTimedOut = true;
+                return ndRes;
+            }
+        } else if (FAILED(hr)) {
+            std::cerr << "Failed to notify completion queue: " << std::hex << hr << std::endl;
+            didTimedOut = false;
+            return ndRes;
+        }
+    }
+}
+
 bool NDSessionBase::WaitForCompletionAndCheckContext(void *expectedContext, ULONG notifyFlag) {
-    ND2_RESULT ndRes = WaitForCompletion(notifyFlag, true);
+    IND2CompletionQueue* pCq;
+    OVERLAPPED* pOv;
+
+    if (expectedContext == RECV_CTXT) {
+        pCq = m_pReceiveCq;
+        pOv = &m_ReceiveOv;
+    } else {
+        pCq = m_pInitiatorCq;
+        pOv = &m_InitiatorOv;
+    }
+
+    ND2_RESULT ndRes = WaitForCompletion(pCq, pOv, notifyFlag, true);
 
     if (ndRes.Status == ND_CANCELED) {
         std::cout << "Remote has closed the connection." << std::endl;
+        return false;
+    } else if (ndRes.Status == ND_IO_TIMEOUT) {
+        std::cerr << "Operation timed out." << std::endl;
+        std::cerr << "Check for possible outstanding Send request without a posted receive." << std::endl;
         return false;
     }
 
@@ -335,6 +445,7 @@ HRESULT NDSessionBase::Reject(const void *pPrivateData, DWORD cbPrivateData) {
     return hr;
 }
 
+/*
 void NDSessionBase::ClearOPs() {
     FlushQP();
     while (true) {
@@ -342,6 +453,7 @@ void NDSessionBase::ClearOPs() {
         if (result.Status == ND_NO_MORE_ENTRIES || result.Status == ND_PENDING) break;
     }
 }
+*/
 
 // MARK: NDSessionServerBase
 NDSessionServerBase::NDSessionServerBase() : m_pListen(nullptr) {}
@@ -374,17 +486,18 @@ HRESULT NDSessionServerBase::Listen(const char* localAddr) {
 }
 
 HRESULT NDSessionServerBase::GetConnectionRequest() {
-    HRESULT hr = m_pListen->GetConnectionRequest(m_pConnector, &m_Ov);
+    HRESULT hr = m_pListen->GetConnectionRequest(m_pConnector, &m_ReceiveOv);
     if (hr == ND_PENDING) {
-        hr = m_pListen->GetOverlappedResult(&m_Ov, true);
+        hr = m_pListen->GetOverlappedResult(&m_ReceiveOv, true);
     }
     return hr;
 }
 
 HRESULT NDSessionServerBase::Accept(DWORD inboundReadLimit, DWORD outboundReadLimit, const void *pPrivateData, DWORD cbPrivateData) {
-    HRESULT hr = m_pConnector->Accept(m_pQp, inboundReadLimit, outboundReadLimit, pPrivateData, cbPrivateData, &m_Ov);
+    OVERLAPPED* pOv = &m_ReceiveOv;
+    HRESULT hr = m_pConnector->Accept(m_pQp, inboundReadLimit, outboundReadLimit, pPrivateData, cbPrivateData, pOv);
     if (hr == ND_PENDING) {
-        hr = m_pConnector->GetOverlappedResult(&m_Ov, true);
+        hr = m_pConnector->GetOverlappedResult(pOv, true);
     }
 
     return hr;
@@ -393,6 +506,8 @@ HRESULT NDSessionServerBase::Accept(DWORD inboundReadLimit, DWORD outboundReadLi
 // MARK: NDSessionClientBase
 
 HRESULT NDSessionClientBase::Connect(const char* localAddr, const char* remoteAddr, DWORD inboundReadLimit, DWORD outboundReadLimit, const void *pPrivateData, DWORD cbPrivateData) {
+    OVERLAPPED* pOv = &m_ReceiveOv;
+
     struct sockaddr_in local = { 0 };
     int len = sizeof(local);
     WSAStringToAddress(const_cast<char*>(localAddr), AF_INET, nullptr, reinterpret_cast<struct sockaddr*>(&local), &len);
@@ -404,7 +519,7 @@ HRESULT NDSessionClientBase::Connect(const char* localAddr, const char* remoteAd
 
     HRESULT hr = m_pConnector->Bind(reinterpret_cast<const sockaddr*>(&local), sizeof(local));
     if (hr == ND_PENDING) {
-        hr = m_pConnector->GetOverlappedResult(&m_Ov, true);
+        hr = m_pConnector->GetOverlappedResult(pOv, true);
     }
 
     if (FAILED(hr)) {
@@ -413,9 +528,9 @@ HRESULT NDSessionClientBase::Connect(const char* localAddr, const char* remoteAd
         #endif
     }
 
-    hr = m_pConnector->Connect(m_pQp, reinterpret_cast<const sockaddr*>(&remote), sizeof(remote), inboundReadLimit, outboundReadLimit, pPrivateData, cbPrivateData, &m_Ov);
+    hr = m_pConnector->Connect(m_pQp, reinterpret_cast<const sockaddr*>(&remote), sizeof(remote), inboundReadLimit, outboundReadLimit, pPrivateData, cbPrivateData, pOv);
     if (hr == ND_PENDING) {
-        hr = m_pConnector->GetOverlappedResult(&m_Ov, true);
+        hr = m_pConnector->GetOverlappedResult(pOv, true);
     }
 
     if (FAILED(hr)) {
@@ -428,9 +543,11 @@ HRESULT NDSessionClientBase::Connect(const char* localAddr, const char* remoteAd
 }
 
 HRESULT NDSessionClientBase::CompleteConnect() {
-    HRESULT hr = m_pConnector->CompleteConnect(&m_Ov);
+    OVERLAPPED* pOv = &m_ReceiveOv;
+
+    HRESULT hr = m_pConnector->CompleteConnect(pOv);
     if (hr == ND_PENDING) {
-        hr = m_pConnector->GetOverlappedResult(&m_Ov, true);
+        hr = m_pConnector->GetOverlappedResult(pOv, true);
     }
     return hr;
 }

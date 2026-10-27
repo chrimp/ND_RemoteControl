@@ -16,6 +16,7 @@
 
 extern std::atomic<bool> g_shouldQuit;
 
+using namespace AudioNDSession;
 
 void SetupAudioRenderer(_Out_ IAudioRenderClient*& pRenderClient, _Out_ IAudioClient*& pAudioClient, _In_ const HANDLE& hEvent) {
     CoInitializeEx(nullptr, COINIT_MULTITHREADED);
@@ -53,8 +54,21 @@ bool AudioNDSessionServer::Setup(char* localAddr) {
     ND2_ADAPTER_INFO info = GetAdapterInfo();
     if (info.AdapterId == 0) std::terminate();
 
-    if (FAILED(CreateCQ(info.MaxCompletionQueueDepth))) std::terminate();
-    if (FAILED(CreateQP(info.MaxReceiveQueueDepth, info.MaxInitiatorQueueDepth, info.MaxReceiveSge, info.MaxInitiatorSge))) std::terminate();
+    constexpr DWORD recvDepth = 16;
+    constexpr DWORD initDepth = 4;
+
+    HRESULT hr = CreateCQ(&m_pReceiveCq, recvDepth);
+    if (FAILED(hr)) {
+        std::cerr << "Failed to create receive completion queue: " << std::hex << hr << std::endl;
+        return false;
+    }
+
+    hr = CreateCQ(&m_pInitiatorCq, initDepth);
+    if (FAILED(hr)) {
+        std::cerr << "Failed to create initiator completion queue: " << std::hex << hr << std::endl;
+        return false;
+    }
+    if (FAILED(CreateQP(recvDepth, initDepth, 1, 1))) std::terminate();
     if (FAILED(CreateMR())) std::terminate();
 
     ULONG flags = ND_MR_FLAG_ALLOW_LOCAL_WRITE | ND_MR_FLAG_ALLOW_REMOTE_WRITE;
@@ -73,7 +87,7 @@ void AudioNDSessionServer::OpenListener(const char* localAddr, const unsigned sh
     if (FAILED(Listen(fullAddress.c_str()))) std::terminate();
 
     if (FAILED(GetConnectionRequest())) {
-        std::cerr << "AUDIO: " << "GetConnectionRequest failed. Reason: " << std::hex << GetResult() << std::endl;
+        std::cerr << "AUDIO: " << "GetConnectionRequest failed. Reason: " << std::hex << GetResult(m_pReceiveCq, &m_ReceiveOv) << std::endl;
         return;
     }
 
@@ -143,36 +157,52 @@ void AudioNDSessionServer::Loop() { //MARK: Remove flagging
     pAudioClient->Start();
 
     while (m_isRunning && !g_shouldQuit.load()) {
-        WaitForSingleObject(m_hEvent, INFINITE);
+        bool didTimedOut = false;
+        if (!WaitForCompletionAndCheckContextWithTimeout(RECV_CTXT, didTimedOut)) {
+            std::cerr << "AUDIO: " << "WaitForCompletion for audio data failed." << std::endl;
+            g_shouldQuit.store(true);
+            break;
+        }
 
-        UINT32 padding = 0;
-        UINT32 nBufferToWrite = bufferFrameCount;
-        pAudioClient->GetCurrentPadding(&padding);
-        nBufferToWrite -= padding;
-
-        if (nBufferToWrite < SAMPLE_RATE / 1000 * 10) {
-            std::cerr << "AUDIO: " << "Buffer is full, skipping frame." << std::endl;
+        if (didTimedOut) {
             continue;
         }
         
-        BYTE* pData = nullptr;
-        HRESULT hr = pRenderClient->GetBuffer(nBufferToWrite, &pData);
-        if (FAILED(hr)) {
-            std::cerr << "AUDIO: " << "GetBuffer failed: " << std::hex << hr << std::endl;
-            break;
-        }
-        if (pData == nullptr) {
-            std::cerr << "AUDIO: " << "GetBuffer returned null data." << std::endl;
-            abort();
-            break;
-        }
-        if (!WaitForCompletionAndCheckContext(RECV_CTXT)) {
-            std::cerr << "AUDIO: " << "WaitForCompletion for audio data failed." << std::endl;
-            break;
+        WaitForSingleObject(m_hEvent, INFINITE);
+
+        UINT32 padding = 0;
+        pAudioClient->GetCurrentPadding(&padding);
+
+        bool doNotRender = false;
+
+        const UINT32 availableFrames = bufferFrameCount - padding;
+        if (availableFrames < FRAMES_PER_PACKET) {
+            std::cerr << "AUDIO: " << "Not enough space in audio buffer. Available frames: " << availableFrames << std::endl;
+            doNotRender = true;
         }
         
-        memcpy(pData, data, AUDIO_BUFFER_SIZE);
-        
+        if (!doNotRender) {
+            BYTE* pData = nullptr;
+            HRESULT hr = pRenderClient->GetBuffer(FRAMES_PER_PACKET, &pData);
+            if (FAILED(hr)) {
+                std::cerr << "AUDIO: " << "GetBuffer failed: " << std::hex << hr << std::endl;
+                break;
+            }
+            if (pData == nullptr) {
+                std::cerr << "AUDIO: " << "GetBuffer returned null data." << std::endl;
+                abort();
+                break;
+            }
+            
+            memcpy(pData, data, AUDIO_BUFFER_SIZE);
+            
+            hr = pRenderClient->ReleaseBuffer(FRAMES_PER_PACKET, 0);
+            if (FAILED(hr)) {
+                std::cerr << "AUDIO: " << "ReleaseBuffer failed: " << std::hex << hr << std::endl;
+                break;
+            }
+        }
+
         if (FAILED(PostReceive(&sge, 1, RECV_CTXT))) {
             std::cerr << "AUDIO: " << "PostReceive for audio data failed." << std::endl;
             return;
@@ -186,23 +216,101 @@ void AudioNDSessionServer::Loop() { //MARK: Remove flagging
             std::cerr << "AUDIO: " << "WaitForCompletion for audio data send failed." << std::endl;
             break;
         }
-        
-        hr = pRenderClient->ReleaseBuffer(nBufferToWrite, 0);
-        if (FAILED(hr)) {
-            std::cerr << "AUDIO: " << "ReleaseBuffer failed: " << std::hex << hr << std::endl;
-            break;
-        }
     }
     pAudioClient->Stop();
     
     g_shouldQuit.store(true);
 }
 
-bool AudioNDSessionServer::WaitForCompletionAndCheckContext(void *expectedContext, ULONG notifyFlag) {
-    ND2_RESULT ndRes = WaitForCompletion(notifyFlag, true);
+bool AudioNDSessionServer::WaitForCompletionAndCheckContextWithTimeout(void *expectedContext, bool& didTimedOut, ULONG notifyFlag) {
+    IND2CompletionQueue* pCq;
+    OVERLAPPED* pOv;
+
+    if (expectedContext == RECV_CTXT) {
+        pCq = m_pReceiveCq;
+        pOv = &m_ReceiveOv;
+    } else {
+        pCq = m_pInitiatorCq;
+        pOv = &m_InitiatorOv;
+    }
+    
+    didTimedOut = false;
+    ND2_RESULT ndRes = WaitForCompletionWithTimeout(pCq, pOv, notifyFlag, 10000, didTimedOut);
+    // How to test QP:
+    // 1. Bind memory with slightly larger than the required space with remote write
+    // 2. Use SGE for necessary audio buffer length to save bandwidth
+    // 3. When testing QP, move the starting pointer and write to the leftover space
+    // 4. When checking completion, silently failed peer will break the QP (Only PostReceive does not break the QP)
+    // When the peer disconnects silently, such as crash or power failure, the other peer's QP stays alive until Send or Write
+
+    if (didTimedOut) {
+        uint8_t* buffer = reinterpret_cast<uint8_t*>(m_Buf) + FLAG_LENGTH + AUDIO_BUFFER_SIZE; // Point to the reserved space
+        ND2_SGE sge = { buffer, QP_CHECK_RESERVE_LENGTH, m_pMr->GetLocalToken() };
+        if (FAILED(Write(&sge, 1, remoteInfo.remoteAddr, remoteInfo.remoteToken, 0, WRITE_CTXT))) {
+            std::cerr << "AUDIO: " << "QP check Write failed." << std::endl;
+            g_shouldQuit.store(true);
+            return false;
+        }
+
+        bool res;
+        if (!(res = WaitForCompletionAndCheckContext(WRITE_CTXT))) {
+            std::cerr << "AUDIO: " << "QP check WaitForCompletion failed." << std::endl;
+            g_shouldQuit.store(true);
+            return false;
+        }
+
+        // QP is alive here
+        didTimedOut = true;
+        return true;
+    }
 
     if (ndRes.Status == ND_CANCELED) {
         std::cout << "AUDIO: " << "Remote has closed the connection." << std::endl;
+        return false;
+    } else if (ndRes.Status == ND_IO_TIMEOUT) {
+        std::cerr << "AUDIO: Operation timed out." << std::endl;
+        std::cerr << "AUDIO: Check for possible outstanding Send request without a posted receive." << std::endl;
+        g_shouldQuit.store(true);
+        return false;
+    }
+
+    if (ND_SUCCESS != ndRes.Status) {
+        std::cerr << "AUDIO: " << "Operation failed with status: " << std::hex << ndRes.Status << std::endl;
+        #ifdef _DEBUG
+        std::terminate();
+        #endif
+        return false;
+    }
+    if (expectedContext != ndRes.RequestContext) {
+        std::cerr << "AUDIO: " << "Unexpected completion. Check for missing WaitForCompletion() call." << std::endl;
+        throw std::exception();
+        return false;
+    }
+
+    return true;
+}
+
+bool AudioNDSessionServer::WaitForCompletionAndCheckContext(void *expectedContext, ULONG notifyFlag) {
+    IND2CompletionQueue* pCq;
+    OVERLAPPED* pOv;
+
+    if (expectedContext == RECV_CTXT) {
+        pCq = m_pReceiveCq;
+        pOv = &m_ReceiveOv;
+    } else {
+        pCq = m_pInitiatorCq;
+        pOv = &m_InitiatorOv;
+    }
+
+    ND2_RESULT ndRes = WaitForCompletion(pCq, pOv, notifyFlag, true);
+
+    if (ndRes.Status == ND_CANCELED) {
+        std::cout << "AUDIO: " << "Remote has closed the connection." << std::endl;
+        return false;
+    } else if (ndRes.Status == ND_IO_TIMEOUT) {
+        std::cerr << "AUDIO: Operation timed out." << std::endl;
+        std::cerr << "AUDIO: Check for possible outstanding Send request without a posted receive." << std::endl;
+        g_shouldQuit.store(true);
         return false;
     }
 
@@ -229,8 +337,21 @@ bool AudioNDSessionClient::Setup(const char* localAddr) {
     ND2_ADAPTER_INFO info = GetAdapterInfo();
     if (info.AdapterId == 0) std::terminate();
 
-    if (FAILED(CreateCQ(info.MaxCompletionQueueDepth))) std::terminate();
-    if (FAILED(CreateQP(info.MaxReceiveQueueDepth, info.MaxInitiatorQueueDepth, info.MaxReceiveSge, info.MaxInitiatorSge))) std::terminate();
+    constexpr DWORD recvDepth = 4;
+    constexpr DWORD initDepth = 4;
+
+    HRESULT hr = CreateCQ(&m_pReceiveCq, recvDepth);
+    if (FAILED(hr)) {
+        std::cerr << "Failed to create receive completion queue: " << std::hex << hr << std::endl;
+        return false;
+    }
+
+    hr = CreateCQ(&m_pInitiatorCq, initDepth);
+    if (FAILED(hr)) {
+        std::cerr << "Failed to create initiator completion queue: " << std::hex << hr << std::endl;
+        return false;
+    }
+    if (FAILED(CreateQP(recvDepth, initDepth, 1, 1))) std::terminate();
     if (FAILED(CreateMR())) std::terminate();
 
     ULONG flags = ND_MR_FLAG_ALLOW_LOCAL_WRITE | ND_MR_FLAG_ALLOW_REMOTE_WRITE;
@@ -295,7 +416,7 @@ void AudioNDSessionClient::Loop() { //MARK: Remove flagging
     uint8_t* data = reinterpret_cast<uint8_t*>(m_Buf) + 1; // Audio data starts after the flag
     ND2_SGE sge = { data, AUDIO_BUFFER_SIZE, m_pMr->GetLocalToken() };
 
-    m_hEvent = CreateEvent(nullptr, FALSE, FALSE, nullptr);
+    //m_hEvent = CreateEvent(nullptr, FALSE, FALSE, nullptr);
 
     if (FAILED(PostReceive(nullptr, 0, RECV_CTXT))) {
         std::cerr << "AUDIO: " << "PostReceive for audio data failed." << std::endl;
@@ -412,11 +533,13 @@ void AudioNDSessionClient::Loop() { //MARK: Remove flagging
             memcpy(data, buffer, AUDIO_BUFFER_SIZE);
             if (FAILED(Send(&sge, 1, 0, SEND_CTXT))) {
                 std::cerr << "AUDIO: " << "Send failed." << std::endl;
-                return;
+                g_shouldQuit.store(true);
+                break;
             }
             if (!WaitForCompletionAndCheckContext(SEND_CTXT)) {
                 std::cerr << "AUDIO: " << "WaitForCompletion for audio send failed." << std::endl;
-                return;
+                g_shouldQuit.store(true);
+                break;
             }
 
             memset(m_Buf, 0, BUFFER_ALLOC_SIZE);
@@ -424,16 +547,41 @@ void AudioNDSessionClient::Loop() { //MARK: Remove flagging
             hr = m_audioCaptureClient->ReleaseBuffer(frames);
             if (FAILED(hr)) {
                 std::cerr << "AUDIO: " << "ReleaseBuffer failed: " << std::hex << hr << std::endl;
-                return;
+                g_shouldQuit.store(true);
+                break;
             }
 
-            if (!WaitForCompletionAndCheckContext(RECV_CTXT)) {
-                std::cerr << "AUDIO: " << "WaitForCompletion for audio send wait failed." << std::endl;
-                return;
+            bool didTimedOut = false;
+            bool shouldBreak = false;
+
+            while (!didTimedOut) {
+                if (!WaitForCompletionAndCheckContextWithTimeout(RECV_CTXT, didTimedOut)) {
+                    std::cerr << "AUDIO: " << "WaitForCompletion for audio send wait failed." << std::endl;
+                    g_shouldQuit.store(true);
+                    shouldBreak = true;
+                    break;
+                }
+
+                if (didTimedOut) {
+                    didTimedOut = false;
+                    if (g_shouldQuit.load() && m_isRunning) {
+                        shouldBreak = true;
+                        break;
+                    }
+                    continue;
+                }
             }
+
+            if (shouldBreak) break;
+
+            //if (!WaitForCompletionAndCheckContext(RECV_CTXT)) {
+            //    std::cerr << "AUDIO: " << "WaitForCompletion for audio send wait failed." << std::endl;
+            //    return;
+            //}
             if (FAILED(PostReceive(nullptr, 0, RECV_CTXT))) {
                 std::cerr << "AUDIO: " << "PostReceive for audio send wait failed." << std::endl;
-                return;
+                g_shouldQuit.store(true);
+                break;
             }
         }
         pAudioClient->Stop();
@@ -446,6 +594,8 @@ void AudioNDSessionClient::Loop() { //MARK: Remove flagging
 
         double phase = 0.0;
         auto* samples = reinterpret_cast<float*>(data);
+
+        int playCount = 0;
 
         while (m_isRunning && !g_shouldQuit.load()) {
             DWORD waitResult = WaitForSingleObject(m_hEvent, INFINITE);
@@ -477,13 +627,38 @@ void AudioNDSessionClient::Loop() { //MARK: Remove flagging
 
             memset(m_Buf, 0, BUFFER_ALLOC_SIZE);
 
-            if (!WaitForCompletionAndCheckContext(RECV_CTXT)) {
-                std::cerr << "AUDIO: " << "WaitForCompletion for audio send wait failed." << std::endl;
-                return;
+            bool didTimedOut = false;
+            bool shouldBreak = false;
+
+            while (!didTimedOut) {
+                if (!WaitForCompletionAndCheckContextWithTimeout(RECV_CTXT, didTimedOut)) {
+                    std::cerr << "AUDIO: " << "WaitForCompletion for audio send wait failed." << std::endl;
+                    g_shouldQuit.store(true);
+                    shouldBreak = true;
+                    break;
+                }
+
+                if (didTimedOut) {
+                    didTimedOut = false;
+                    if (g_shouldQuit.load() && !m_isRunning) {
+                        shouldBreak = true;
+                        break;
+                    }
+                    continue;
+                }
+                break; // New packet
             }
+
+            if (shouldBreak) break;
+
+            if (playCount++ < 5) {
+                SetEvent(m_hEvent);
+            } else playCount = 0;
+
             if (FAILED(PostReceive(nullptr, 0, RECV_CTXT))) {
                 std::cerr << "AUDIO: " << "PostReceive for audio send wait failed." << std::endl;
-                return;
+                g_shouldQuit.store(true);
+                break;
             }
         }
         CloseHandle(m_hEvent);
@@ -492,11 +667,95 @@ void AudioNDSessionClient::Loop() { //MARK: Remove flagging
     g_shouldQuit.store(true);
 }
 
-bool AudioNDSessionClient::WaitForCompletionAndCheckContext(void *expectedContext, ULONG notifyFlag) {
-    ND2_RESULT ndRes = WaitForCompletion(notifyFlag, true);
+bool AudioNDSessionClient::WaitForCompletionAndCheckContextWithTimeout(void *expectedContext, bool& didTimedOut, ULONG notifyFlag) {
+    IND2CompletionQueue* pCq;
+    OVERLAPPED* pOv;
+
+    if (expectedContext == RECV_CTXT) {
+        pCq = m_pReceiveCq;
+        pOv = &m_ReceiveOv;
+    } else {
+        pCq = m_pInitiatorCq;
+        pOv = &m_InitiatorOv;
+    }
+    
+    didTimedOut = false;
+    ND2_RESULT ndRes = WaitForCompletionWithTimeout(pCq, pOv, notifyFlag, 10000, didTimedOut);
+    // How to test QP:
+    // 1. Bind memory with slightly larger than the required space with remote write
+    // 2. Use SGE for necessary audio buffer length to save bandwidth
+    // 3. When testing QP, move the starting pointer and write to the leftover space
+    // 4. When checking completion, silently failed peer will break the QP (Only PostReceive does not break the QP)
+    // When the peer disconnects silently, such as crash or power failure, the other peer's QP stays alive until Send or Write
+
+    if (didTimedOut) {
+        uint8_t* buffer = reinterpret_cast<uint8_t*>(m_Buf) + FLAG_LENGTH + AUDIO_BUFFER_SIZE; // Point to the reserved space
+        ND2_SGE sge = { buffer, QP_CHECK_RESERVE_LENGTH, m_pMr->GetLocalToken() };
+        if (FAILED(Write(&sge, 1, remoteInfo.remoteAddr, remoteInfo.remoteToken, 0, WRITE_CTXT))) {
+            std::cerr << "AUDIO: " << "QP check Write failed." << std::endl;
+            g_shouldQuit.store(true);
+            return false;
+        }
+
+        if (!WaitForCompletionAndCheckContext(WRITE_CTXT)) {
+            std::cerr << "AUDIO: " << "QP check WaitForCompletion failed." << std::endl;
+            g_shouldQuit.store(true);
+            return false;
+        }
+
+        // QP is alive here
+        didTimedOut = true;
+        return true;
+    }
 
     if (ndRes.Status == ND_CANCELED) {
         std::cout << "AUDIO: " << "Remote has closed the connection." << std::endl;
+        return false;
+    } else if (ndRes.Status == ND_IO_TIMEOUT) {
+        std::cerr << "AUDIO: Operation timed out." << std::endl;
+        std::cerr << "AUDIO: Check for possible outstanding Send request without a posted receive." << std::endl;
+        g_shouldQuit.store(true);
+        return false;
+    }
+
+    if (ND_SUCCESS != ndRes.Status) {
+        std::cerr << "AUDIO: " << "Operation failed with status: " << std::hex << ndRes.Status << std::endl;
+        #ifdef _DEBUG
+        std::terminate();
+        #endif
+        return false;
+    }
+    if (expectedContext != ndRes.RequestContext) {
+        std::cerr << "AUDIO: " << "Unexpected completion. Check for missing WaitForCompletion() call." << std::endl;
+        throw std::exception();
+        return false;
+    }
+
+    return true;
+}
+
+
+bool AudioNDSessionClient::WaitForCompletionAndCheckContext(void *expectedContext, ULONG notifyFlag) {
+    IND2CompletionQueue* pCq;
+    OVERLAPPED* pOv;
+
+    if (expectedContext == RECV_CTXT) {
+        pCq = m_pReceiveCq;
+        pOv = &m_ReceiveOv;
+    } else {
+        pCq = m_pInitiatorCq;
+        pOv = &m_InitiatorOv;
+    }
+
+    ND2_RESULT ndRes = WaitForCompletion(pCq, pOv, notifyFlag, true);
+
+    if (ndRes.Status == ND_CANCELED) {
+        std::cout << "AUDIO: " << "Remote has closed the connection." << std::endl;
+        return false;
+    } else if (ndRes.Status == ND_IO_TIMEOUT) {
+        std::cerr << "AUDIO: Operation timed out." << std::endl;
+        std::cerr << "AUDIO: Check for possible outstanding Send request without a posted receive." << std::endl;
+        g_shouldQuit.store(true);
         return false;
     }
 
