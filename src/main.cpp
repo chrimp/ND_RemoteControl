@@ -86,6 +86,13 @@ bool SyncThreadDesktop() {
     return true;
 }
 
+struct MulticastAnnounce {
+    char addr[16];
+    uint16_t mainPort;
+    uint16_t inputPort;
+    uint16_t audioPort;
+};
+
 // MARK: TestServer
 class TestServer : public NDSessionServerBase {
 private:
@@ -117,13 +124,19 @@ private:
         inet_pton(AF_INET, "239.255.0.1", &mAddr.sin_addr);
         mAddr.sin_port = htons(56789);
 
-        std::string port = std::to_string(ports[0]) + ";" + std::to_string(ports[1]) + ";" + std::to_string(ports[2]);
+        MulticastAnnounce announceMsg = {};
 
-        std::string message = std::string(localAddr) + ":" + port;
+        strncpy_s(announceMsg.addr, localAddr, sizeof(announceMsg.addr) - 1);
+        announceMsg.mainPort = ports[0];
+        announceMsg.inputPort = ports[1];
+        announceMsg.audioPort = ports[2];
+
+        //std::string port = std::to_string(ports[0]) + ";" + std::to_string(ports[1]) + ";" + std::to_string(ports[2]);
+        //std::string message = std::string(localAddr) + ":" + port;
 
         while (!stopToken.stop_requested() && !g_shouldQuit.load()) {
             std::this_thread::sleep_for(std::chrono::seconds(1));
-            int res = sendto(mSock, message.c_str(), message.size(), 0, reinterpret_cast<sockaddr*>(&mAddr), sizeof(mAddr));
+            int res = sendto(mSock, reinterpret_cast<const char*>(&announceMsg), sizeof(MulticastAnnounce), 0, reinterpret_cast<sockaddr*>(&mAddr), sizeof(mAddr));
             if (res == SOCKET_ERROR) {
                 std::cerr << "Failed to send multicast message: " << WSAGetLastError() << std::endl;
                 g_shouldQuit.store(true);
@@ -132,8 +145,7 @@ private:
         }
     }
 
-    static bool SetSockets(_In_ const char* localAddr, _Out_ SOCKET& listenSock, _Out_ std::array<unsigned short, 3> & ports) {
-
+    bool SetSockets(_In_ const char* localAddr) {
         SOCKET listenSock1 = INVALID_SOCKET;
         SOCKET listenSock2 = INVALID_SOCKET;
         SOCKET listenSock3 = INVALID_SOCKET;
@@ -175,20 +187,16 @@ private:
 
         bool success = true;
 
-        if (!bind_ephemeral(listenSock1, ports[0])) success = false;
-        if (!bind_ephemeral(listenSock2, ports[1])) success = false;
-        if (!bind_ephemeral(listenSock3, ports[2])) success = false;
+        if (!bind_ephemeral(m_socks[0], m_ports[0])) success = false;
+        if (!bind_ephemeral(m_socks[1], m_ports[1])) success = false;
+        if (!bind_ephemeral(m_socks[2], m_ports[2])) success = false;
 
         if (!success) {
-            if (listenSock1 != INVALID_SOCKET) closesocket(listenSock1);
-            if (listenSock2 != INVALID_SOCKET) closesocket(listenSock2);
-            if (listenSock3 != INVALID_SOCKET) closesocket(listenSock3);
+            if (m_socks[0] != INVALID_SOCKET) closesocket(m_socks[0]);
+            if (m_socks[1] != INVALID_SOCKET) closesocket(m_socks[1]);
+            if (m_socks[2] != INVALID_SOCKET) closesocket(m_socks[2]);
             return false;
         }
-        
-        listenSock = listenSock1;
-        //closesocket(listenSock2);
-        //closesocket(listenSock3);
 
         return true;
     }
@@ -266,37 +274,37 @@ public:
             return ret;
         }
 
-        SOCKET listenSock, clientSock;
+        SOCKET clientSock;
 
         //unsigned short assignedPort = 0;
 
-        if (!SetSockets(localAddr, listenSock, m_listenPorts)) {
+        if (!SetSockets(localAddr)) {
             WSACleanup();
             return ret;
         }
 
         //m_listenPorts = assignedPort;
-        std::jthread multicastThread(SendMultiCast, localAddr, m_listenPorts);
+        std::jthread multicastThread(SendMultiCast, localAddr, m_ports);
 
-        std::string ports = std::to_string(m_listenPorts[0]) + ", " + std::to_string(m_listenPorts[1]) + ", " + std::to_string(m_listenPorts[2]);
+        std::string ports = std::to_string(m_ports[0]) + ", " + std::to_string(m_ports[1]) + ", " + std::to_string(m_ports[2]);
 
         std::cout << "Starting Announce with localAddr: " << localAddr << ", " << ports << std::endl;
 
-        if (listen(listenSock, SOMAXCONN) == SOCKET_ERROR) {
+        if (listen(m_socks[0], SOMAXCONN) == SOCKET_ERROR) {
             std::cerr << "Failed to listen on socket: " << WSAGetLastError() << std::endl;
             multicastThread.request_stop();
-            closesocket(listenSock);
+            closesocket(m_socks[0]);
             return ret; 
         }
 
         sockaddr_in clientAddr = {};
         int clientAddrLen = sizeof(clientAddr);
 
-        clientSock = accept(listenSock, reinterpret_cast<sockaddr*>(&clientAddr), &clientAddrLen);
+        clientSock = accept(m_socks[0], reinterpret_cast<sockaddr*>(&clientAddr), &clientAddrLen);
         if (clientSock == INVALID_SOCKET) {
             std::cerr << "Failed to accept connection: " << WSAGetLastError() << std::endl;
             multicastThread.request_stop();
-            closesocket(listenSock);
+            closesocket(m_socks[0]);
             return ret;
         }
 
@@ -311,12 +319,12 @@ public:
         if (bytesReceived == SOCKET_ERROR) {
             std::cerr << "Failed to receive data: " << WSAGetLastError() << std::endl;
             closesocket(clientSock);
-            closesocket(listenSock);
+            closesocket(m_socks[0]);
             return ret;
         } else if (bytesReceived == 0) {
             std::cerr << "Connection closed by client." << std::endl;
             closesocket(clientSock);
-            closesocket(listenSock);
+            closesocket(m_socks[0]);
             return ret;
         }
 
@@ -332,7 +340,7 @@ public:
         m_RefreshRate = refreshRate;
 
         closesocket(clientSock);
-        closesocket(listenSock);
+        //closesocket(m_socks[0]);
         return true;
     }
 
@@ -421,7 +429,7 @@ public:
     }
 
     void OpenListener(const char* localAddr) {
-        std::string fullAddress = std::string(localAddr) + ":" + std::to_string(m_listenPorts[0]);
+        std::string fullAddress = std::string(localAddr) + ":" + std::to_string(m_ports[0]);
         std::cout << "Listening on " << fullAddress << "..." << std::endl;
         if (FAILED(Listen(fullAddress.c_str()))) return;
 
@@ -701,11 +709,11 @@ public:
         if (!a) return;
 
         #ifndef NOCONTROL
-        inputSession.Start(const_cast<char*>(localAddr), m_listenPorts[1]);
+        inputSession.Start(const_cast<char*>(localAddr), m_ports[1]);
         #endif
 
         #ifndef NOAUDIO
-        audioSession.Start(const_cast<char*>(localAddr), m_listenPorts[2]);
+        audioSession.Start(const_cast<char*>(localAddr), m_ports[2]);
         #endif
 
         if (!Setup(const_cast<char*>(localAddr))) return;
@@ -741,7 +749,8 @@ public:
     unsigned short m_RefreshRate = 0;
     bool m_Compress = false;
 
-    std::array<unsigned short, 3> m_listenPorts = { 0 };
+    std::array<unsigned short, 3> m_ports = {};
+    std::array<SOCKET, 3> m_socks = { INVALID_SOCKET, INVALID_SOCKET, INVALID_SOCKET };
 
     unsigned long m_LengthPerFrame = 0;
     unsigned long m_BufferSize = 0;
@@ -783,17 +792,24 @@ private:
             return false;
         }
 
-        char buffer[128];
+        MulticastAnnounce announceMsg = {};
         sockaddr_in senderAddr = {};
         int senderAddrLen = sizeof(senderAddr);
 
-        int bytesReceived = recvfrom(mSock, buffer, sizeof(buffer) - 1, 0, reinterpret_cast<sockaddr*>(&senderAddr), &senderAddrLen);
+        int bytesReceived = recvfrom(mSock, reinterpret_cast<char*>(&announceMsg), sizeof(MulticastAnnounce), 0, reinterpret_cast<sockaddr*>(&senderAddr), &senderAddrLen);
         if (bytesReceived == SOCKET_ERROR) {
             std::cerr << "Failed to receive data: " << WSAGetLastError() << std::endl;
             closesocket(mSock);
             return false;
         }
 
+        if (bytesReceived != sizeof(MulticastAnnounce)) {
+            std::cerr << "Multicast message length does not match. Expected: " << sizeof(MulticastAnnounce)<< ", Got : " << bytesReceived << std::endl;
+            closesocket(mSock);
+            return false;
+        }
+
+        /*
         buffer[bytesReceived] = '\0';
         std::string message(buffer);
         size_t colonPos = message.find_last_of(':');
@@ -820,6 +836,12 @@ private:
         port[2] = static_cast<unsigned short>(std::stoi(portStr));
 
         serverAddr = ip;
+        */
+
+        serverAddr = announceMsg.addr;
+        port[0] = announceMsg.mainPort;
+        port[1] = announceMsg.inputPort;
+        port[2] = announceMsg.audioPort;
 
         closesocket(mSock);
         return true;

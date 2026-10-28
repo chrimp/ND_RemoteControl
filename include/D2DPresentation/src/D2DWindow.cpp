@@ -246,6 +246,42 @@ LRESULT CALLBACK D2DWindow::WndProc(HWND hWnd, UINT message, WPARAM wParam, LPAR
             }
             RAWINPUT* rawInput = reinterpret_cast<RAWINPUT*>(lpb.data());
 
+            if (rawInput->header.dwType == RIM_TYPEKEYBOARD) {
+                static bool ctrlDown = false;
+                static bool altDown = false;
+                static bool shiftDown = false;
+                static bool xDown = false;
+                static bool combinationDetected = false;
+
+                const bool keyDown = !(rawInput->data.keyboard.Flags & RI_KEY_BREAK);
+                switch (rawInput->data.keyboard.VKey) {
+                    case VK_CONTROL:
+                        ctrlDown = keyDown;
+                        break;
+                    case VK_MENU:
+                        altDown = keyDown;
+                        break;
+                    case VK_SHIFT:
+                        shiftDown = keyDown;
+                        break;
+                    case 'X':
+                        xDown = keyDown;
+                        break;
+                }
+
+                const bool combinationDown = ctrlDown && altDown && shiftDown && xDown;
+                if (combinationDown && !combinationDetected) {
+                    combinationDetected = true;
+                    ClipCursor(nullptr);
+                    while (ShowCursor(true) < 0);
+                    m_cursorTrapped = false;
+                }
+
+                if (!combinationDown) {
+                    combinationDetected = false;
+                }
+            }
+
             #ifdef ABSCURSOR
             if (rawInput->header.dwType == RIM_TYPEMOUSE) {
                 POINT pos;
@@ -281,23 +317,24 @@ LRESULT CALLBACK D2DWindow::WndProc(HWND hWnd, UINT message, WPARAM wParam, LPAR
             bDoNotTrap = false;
             #endif
             while(ShowCursor(false) >= 0);
-            // fallthrough        
-        case WM_SETFOCUS:
-            if (bDoNotTrap) return 0;
-            while(ShowCursor(false) >= 0) {}
-            {
-                RECT rect;
-                GetClientRect(hWnd, &rect);
-                ClientToScreen(hWnd, reinterpret_cast<POINT*>(&rect));
-                ClientToScreen(hWnd, reinterpret_cast<POINT*>(&rect) + 1);
-                ClipCursor(&rect);
-                m_cursorTrapped = true;
-            }
             return 0;
-        case WM_KILLFOCUS:
-            ClipCursor(nullptr);
-            ShowCursor(true);
-            m_cursorTrapped = false;
+        case WM_ACTIVATE:
+            if (wParam == WA_ACTIVE || wParam == WA_CLICKACTIVE) {
+                if (bDoNotTrap) return 0;
+                while(ShowCursor(false) >= 0) {}
+                {
+                    RECT rect;
+                    GetClientRect(hWnd, &rect);
+                    ClientToScreen(hWnd, reinterpret_cast<POINT*>(&rect));
+                    ClientToScreen(hWnd, reinterpret_cast<POINT*>(&rect) + 1);
+                    ClipCursor(&rect);
+                    m_cursorTrapped = true;
+                }
+            } else if (wParam == WA_INACTIVE) {
+                ClipCursor(nullptr);
+                while(ShowCursor(true) < 0);
+                m_cursorTrapped = false;
+            }
             return 0;
         case WM_SIZING:
         {
