@@ -4,6 +4,7 @@
 #include "D2DWindow.hpp"
 #include "InputNDSession.hpp"
 #include "AudioNDSession.hpp"
+#include "launcher.hpp"
 
 #include <WinSock2.h>
 #include <WtsApi32.h>
@@ -65,7 +66,7 @@ void ShowUsage() {
     printf("main.exe [options]\n"
            "Options:\n"
            "\t-s <local_ip>           - Start as server\n"
-           "\t-c <local_ip> <server_ip> - Start as client\n");
+           "\t-c <local_ip> (compression mode: -R or -C) - Start as client\n");
 }
 
 
@@ -1673,38 +1674,97 @@ public:
     bool m_isTest = false;
 };
 
+bool CheckIPAddress(const char* ipAddress) {
+    struct sockaddr_in sa;
+    int result = inet_pton(AF_INET, ipAddress, &(sa.sin_addr));
+    return result == 1;
+}
+
+bool ParseArguments(int argc, char* argv[], _Out_ LauncherConfig& config) {
+    if (argc < 3) { return false; }
+
+    for (int i = 1; i < argc; ++i) {
+        switch (argv[i][0]) {
+            case '-':
+                switch (argv[i][1]) {
+                    case 's':
+                        config.isServer = true;
+                        break;
+                    case 'c':
+                        config.isServer = false;
+                        break;
+                    case 'T':
+                        config.isTest = true;
+                        break;
+                    case 'R':
+                        config.isCompress = false;
+                        break;
+                    case 'C':
+                        config.isCompress = true;
+                        break;
+                    default:
+                        return false;
+                }
+                break;
+            default:
+                if (CheckIPAddress(argv[i])) {
+                    config.ip = argv[i];
+                } else {
+                    return false;
+                }
+                break;
+        }
+    }
+
+    return true;
+}
+
+bool ValidateConfig(const LauncherConfig& config) {
+    if (!CheckIPAddress(config.ip.c_str())) {
+        return false;
+    }
+
+    if (config.isServer) {
+        if (config.isCompress || config.isTest) {
+            return false;
+        }
+    } else if (!config.isServer) {
+        if (config.isTest && config.isCompress) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
 int main(int argc, char* argv[]) {
     #ifdef _DEBUG
     while (!IsDebuggerPresent()) {
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
     #endif
-    if (argc < 3) {
-        ShowUsage();
-        return 1;
+
+    std::optional<LauncherConfig> config;
+
+    if (argc == 1) {
+        // GUI
+        config = ShowLauncherDialog();
+
+        if (!config) {
+            std::cerr << "Launcher dialog canceled or failed." << std::endl;
+            return 1;
+        }
+
+    } else {
+        config = LauncherConfig{};
+        if (!ParseArguments(argc, argv, config.value())) {
+            ShowUsage();
+            return 1;
+        }
     }
 
-    bool isServer = false;
-    bool isTest = false;
-
-    if (strcmp(argv[1], "-s") == 0) {
-        //if (argc == 4) {
-            //if (strcmp(argv[3], "-T") == 0) {
-            //    isTest = true;
-            //}
-        //}
-        //else if (argc != 3) { ShowUsage(); return 1; }
-        if (argc != 3) { ShowUsage(); return 1; }
-        isServer = true;
-    } else if (strcmp(argv[1], "-c") == 0) {
-        if (argc == 5) {
-            if (strcmp(argv[4], "-T") == 0) {
-                isTest = true;
-            }
-        } else if (argc != 4) { ShowUsage(); return 1; }
-        isServer = false;
-    } else {
-        ShowUsage();
+    if (!ValidateConfig(config.value())) {
+        std::cerr << "Invalid configuration." << std::endl;
         return 1;
     }
 
@@ -1720,28 +1780,13 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    if (isServer) {
+    if (config->isServer) {
         TestServer server;
-        server.Run(argv[2]);
+        server.Run(config->ip.c_str());
     } else {
         TestClient client;
-        bool compress = false;
-
-        if (_stricmp(argv[3], "r") == 0) {
-            if (isTest) client.EnableTestMode();
-            compress = false;
-        } else if (_stricmp(argv[3], "c") == 0) {
-            if (isTest) {
-                std::cerr << "Test mode is not supported with compression." << std::endl;
-                return 1;
-            }
-            compress = true;
-        } else {
-            std::cerr << "Invalid compression flag. Use 'r' for raw or 'c' for compressed." << std::endl;
-            return 1;
-        }
-
-        client.Run(argv[2], compress);
+        if (config->isTest) client.EnableTestMode();
+        client.Run(config->ip.c_str(), config->isCompress);
     }
 
     NdCleanup();
